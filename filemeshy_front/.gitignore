@@ -1,0 +1,148 @@
+# ==================== NODE ====================
+# Dependencias (NO subir - se instalan con pnpm install)
+node_modules/
+
+# Lock files de otros gestores (el proyecto usa pnpm exclusivamente)
+package-lock.json
+yarn.lock
+bun.lockb
+
+# pnpm-lock.yaml SÍ se sube (versiones exactas)
+
+# ==================== BUILD ====================
+# Archivos de compilación (NO subir - se generan con pnpm build)
+dist/
+dist-ssr/
+build/
+*.local
+
+# Cache de build (NO subir)
+.cache/
+.temp/
+.tmp/
+*.tsbuildinfo
+.vite/
+
+# ==================== LOGS ====================
+# Archivos de logs (NO subir)
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# ==================== ENVIRONMENT ====================
+# Variables de entorno con datos sensibles (NUNCA subir)
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.env.*.local
+
+# .env.example SÍ se sube (sin valores sensibles)
+
+# ==================== EDITORS ====================
+# VSCode - Configuración personal (NO subir)
+.vscode/*
+# Excepciones: SÍ subir estas (configuración del proyecto)
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+
+# JetBrains IDEs (NO subir)
+.idea/
+*.iml
+*.iws
+*.ipr
+.idea_modules/
+
+# Sublime Text (NO subir)
+*.sublime-workspace
+*.sublime-project
+
+# Vim (NO subir)
+*.swp
+*.swo
+*~
+
+# ==================== SYSTEM ====================
+# macOS (NO subir)
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+# Windows (NO subir)
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msix
+*.msm
+*.msp
+*.lnk
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Linux (NO subir)
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# ==================== TESTING ====================
+# Reportes de cobertura (NO subir)
+coverage/
+*.lcov
+.nyc_output/
+test-results/
+playwright-report/
+
+# ==================== MISC ====================
+# Archivos temporales (NO subir)
+*.tmp
+*.swp
+*.swo
+*.bak
+*.backup
+*.old
+
+# Archivos sensibles (NUNCA subir)
+secrets.json
+credentials.json
+*.pem
+*.key
+*.cert
+*.p12
+.npmrc
+.yarnrc
+
+# Databases locales (NO subir)
+*.db
+*.sqlite
+*.sqlite3
+
+# Archivos de respaldo (NO subir)
+*.zip
+*.tar.gz
+*.rar

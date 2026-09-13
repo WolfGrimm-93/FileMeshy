@@ -1,0 +1,335 @@
+"""
+Tareas de mantenimiento — FileMeshy Worker.
+
+Limpieza de datos obsoletos, consistencia e integridad.
+"""
+
+import logging
+from datetime import datetime, timedelta, timezone
+
+from app.worker.celery_app import celery_app
+from app.worker.db import get_worker_db, iter_tenant_schemas
+
+logger = logging.getLogger(__name__)
+
+
+# Módulo dueño: auth.
+@celery_app.task(name="app.worker.tasks.maintenance.cleanup_expired_sessions")
+def cleanup_expired_sessions():
+    """
+    Elimina sesiones expiradas o inactivas, por tenant activo.
+    Ejecuta cada 6 horas.
+    """
+    resultados = {}
+    for schema in iter_tenant_schemas():
+        clave = schema or "public"
+        try:
+            with get_worker_db(schema_name=schema) as db:
+                from app.auth.models import Session
+                from sqlalchemy import and_, or_
+
+                now = datetime.now(timezone.utc)
+                cutoff_inactive = now - timedelta(days=7)
+
+                count = (
+                    db.query(Session)
+                    .filter(
+                        or_(
+                            Session.expires_at < now,
+                            and_(Session.is_active == False, Session.last_activity < cutoff_inactive),
+                        )
+                    )
+                    .delete(synchronize_session=False)
+                )
+                db.commit()
+                logger.info(f"cleanup_expired_sessions: {count} sesiones eliminadas (tenant={clave})")
+                resultados[clave] = {"eliminadas": count}
+        except Exception:
+            logger.exception(f"cleanup_expired_sessions: fallo en tenant '{clave}'")
+
+    return resultados
+
+
+# Módulo dueño: auth.
+@celery_app.task(name="app.worker.tasks.maintenance.revoke_inactive_sessions")
+def revoke_inactive_sessions(days: int = 30):
+    """
+    Revoca sesiones que no han tenido actividad en N días, por tenant activo.
+    Ejecuta semanalmente (domingos 3:30 AM).
+    """
+    resultados = {}
+    for schema in iter_tenant_schemas():
+        clave = schema or "public"
+        try:
+            with get_worker_db(schema_name=schema) as db:
+                from app.auth.models import Session
+
+                cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+                count = (
+                    db.query(Session)
+                    .filter(
+                        Session.is_active == True,
+                        Session.last_activity < cutoff,
+                    )
+                    .update({"is_active": False}, synchronize_session=False)
+                )
+                db.commit()
+                logger.info(f"revoke_inactive_sessions: {count} sesiones revocadas (>{days} días inactivas, tenant={clave})")
+                resultados[clave] = {"revocadas": count}
+        except Exception:
+            logger.exception(f"revoke_inactive_sessions: fallo en tenant '{clave}'")
+
+    return resultados
+
+
+# Módulo dueño: notifications.
+@celery_app.task(name="app.worker.tasks.maintenance.cleanup_old_notifications")
+def cleanup_old_notifications(days: int = 30):
+    """
+    Elimina notificaciones leídas con más de N días, por tenant activo.
+    Ejecuta semanalmente (domingos 3:00 AM).
+    """
+    resultados = {}
+    for schema in iter_tenant_schemas():
+        clave = schema or "public"
+        try:
+            with get_worker_db(schema_name=schema) as db:
+                from app.notifications.models import Notification
+                from sqlalchemy import and_
+
+                cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+                count = (
+                    db.query(Notification)
+                    .filter(
+                        and_(
+                            Notification.is_read == True,
+                            Notification.created_at < cutoff,
+                        )
+                    )
+                    .delete(synchronize_session=False)
+                )
+                db.commit()
+                logger.info(f"cleanup_old_notifications: {count} notificaciones leídas eliminadas (>{days} días, tenant={clave})")
+                resultados[clave] = {"eliminadas": count}
+        except Exception:
+            logger.exception(f"cleanup_old_notifications: fallo en tenant '{clave}'")
+
+    return resultados
+
+
+# Módulo dueño: audit.
+@celery_app.task(name="app.worker.tasks.maintenance.cleanup_old_audit_logs")
+def cleanup_old_audit_logs(days: int = 90):
+    """
+    Elimina audit_logs con más de N días, por tenant activo.
+    Ejecuta el primer domingo del mes a las 4:00 AM.
+    El umbral respeta audit_configuration.log_retention_days si está configurado.
+    """
+    resultados = {}
+    for schema in iter_tenant_schemas():
+        clave = schema or "public"
+        try:
+            with get_worker_db(schema_name=schema) as db:
+                from app.audit.models import AuditLog
+
+                dias = days
+                # Intentar leer retención desde configuración del sistema
+                try:
+                    from app.configuration.models import SystemConfiguration
+                    config = (
+                        db.query(SystemConfiguration)
+                        .filter(SystemConfiguration.config_key == "log_retention_days")
+                        .first()
+                    )
+                    if config and config.config_value:
+                        dias = int(config.config_value)
+                except Exception:
+                    pass
+
+                cutoff = datetime.now(timezone.utc) - timedelta(days=dias)
+
+                count = (
+                    db.query(AuditLog)
+                    .filter(AuditLog.created_at < cutoff)
+                    .delete(synchronize_session=False)
+                )
+                db.commit()
+                logger.info(f"cleanup_old_audit_logs: {count} registros eliminados (>{dias} días, tenant={clave})")
+                resultados[clave] = {"eliminados": count}
+        except Exception:
+            logger.exception(f"cleanup_old_audit_logs: fallo en tenant '{clave}'")
+
+    return resultados
+
+
+# Módulo dueño: files (MinIO).
+@celery_app.task(name="app.worker.tasks.maintenance.cleanup_temp_files")
+def cleanup_temp_files(max_age_hours: int = 24):
+    """
+    Elimina objetos temporales en MinIO bajo el prefijo 'temp/' con más de N horas.
+    Los archivos temporales son exportaciones, previsualizaciones, etc. generadas por el sistema.
+    Bucket único global (no hay uno por tenant) -- no depende de tenant_schema_ctx.
+    Ejecuta diariamente a las 3:00 AM.
+    """
+    try:
+        from app.core.config import settings
+        import boto3
+        from botocore.config import Config
+
+        if not settings.MINIO_ENDPOINT:
+            logger.info("cleanup_temp_files: MinIO no configurado, omitiendo")
+            return {"eliminados": 0}
+
+        client = boto3.client(
+            "s3",
+            endpoint_url=settings.MINIO_ENDPOINT,
+            aws_access_key_id=settings.MINIO_ACCESS_KEY,
+            aws_secret_access_key=settings.MINIO_SECRET_KEY,
+            config=Config(signature_version="s3v4"),
+            region_name="us-east-1",
+        )
+
+        bucket = settings.MINIO_BUCKET
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+
+        eliminados = 0
+        continuation_token = None
+
+        while True:
+            kwargs = {"Bucket": bucket, "Prefix": "temp/"}
+            if continuation_token:
+                kwargs["ContinuationToken"] = continuation_token
+
+            response = client.list_objects_v2(**kwargs)
+            objects = response.get("Contents", [])
+
+            for obj in objects:
+                last_modified = obj["LastModified"]
+                # boto3 devuelve datetime timezone-aware (UTC)
+                if last_modified < cutoff:
+                    client.delete_object(Bucket=bucket, Key=obj["Key"])
+                    eliminados += 1
+                    logger.debug(f"cleanup_temp_files: eliminado {obj['Key']}")
+
+            if not response.get("IsTruncated"):
+                break
+            continuation_token = response.get("NextContinuationToken")
+
+        logger.info(f"cleanup_temp_files: {eliminados} objetos temporales eliminados de MinIO")
+        return {"eliminados": eliminados}
+
+    except ImportError:
+        logger.warning("cleanup_temp_files: boto3 no disponible")
+        return {"eliminados": 0}
+    except Exception as e:
+        logger.error(f"cleanup_temp_files error: {e}")
+        return {"eliminados": 0, "error": str(e)}
+
+
+# Módulo dueño: files.
+@celery_app.task(name="app.worker.tasks.maintenance.purge_deleted_files_and_folders")
+def purge_deleted_files_and_folders(days: int = 30):
+    """
+    Purga definitiva de la papelera: archivos y carpetas con `deleted_at` de
+    más de N días, por tenant activo. Antes de borrar la fila de un ARCHIVO,
+    borra su objeto de MinIO -- si ese borrado falla, se loggea y se sigue
+    con el resto del batch en vez de abortar todo (un objeto huérfano en
+    MinIO es preferible a una fila sin storage_key borrable). Las carpetas no
+    tienen storage propio -- solo se borra la fila.
+
+    Los `shares` que apunten a un archivo/carpeta purgado se limpian solos
+    por el `ON DELETE CASCADE` de la FK -- no hace falta lógica extra acá.
+    Ejecuta diariamente a las 4:00 AM (staggered de cleanup-temp-files, 3 AM).
+    """
+    resultados = {}
+    for schema in iter_tenant_schemas():
+        clave = schema or "public"
+        try:
+            with get_worker_db(schema_name=schema) as db:
+                # Import de todos los modelos referenciados por relationship()
+                # STRING desde la cadena File/Folder -> User -> Role (y lo que
+                # Role/User encadenen), por su efecto de lado de registrarlos en
+                # el registry de SQLAlchemy antes de la primera query. A
+                # diferencia del proceso backend (que importa esto transitivamente
+                # vía app.main -> api_router), este worker Celery solo importa los
+                # módulos de app/worker/tasks/ -- sin esto, configure_mappers()
+                # revienta con "expression 'User' failed to locate a name" (y
+                # luego 'Role', encadenado) apenas se hace la primera query a
+                # File/Folder en este proceso. Mismo listado de imports que usa
+                # migrations/env.py para el mismo propósito ("Import all models
+                # to register them with Base.metadata") -- reproducido y
+                # confirmado durante la verificación de esta tarea (2026-09-06).
+                from app.auth.models import Session, PasswordResetSession  # noqa: F401
+                from app.users.models import User  # noqa: F401
+                from app.access_control.models import (  # noqa: F401
+                    Role, Permission, RolePermission, UserPermissionOverride,
+                )
+                from app.files.models import File, Folder
+                from app.files.service import delete_private_file
+                from app.storage_quota.repository import user_storage_quota_repo
+
+                cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+                files_purgados = 0
+                files_a_purgar = (
+                    db.query(File)
+                    .filter(File.deleted_at.isnot(None), File.deleted_at < cutoff)
+                    .all()
+                )
+                for file_obj in files_a_purgar:
+                    file_id, storage_key = file_obj.id, file_obj.storage_key
+                    owner_id, size_bytes = file_obj.owner_id, file_obj.size_bytes
+                    try:
+                        delete_private_file(storage_key)
+                    except Exception:
+                        logger.exception(
+                            f"purge_deleted_files_and_folders: fallo borrando de MinIO "
+                            f"'{storage_key}' (file_id={file_id}), se continúa"
+                        )
+                    try:
+                        db.delete(file_obj)
+                        db.commit()
+                        files_purgados += 1
+                    except Exception:
+                        db.rollback()
+                        logger.exception(
+                            f"purge_deleted_files_and_folders: fallo borrando fila de archivo "
+                            f"{file_id}, se continúa"
+                        )
+                        continue
+
+                    # Consumo real -- decrementar recién cuando la purga quedó
+                    # confirmada (fila borrada). No se toca en soft-delete/restore
+                    # (ver app/storage_quota/repository.py::adjust_bytes_used).
+                    try:
+                        user_storage_quota_repo.adjust_bytes_used(db, owner_id, -size_bytes)
+                    except Exception:
+                        # Mismo criterio que el except de arriba (borrado de fila): sin este
+                        # rollback, un fallo transitorio de DB acá deja la sesión en
+                        # transacción abortada y el resto del batch de esta corrida falla
+                        # en cascada con errores engañosos (hallazgo de la revisión
+                        # adversarial, Fase 3, 2026-09-08).
+                        db.rollback()
+                        logger.exception(
+                            f"purge_deleted_files_and_folders: fallo actualizando cuota de "
+                            f"almacenamiento de owner_id={owner_id} (file_id={file_id}), se continúa"
+                        )
+
+                carpetas_purgadas = (
+                    db.query(Folder)
+                    .filter(Folder.deleted_at.isnot(None), Folder.deleted_at < cutoff)
+                    .delete(synchronize_session=False)
+                )
+                db.commit()
+
+                logger.info(
+                    f"purge_deleted_files_and_folders: {files_purgados} archivos y "
+                    f"{carpetas_purgadas} carpetas purgados (>{days} días en papelera, tenant={clave})"
+                )
+                resultados[clave] = {"archivos": files_purgados, "carpetas": carpetas_purgadas}
+        except Exception:
+            logger.exception(f"purge_deleted_files_and_folders: fallo en tenant '{clave}'")
+
+    return resultados

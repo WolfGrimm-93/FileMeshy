@@ -1,0 +1,74 @@
+@utility gradient-primary {
+  /* ===== GRADIENTES PERSONALIZADOS (paleta FileMeshy) ===== */
+  @apply bg-linear-to-r from-[#3A64D9] via-[#6552E0] to-[#22D3EE];
+}
+
+@utility gradient-soft {
+  @apply bg-linear-to-br from-brand-50 to-gray-50;
+}
+
+@utility gradient-brand {
+  @apply bg-linear-to-br from-[#3A64D9] to-brand-700;
+}
+
+@utility gradient-dark {
+  @apply bg-linear-to-br from-[#0B1638] to-[#050914];
+}
+
+@utility text-gradient {
+  /* Gradiente de marca (navy -> índigo -> azul -> cian, el mismo del ícono) */
+  @apply bg-clip-text text-transparent bg-linear-to-r from-[#4531A5] via-[#3A64D9] to-[#22D3EE];
+}
+
+@utility shadow-primary {
+  /* ===== SOMBRAS PERSONALIZADAS ===== */
+  box-shadow: 0 4px 20px rgba(58, 100, 217, 0.15);
+}
+
+@utility shadow-brand {
+  box-shadow: 0 4px 20px rgba(58, 100, 217, 0.25);
+}
+
+@utility shadow-dark {
+  box-shadow: 0 4px 20px rgba(11, 22, 56, 0.15);
+}
+
+@utility animate-fade-in {
+  /* ===== ANIMACIONES ===== */
+  animation: fadeIn 0.3s ease-in;
+}
+
+@utility animate-fadeIn {
+  animation: fadeIn 0.3s ease-out;
+}
+
+@utility animate-slide-in {
+  animation: slideIn 0.3s ease-out;
+}
+
+/* ============================================
+   UTILITIES
+   Custom utility classes
+   ============================================ */
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(-10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes slideIn {
+  from {
+    opacity: 0;
+    transform: translateX(-20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}

@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/icon-32x32.png" />
+    <link rel="icon" type="image/png" sizes="16x16" href="/icon-16x16.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/manifest.json" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="FileMeshy - Almacenamiento de archivos" />
+    <title>FileMeshy</title>
+    <script>
+      // Aplicar tema ANTES de que pinte nada — misma clave que ThemeProvider
+      ;(function() {
+        try {
+          var theme = localStorage.getItem('filemeshy_theme') || 'dark';
+          var isDark = theme === 'dark' || (theme !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+          if (isDark) document.documentElement.classList.add('dark');
+        } catch (e) {
+          if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
+            document.documentElement.classList.add('dark');
+          }
+        }
+      })();
+    </script>
+    <style>
+      /*
+        Tailwind v4 usa @layer nativo del navegador para sus utilities (antes,
+        en v3, todo era CSS plano). Cualquier CSS SIN capa (como este reset,
+        que corre antes de que React/Tailwind carguen) le gana automáticamente
+        a CUALQUIER regla dentro de una @layer sin importar especificidad --
+        por eso el reset universal de acá abajo, antes inofensivo, empezaba a
+        pisar utilities como p-*/space-y-*. Poniéndolo en la misma capa `base`
+        que usa Tailwind se resuelve: mismo mecanismo, prioridad correcta.
+
+        Nota: este <style> va ANTES del <link> que carga el CSS de Tailwind,
+        así que la capa `base` de acá queda registrada primero -- el orden
+        real de capas termina siendo base, properties, theme, components,
+        utilities (no theme, base, components, utilities como en el orden
+        "canónico" de Tailwind). Funciona igual porque lo único que importa
+        es que `base` quede por debajo de `components`/`utilities`, y así
+        es. Si algún día se agrega algo a `@layer theme`/`properties` que
+        toque margin/padding/box-sizing sobre `*`, revisar este orden.
+      */
+      @layer base {
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body, #root { width: 100%; height: 100%; min-height: 100vh; overflow-x: hidden; }
+      }
+
+      /* Fondo del tema — coincide exactamente con CSS vars de index.css */
+      html       { background: hsl(220, 20%, 97%); }
+      html.dark  { background: hsl(224, 71%, 4%); }
+
+      /* Splash nativo — visible mientras React carga */
+      #splash {
+        display: flex; align-items: center; justify-content: center;
+        min-height: 100vh; position: fixed; inset: 0; z-index: 9999;
+        background: inherit;
+        transition: opacity 0.2s ease-out;
+      }
+      #splash .spinner {
+        width: 40px; height: 40px;
+        border: 3px solid hsl(220, 13%, 91%);
+        border-top-color: #3A64D9;
+        border-radius: 50%;
+        animation: spin 0.7s linear infinite;
+      }
+      html.dark #splash .spinner {
+        border-color: hsl(217, 19%, 17%);
+        border-top-color: #3A64D9;
+      }
+      @keyframes spin { to { transform: rotate(360deg); } }
+    </style>
+  </head>
+  <body>
+    <!-- Splash nativo: React lo elimina automaticamente al montar -->
+    <div id="splash">
+      <div class="spinner"></div>
+    </div>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

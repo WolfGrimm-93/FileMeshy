@@ -1,0 +1,45 @@
+# Cada subproyecto (filemeshy_back/, filemeshy_front/) tiene su propio
+# .gitignore con las reglas específicas de su stack. Este archivo es solo
+# para lo que puede aparecer en la raíz o como red de seguridad general.
+
+# Variables de entorno (nunca subir secretos reales)
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Dependencias (red de seguridad — cada subproyecto ya las ignora también)
+node_modules/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Builds
+dist/
+build/
+
+# Logs
+*.log
+
+# Editores
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Worktrees de git (.claude/worktrees/<nombre>/) — copias de trabajo locales,
+# nunca se versionan
+.claude/
+
+# Notas de Claude Code e infraestructura real de producción (dominio, topología
+# de despliegue, rutas a otros proyectos del mismo servidor) — no van a un repo
+# que pueda hacerse público
+CLAUDE.md
+docker-compose.prod.yml

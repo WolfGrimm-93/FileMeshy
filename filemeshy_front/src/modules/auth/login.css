@@ -1,0 +1,40 @@
+/**
+ * Tipografía y animaciones EXCLUSIVAS de /login.
+ * Todo va detrás de la clase `.filemeshy-login-scope` (o `.mesh-node-pulse`,
+ * que solo existe dentro del SVG del fondo de esta pantalla) para no
+ * filtrarse al resto de la app -- este archivo solo lo importa LoginPage.tsx.
+ */
+
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&family=Space+Grotesk:wght@500;600;700&display=swap');
+
+.filemeshy-login-scope {
+  font-family: 'DM Sans', system-ui, sans-serif;
+}
+
+.filemeshy-login-scope .heading-font {
+  font-family: 'Space Grotesk', system-ui, sans-serif;
+}
+
+/* Pulso suave en algunos nodos del mesh -- sugiere red "viva", sin ser una
+   animación llamativa. Respeta prefers-reduced-motion. */
+@keyframes filemeshy-mesh-glow {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 0.95;
+  }
+}
+
+.mesh-node-pulse {
+  animation: filemeshy-mesh-glow 6s ease-in-out infinite;
+  transform-origin: center;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mesh-node-pulse {
+    animation: none;
+    opacity: 0.7;
+  }
+}

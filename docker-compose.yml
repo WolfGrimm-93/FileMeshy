@@ -1,0 +1,112 @@
+# Orquesta los 2 subproyectos (backend/frontend) para probarlos juntos en local.
+#
+# Stack completamente AISLADO de cualquier base de datos compartida con otros
+# proyectos en la misma máquina -- este compose levanta su PROPIO
+# Postgres/Redis/MinIO vacíos, en un rango de puertos distinto (58100-58105)
+# para no chocar ni confundirse con nada de eso. Las credenciales de abajo son
+# de desarrollo local solamente, no se usan en ningún entorno real.
+#
+# Uso:
+#   docker compose up --build           # backend + frontend + DB + redis + minio + worker
+#
+# Pendiente conocido (ver pendiente.md): la migración baseline crea el schema
+# pero no siembra `permissions`/`role_permissions` -- después de `up`, la API
+# funciona pero el RBAC no tiene permisos cargados todavía.
+
+x-backend-env: &backend-env
+  ENVIRONMENT: development
+  DEBUG: "True"
+  PROJECT_NAME: FileMeshy API
+  DATABASE_URL: postgresql://filemeshy:filemeshy_dev_only@postgres:5432/filemeshy
+  SECRET_KEY: dev-only-secret-do-not-use-in-production
+  REDIS_URL: redis://redis:6379/0
+  CELERY_BROKER_URL: redis://redis:6379/1
+  CELERY_RESULT_BACKEND: redis://redis:6379/2
+  MINIO_ENDPOINT: http://minio:9000
+  MINIO_ACCESS_KEY: filemeshy_minio_admin
+  MINIO_SECRET_KEY: filemeshy_minio_dev_only
+  MINIO_PUBLIC_URL: http://localhost:58102
+  MINIO_BUCKET: filemeshy-media
+  MINIO_PRIVATE_BUCKET: filemeshy-media-private
+  BACKEND_CORS_ORIGINS: '["http://localhost:58100"]'
+  DEPLOYMENT_MODE: local
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: filemeshy
+      POSTGRES_PASSWORD: filemeshy_dev_only
+      POSTGRES_DB: filemeshy
+    ports:
+      - "58104:5432"
+    volumes:
+      - filemeshy_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U filemeshy"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "58105:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: filemeshy_minio_admin
+      MINIO_ROOT_PASSWORD: filemeshy_minio_dev_only
+    ports:
+      - "58102:9000"
+      - "58103:9001"
+    volumes:
+      - filemeshy_minio_data:/data
+
+  backend:
+    build:
+      context: ./filemeshy_back
+    environment:
+      <<: *backend-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    ports:
+      - "58101:8000"
+
+  celery_worker:
+    build:
+      context: ./filemeshy_back
+    command: celery -A app.worker.celery_app worker --loglevel=info
+    environment:
+      <<: *backend-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+
+  frontend:
+    build:
+      context: ./filemeshy_front
+    depends_on:
+      - backend
+    ports:
+      - "58100:80"
+
+volumes:
+  filemeshy_postgres_data:
+  filemeshy_minio_data:
