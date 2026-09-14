@@ -1,0 +1,15 @@
+# Normaliza los finales de línea a LF para todo archivo de texto,
+# sin importar el sistema operativo donde se edite o clone el repo.
+* text=auto eol=lf
+
+# Binarios: nunca tocar finales de línea.
+*.pdf binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.eot binary
