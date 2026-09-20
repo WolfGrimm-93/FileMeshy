@@ -6,6 +6,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
+from app.tags.schemas import TagOut
+
 
 # ==================== Breadcrumb ====================
 
@@ -27,6 +29,7 @@ class FolderOut(BaseModel):
     updated_at: datetime
     deleted_at: Optional[datetime] = None
     is_favorite: bool = False
+    tags: List[TagOut] = Field(default_factory=list)
 
     class Config:
         from_attributes = True
@@ -68,6 +71,7 @@ class FileOut(BaseModel):
     updated_at: datetime
     deleted_at: Optional[datetime] = None
     is_favorite: bool = False
+    tags: List[TagOut] = Field(default_factory=list)
 
     class Config:
         from_attributes = True
@@ -95,6 +99,16 @@ class CopyRequest(BaseModel):
     (debe pertenecer al mismo dueño del original, ver `_get_target_parent_folder`
     en el router)."""
     folder_id: Optional[UUID] = None
+
+
+# ==================== Tags (Ronda 2) ====================
+
+class TagIdsUpdate(BaseModel):
+    """Body de `PUT /files/{id}/tags` y `PUT /folders/{id}/tags` --
+    REEMPLAZA el set completo de etiquetas del archivo/carpeta (no es
+    incremental add/remove). Todos los ids deben pertenecer al usuario
+    dueño del archivo/carpeta -- ver `_resolve_owned_tags` en el router."""
+    tag_ids: List[UUID] = Field(default_factory=list)
 
 
 # ==================== Listado de directorio ====================

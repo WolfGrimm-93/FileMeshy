@@ -31,6 +31,7 @@ import {
   StarOff,
   ArrowUpNarrowWide,
   ArrowDownWideNarrow,
+  Tags,
 } from 'lucide-react'
 import { DataTable, type Column } from '@/ui/tables/DataTable'
 import { TableFilters } from '@/ui/tables/TableFilters'
@@ -53,6 +54,8 @@ import MoveModal, { type MoveTarget } from '../components/MoveModal'
 import UploadModal from '../components/UploadModal'
 import ShareModal, { type ShareTarget } from '../components/ShareModal'
 import PreviewModal, { type PreviewTarget } from '../components/PreviewModal'
+import TagsModal, { type TagsTarget } from '../components/TagsModal'
+import TagChips from '../components/TagChips'
 import FileGridView from '../components/FileGridView'
 import type { DirectoryListing, FileOut, FolderOut } from '../types'
 
@@ -119,6 +122,7 @@ export default function FilesPage() {
   const [deleteTarget, setDeleteTarget] = useState<Row | null>(null)
   const [shareTarget, setShareTarget] = useState<ShareTarget | null>(null)
   const [previewTarget, setPreviewTarget] = useState<PreviewTarget | null>(null)
+  const [tagsTarget, setTagsTarget] = useState<TagsTarget | null>(null)
 
   const [viewMode, setViewModeState] = useState<ViewMode>(() => {
     const stored = localStorage.getItem(VIEW_MODE_STORAGE_KEY)
@@ -463,6 +467,24 @@ export default function FilesPage() {
       })
     }
 
+    // Etiquetas: mismo gate que Favorito -- el backend solo exige el permiso de
+    // visualización correspondiente (files.view/folders.view), no uno de escritura
+    // sobre el elemento en sí.
+    const canTag =
+      row.type === 'folder' ? hasPermission(Permission.VIEW_FOLDERS) : hasPermission(Permission.VIEW_FILES)
+    if (canTag) {
+      items.push({
+        label: 'Etiquetas',
+        icon: <Tags className="size-4" />,
+        onClick: () =>
+          setTagsTarget({
+            id: row.id,
+            type: row.type,
+            currentTagIds: (row.raw.tags ?? []).map((t) => t.id),
+          }),
+      })
+    }
+
     const canDelete =
       row.type === 'folder' ? hasPermission(Permission.DELETE_FOLDERS) : hasPermission(Permission.DELETE_FILES)
     if (canDelete) {
@@ -483,25 +505,28 @@ export default function FilesPage() {
       key: 'name',
       label: 'Nombre',
       render: (_value, row) => (
-        <div
-          className={`flex items-center gap-2 ${
-            row.type === 'folder' || !showTrash ? 'cursor-pointer select-none' : ''
-          }`}
-          onDoubleClick={() => {
-            if (row.type === 'folder') handleNavigate(row.id)
-            else if (!showTrash) handlePreview(row)
-          }}
-          title={row.type === 'folder' ? 'Doble clic para entrar' : !showTrash ? 'Doble clic para previsualizar' : undefined}
-        >
-          {row.type === 'folder' ? (
-            <Folder className="size-4 text-brand-500 shrink-0" />
-          ) : (
-            <FileIcon className="size-4 text-gray-400 shrink-0" />
-          )}
-          <span className="truncate font-medium text-gray-900 dark:text-white">{row.name}</span>
-          {Boolean(row.raw?.is_favorite) && (
-            <Star className="size-3.5 shrink-0 fill-current text-yellow-500" aria-label="Favorito" />
-          )}
+        <div className="flex flex-col gap-0.5 py-0.5">
+          <div
+            className={`flex items-center gap-2 ${
+              row.type === 'folder' || !showTrash ? 'cursor-pointer select-none' : ''
+            }`}
+            onDoubleClick={() => {
+              if (row.type === 'folder') handleNavigate(row.id)
+              else if (!showTrash) handlePreview(row)
+            }}
+            title={row.type === 'folder' ? 'Doble clic para entrar' : !showTrash ? 'Doble clic para previsualizar' : undefined}
+          >
+            {row.type === 'folder' ? (
+              <Folder className="size-4 text-brand-500 shrink-0" />
+            ) : (
+              <FileIcon className="size-4 text-gray-400 shrink-0" />
+            )}
+            <span className="truncate font-medium text-gray-900 dark:text-white">{row.name}</span>
+            {Boolean(row.raw?.is_favorite) && (
+              <Star className="size-3.5 shrink-0 fill-current text-yellow-500" aria-label="Favorito" />
+            )}
+          </div>
+          <TagChips tags={row.raw.tags ?? []} className="pl-6" />
         </div>
       ),
     },
@@ -754,6 +779,8 @@ export default function FilesPage() {
       <ShareModal target={shareTarget} onClose={() => setShareTarget(null)} />
 
       <PreviewModal target={previewTarget} onClose={() => setPreviewTarget(null)} />
+
+      <TagsModal target={tagsTarget} onClose={() => setTagsTarget(null)} onSaved={() => loadListing()} />
 
       {deleteTarget && (
         <DeleteConfirmDialog

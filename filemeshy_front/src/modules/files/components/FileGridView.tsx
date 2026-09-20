@@ -11,6 +11,7 @@
 import { Folder, MoreVertical, Star } from 'lucide-react'
 import { Dropdown, type DropdownItem } from '@/ui/dropdown/Dropdown'
 import { getFileTypeIcon } from '@/shared/utils/fileTypeIcon'
+import TagChips from './TagChips'
 import type { Row } from '../pages/FilesPage'
 import type { FileOut } from '../types'
 
@@ -77,6 +78,7 @@ export default function FileGridView({ rows, size, showTrash, onNavigate, onPrev
             )}
             <Icon className={`${ICON_SIZE_CLASSES[size]} ${iconColorClass} flex-shrink-0`} />
             <span className="w-full truncate text-sm font-medium text-gray-900 dark:text-white">{row.name}</span>
+            <TagChips tags={row.raw.tags ?? []} className="justify-center" />
           </div>
         )
       })}

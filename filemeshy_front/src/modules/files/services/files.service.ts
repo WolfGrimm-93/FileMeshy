@@ -95,6 +95,14 @@ class FilesService {
     return response.data
   }
 
+  /** Reemplaza el set completo de etiquetas del archivo. */
+  async setTags(fileId: string, tagIds: string[]): Promise<FileOut> {
+    const response = await axiosInstance.put<FileOut>(`${this.basePath}/${fileId}/tags`, {
+      tag_ids: tagIds,
+    })
+    return response.data
+  }
+
   async copy(fileId: string, folderId?: string | null): Promise<FileOut> {
     const response = await axiosInstance.post<FileOut>(`${this.basePath}/${fileId}/copy`, {
       folder_id: folderId ?? null,

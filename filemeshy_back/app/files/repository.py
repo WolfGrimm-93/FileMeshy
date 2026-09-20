@@ -9,10 +9,11 @@ from typing import List, Optional
 from uuid import UUID
 
 from sqlalchemy import text
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.files.models import File, Folder, Share
 from app.shared.repository_base import CRUDBase
+from app.tags.models import file_tags, folder_tags
 
 # Whitelist de columnas ordenables por modelo -- el valor de `sort_by` llega
 # directo de un query param del cliente, NUNCA se interpola en el `order_by`
@@ -59,8 +60,9 @@ class CRUDFolder(CRUDBase[Folder, None, None]):
         sort_by: str = "name",
         sort_dir: str = "asc",
         favorites_only: bool = False,
+        tag_id: Optional[UUID] = None,
     ) -> List[Folder]:
-        query = db.query(Folder).filter(
+        query = db.query(Folder).options(selectinload(Folder.tags)).filter(
             Folder.owner_id == owner_id, Folder.deleted_at.is_(None)
         )
         if parent_id is None:
@@ -69,6 +71,10 @@ class CRUDFolder(CRUDBase[Folder, None, None]):
             query = query.filter(Folder.parent_id == parent_id)
         if favorites_only:
             query = query.filter(Folder.is_favorite.is_(True))
+        if tag_id is not None:
+            query = query.join(folder_tags, folder_tags.c.folder_id == Folder.id).filter(
+                folder_tags.c.tag_id == tag_id
+            )
         return query.order_by(_resolve_sort_column(_FOLDER_SORT_COLUMNS, sort_by, sort_dir)).all()
 
     def get_trash(
@@ -78,12 +84,17 @@ class CRUDFolder(CRUDBase[Folder, None, None]):
         sort_by: str = "name",
         sort_dir: str = "asc",
         favorites_only: bool = False,
+        tag_id: Optional[UUID] = None,
     ) -> List[Folder]:
-        query = db.query(Folder).filter(Folder.deleted_at.isnot(None))
+        query = db.query(Folder).options(selectinload(Folder.tags)).filter(Folder.deleted_at.isnot(None))
         if owner_id is not None:
             query = query.filter(Folder.owner_id == owner_id)
         if favorites_only:
             query = query.filter(Folder.is_favorite.is_(True))
+        if tag_id is not None:
+            query = query.join(folder_tags, folder_tags.c.folder_id == Folder.id).filter(
+                folder_tags.c.tag_id == tag_id
+            )
         return query.order_by(_resolve_sort_column(_FOLDER_SORT_COLUMNS, sort_by, sort_dir)).all()
 
     def search(
@@ -94,14 +105,19 @@ class CRUDFolder(CRUDBase[Folder, None, None]):
         sort_by: str = "name",
         sort_dir: str = "asc",
         favorites_only: bool = False,
+        tag_id: Optional[UUID] = None,
     ) -> List[Folder]:
-        query = db.query(Folder).filter(
+        query = db.query(Folder).options(selectinload(Folder.tags)).filter(
             Folder.owner_id == owner_id,
             Folder.deleted_at.is_(None),
             Folder.name.ilike(f"%{q}%"),
         )
         if favorites_only:
             query = query.filter(Folder.is_favorite.is_(True))
+        if tag_id is not None:
+            query = query.join(folder_tags, folder_tags.c.folder_id == Folder.id).filter(
+                folder_tags.c.tag_id == tag_id
+            )
         return query.order_by(_resolve_sort_column(_FOLDER_SORT_COLUMNS, sort_by, sort_dir)).all()
 
     def get_descendant_ids(self, db: Session, folder_id: UUID) -> List[UUID]:
@@ -172,8 +188,9 @@ class CRUDFile(CRUDBase[File, None, None]):
         sort_by: str = "name",
         sort_dir: str = "asc",
         favorites_only: bool = False,
+        tag_id: Optional[UUID] = None,
     ) -> List[File]:
-        query = db.query(File).filter(
+        query = db.query(File).options(selectinload(File.tags)).filter(
             File.owner_id == owner_id, File.deleted_at.is_(None)
         )
         if folder_id is None:
@@ -182,6 +199,10 @@ class CRUDFile(CRUDBase[File, None, None]):
             query = query.filter(File.folder_id == folder_id)
         if favorites_only:
             query = query.filter(File.is_favorite.is_(True))
+        if tag_id is not None:
+            query = query.join(file_tags, file_tags.c.file_id == File.id).filter(
+                file_tags.c.tag_id == tag_id
+            )
         return query.order_by(_resolve_sort_column(_FILE_SORT_COLUMNS, sort_by, sort_dir)).all()
 
     def get_trash(
@@ -191,12 +212,17 @@ class CRUDFile(CRUDBase[File, None, None]):
         sort_by: str = "name",
         sort_dir: str = "asc",
         favorites_only: bool = False,
+        tag_id: Optional[UUID] = None,
     ) -> List[File]:
-        query = db.query(File).filter(File.deleted_at.isnot(None))
+        query = db.query(File).options(selectinload(File.tags)).filter(File.deleted_at.isnot(None))
         if owner_id is not None:
             query = query.filter(File.owner_id == owner_id)
         if favorites_only:
             query = query.filter(File.is_favorite.is_(True))
+        if tag_id is not None:
+            query = query.join(file_tags, file_tags.c.file_id == File.id).filter(
+                file_tags.c.tag_id == tag_id
+            )
         return query.order_by(_resolve_sort_column(_FILE_SORT_COLUMNS, sort_by, sort_dir)).all()
 
     def search(
@@ -207,14 +233,19 @@ class CRUDFile(CRUDBase[File, None, None]):
         sort_by: str = "name",
         sort_dir: str = "asc",
         favorites_only: bool = False,
+        tag_id: Optional[UUID] = None,
     ) -> List[File]:
-        query = db.query(File).filter(
+        query = db.query(File).options(selectinload(File.tags)).filter(
             File.owner_id == owner_id,
             File.deleted_at.is_(None),
             File.name.ilike(f"%{q}%"),
         )
         if favorites_only:
             query = query.filter(File.is_favorite.is_(True))
+        if tag_id is not None:
+            query = query.join(file_tags, file_tags.c.file_id == File.id).filter(
+                file_tags.c.tag_id == tag_id
+            )
         return query.order_by(_resolve_sort_column(_FILE_SORT_COLUMNS, sort_by, sort_dir)).all()
 
     def get_by_folder_ids(self, db: Session, folder_ids: List[UUID]) -> List[File]:

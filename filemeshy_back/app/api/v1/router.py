@@ -13,6 +13,7 @@ from app.access_control.router import roles_router, permissions_router
 from app.notifications.router import router as notifications_router
 from app.files.router import folders_router, files_router, shares_router, public_shares_router
 from app.storage_quota.router import router as storage_quota_router
+from app.tags.router import router as tags_router
 from app.shared.feature_flags import router as feature_flags_router
 
 # Router principal V1 - prefijo /api/v1 se define aquí
@@ -65,6 +66,11 @@ api_router.include_router(files_router, prefix="/files", tags=["files"])
 # acceso público de solo lectura por token (sin Depends(get_current_user)).
 api_router.include_router(shares_router, prefix="/shares", tags=["shares"])
 api_router.include_router(public_shares_router, prefix="/public/shares", tags=["public-shares"])
+
+# Etiquetas personales (Ronda 2): CRUD propio bajo /tags + los endpoints
+# PUT /files/{id}/tags y PUT /folders/{id}/tags que cuelgan de files_router/
+# folders_router de arriba (mismo motivo que los shares autenticados).
+api_router.include_router(tags_router, prefix="/tags", tags=["tags"])
 
 # Cuotas de almacenamiento por usuario (pantalla admin, Hito 3) -- prefijo
 # /storage-quotas ya fijado en el propio router.

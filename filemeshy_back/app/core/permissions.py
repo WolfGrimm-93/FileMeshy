@@ -41,6 +41,12 @@ CANONICAL_PERMISSIONS = {
     'shares.revoke': 'Revocar enlaces compartidos',
     'shares.manage': 'Gestionar todos los enlaces compartidos',
 
+    # Etiquetas (Ronda 2) -- CRUD de las propias etiquetas (app/tags/router.py).
+    # Asignar/quitar etiquetas de un archivo o carpeta puntual NO usa este
+    # permiso -- reusa files.view/folders.view, mismo criterio que is_favorite
+    # (ver PUT /files/{id}/tags y PUT /folders/{id}/tags en app/files/router.py).
+    'tags.manage': 'Gestionar las propias etiquetas',
+
     # Usuarios
     'users.view': 'Ver usuarios',
     'users.create': 'Crear usuarios',
@@ -206,6 +212,9 @@ ROLE_PERMISSIONS_CANONICAL = {
         'shares.revoke',
         'shares.manage',
 
+        # Etiquetas
+        'tags.manage',
+
         # Usuarios
         'users.view',
         'users.create',
@@ -235,6 +244,12 @@ ROLE_PERMISSIONS_CANONICAL = {
         'files.upload',
         'files.download',
         'folders.view',
+
+        # Etiquetas -- gestionar las propias es uso básico del Drive, mismo
+        # criterio que favoritear (Ronda 1): no debería requerir un rol
+        # elevado para que el caso de uso principal de esta ronda sea
+        # utilizable por el rol por defecto.
+        'tags.manage',
     ],
 }
 

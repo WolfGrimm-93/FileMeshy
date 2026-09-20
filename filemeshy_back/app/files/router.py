@@ -57,6 +57,7 @@ from app.files.schemas import (
     PublicFolderShareOut,
     ShareCreate,
     ShareOut,
+    TagIdsUpdate,
 )
 from app.files.service import (
     delete_private_file,
@@ -66,6 +67,8 @@ from app.files.service import (
     upload_private_file,
 )
 from app.storage_quota.service import reserve_upload_bytes, release_upload_bytes
+from app.tags.models import Tag
+from app.tags.repository import tag_repo
 from app.users.models import User
 
 folders_router = APIRouter()
@@ -184,6 +187,26 @@ def _share_to_out(share: Share) -> ShareOut:
         created_at=share.created_at,
         is_active=is_active,
     )
+
+
+def _resolve_owned_tags(db: Session, owner_id: UUID, tag_ids: List[UUID]) -> List[Tag]:
+    """Resuelve una lista de `tag_ids` a sus filas `Tag` reales, validando
+    que TODAS pertenezcan a `owner_id` -- criterio "todo o nada": si algún id
+    no existe o es de otro usuario, 404 en vez de aplicar en silencio el
+    subconjunto válido (evita que un usuario le asigne a un archivo propio
+    una etiqueta ajena adivinando/probando ids, ver test_files_tags.py).
+    Deduplica preservando orden (un mismo id repetido en el body no debe
+    romper la comparación de longitudes)."""
+    unique_ids = list(dict.fromkeys(tag_ids))
+    if not unique_ids:
+        return []
+    tags = tag_repo.get_by_ids_for_owner(db, owner_id, unique_ids)
+    if len(tags) != len(unique_ids):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Una o más etiquetas no existen o no pertenecen al usuario",
+        )
+    return tags
 
 
 def _get_target_parent_folder(db: Session, parent_id: UUID, owner_id: UUID) -> Folder:
@@ -558,6 +581,28 @@ def update_folder(
     return folder
 
 
+@folders_router.put("/{folder_id}/tags", response_model=FolderOut)
+def set_folder_tags(
+    folder_id: UUID,
+    payload: TagIdsUpdate,
+    db: Session = Depends(get_db),
+    # Mismo gate que update_folder (folders.view, no folders.rename/move) --
+    # taggear es una preferencia personal de organización sobre un recurso
+    # ya validado por ownership, no una operación de bajo riesgo asimilable
+    # a renombrar/mover (mismo criterio que is_favorite, ver comentario de
+    # update_folder más arriba -- no repetir el bug corregido en Ronda 1).
+    current_user: User = Depends(has_permission(["folders.view"])),
+):
+    """Reemplaza el set COMPLETO de etiquetas de la carpeta (no incremental).
+    Todos los `tag_ids` deben pertenecer al usuario dueño de la carpeta --
+    ver `_resolve_owned_tags`."""
+    folder = _get_owned_folder(db, folder_id, current_user, active_only=True)
+    folder.tags = _resolve_owned_tags(db, folder.owner_id, payload.tag_ids)
+    db.commit()
+    db.refresh(folder)
+    return folder
+
+
 @folders_router.delete("/{folder_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_folder(
     folder_id: UUID,
@@ -657,12 +702,13 @@ def list_directory(
     sort_by: str = Query("name"),
     sort_dir: str = Query("asc"),
     favorites_only: bool = Query(False),
+    tag_id: Optional[UUID] = Query(None),
     db: Session = Depends(get_db),
     current_user: User = Depends(has_permission(["files.view"])),
 ):
     if q:
-        folders = folder_repo.search(db, current_user.id, q, sort_by, sort_dir, favorites_only)
-        files = file_repo.search(db, current_user.id, q, sort_by, sort_dir, favorites_only)
+        folders = folder_repo.search(db, current_user.id, q, sort_by, sort_dir, favorites_only, tag_id)
+        files = file_repo.search(db, current_user.id, q, sort_by, sort_dir, favorites_only, tag_id)
         return DirectoryListing(folders=folders, files=files, breadcrumb=[])
 
     if trash:
@@ -670,8 +716,8 @@ def list_directory(
         # arriba: admin accede a recursos puntuales por ID (ver _get_owned_folder/_get_owned_file),
         # no ve la papelera ajena solo por tener rol admin (hallazgo del auditor final, 2026-09-05).
         owner_filter = current_user.id
-        folders = folder_repo.get_trash(db, owner_filter, sort_by, sort_dir, favorites_only)
-        files = file_repo.get_trash(db, owner_filter, sort_by, sort_dir, favorites_only)
+        folders = folder_repo.get_trash(db, owner_filter, sort_by, sort_dir, favorites_only, tag_id)
+        files = file_repo.get_trash(db, owner_filter, sort_by, sort_dir, favorites_only, tag_id)
         return DirectoryListing(folders=folders, files=files, breadcrumb=[])
 
     breadcrumb: List[BreadcrumbItem] = []
@@ -682,8 +728,8 @@ def list_directory(
     else:
         owner_scope = current_user.id
 
-    folders = folder_repo.get_children(db, owner_scope, folder_id, sort_by, sort_dir, favorites_only)
-    files = file_repo.get_children(db, owner_scope, folder_id, sort_by, sort_dir, favorites_only)
+    folders = folder_repo.get_children(db, owner_scope, folder_id, sort_by, sort_dir, favorites_only, tag_id)
+    files = file_repo.get_children(db, owner_scope, folder_id, sort_by, sort_dir, favorites_only, tag_id)
     return DirectoryListing(folders=folders, files=files, breadcrumb=breadcrumb)
 
 
@@ -845,6 +891,25 @@ def update_file(
     if "is_favorite" in fields_set and payload.is_favorite is not None:
         file_obj.is_favorite = payload.is_favorite
 
+    db.commit()
+    db.refresh(file_obj)
+    return file_obj
+
+
+@files_router.put("/{file_id}/tags", response_model=FileOut)
+def set_file_tags(
+    file_id: UUID,
+    payload: TagIdsUpdate,
+    db: Session = Depends(get_db),
+    # Mismo gate que update_file (files.view, no files.rename/move) -- ver
+    # comentario de set_folder_tags / update_file más arriba.
+    current_user: User = Depends(has_permission(["files.view"])),
+):
+    """Reemplaza el set COMPLETO de etiquetas del archivo (no incremental).
+    Todos los `tag_ids` deben pertenecer al usuario dueño del archivo --
+    ver `_resolve_owned_tags`."""
+    file_obj = _get_owned_file(db, file_id, current_user, active_only=True)
+    file_obj.tags = _resolve_owned_tags(db, file_obj.owner_id, payload.tag_ids)
     db.commit()
     db.refresh(file_obj)
     return file_obj

@@ -70,6 +70,26 @@ de la Ronda 1, sin investigar ni arreglar todavía): alternar a "modo claro" con
 tema no aplica visualmente el cambio (el `<html>` pierde la clase `dark` pero la página sigue
 viéndose en dark) — posible bug de theming preexistente, no relacionado a esta ronda.
 
+**Hecho (2026-09-20) — Ronda 2 del plan de construcción: etiquetas.** Módulo nuevo
+`app/tags/` (etiqueta personal por usuario, tablas puente `file_tags`/`folder_tags`
+many-to-many), CRUD de etiquetas + reemplazo completo del set de un archivo/carpeta vía
+`PUT /files|folders/{id}/tags` (todo-o-nada en ownership: si un solo `tag_id` no pertenece al
+usuario, rechaza el request completo sin aplicar el resto), filtro `?tag_id=` en el listado,
+chips visibles en fila y grilla con color, modal de asignación con confirmación de borrado.
+Pasó por implementación → revisión adversarial (2 agentes) → feedback (3 fixes de UX en el
+frontend: confirmación de borrado con `DeleteConfirmDialog`, accesibilidad del botón de
+borrar, refresco del listado tras cancelar) → auditor final, con verificación en vivo
+(incluida medición real de DOM para confirmar el truncado de nombres largos) y un escenario
+de punta a punta con un usuario de rol USER real sin permisos extra. Sin bloqueadores.
+
+**Deuda de diseño aceptada, no bloqueante:** `PUT /files|folders/{id}/tags` exige el permiso
+de visualización (`files.view`/`folders.view`), no el de gestión de etiquetas (`tags.manage`)
+— mismo criterio que se fijó para favoritos en Ronda 1 (favoritear/etiquetar un recurso propio
+no debería requerir un permiso de escritura elevado). Ownership sigue validado siempre
+(`_resolve_owned_tags`), así que no es una brecha real hoy — los roles ADMIN/USER tienen ambos
+permisos simultáneamente. Solo importaría si en el futuro se crea un rol con `files.view` pero
+sin `tags.manage` a propósito.
+
 ### 🟠 Seguridad — importante pero no bloqueante
 
 - `SECRET_KEY` con default hardcodeado en `core/config.py:32` — mitigado por una guarda que
@@ -106,14 +126,14 @@ viéndose en dark) — posible bug de theming preexistente, no relacionado a est
 
 - Antes de la auditoría del 19: **0% de cobertura**, sin pytest ni vitest configurado en
   ningún lado del repo.
-- Tras la Ronda 1: `filemeshy_back/tests/` (25 tests) + `filemeshy_back/requirements-dev.txt`
-  — **sigue sin commitear**, decidir si se incorporan al repo. Cubre: auth (registro, login,
-  2FA end-to-end), IDOR de archivos y carpetas (incluido copy), favoritos/orden con
-  regresión explícita del bug de permisos, cuota propia, y regresión de los 3 fixes de
+- Tras la Ronda 1 + Ronda 2: `filemeshy_back/tests/` (35 tests) + `filemeshy_back/requirements-dev.txt`
+  — decidir si se incorporan al repo. Cubre: auth (registro, login, 2FA end-to-end), IDOR de
+  archivos y carpetas (incluido copy y tags), favoritos/orden con regresión explícita del bug
+  de permisos, cuota propia, CRUD de etiquetas con ownership, y regresión de los 3 fixes de
   seguridad más fáciles de reproducir automatizadamente (spoofing de IP, DoS 2FA, flag de
   registro).
-- Última corrida (contra la imagen final reconstruida, dos veces seguidas): **25 passed, 0
-  failed**, sin flakiness.
+- Última corrida (contra la imagen final reconstruida): **35 passed, 0 failed**, sin
+  flakiness.
 - Falta: tests de frontend (cero — la Ronda 1 se verificó visualmente a mano con Playwright
   ad-hoc, no queda como suite automatizada), tests de aislamiento multi-tenant, y CI que
   corra esto automáticamente (no hay ningún pipeline en el repo).
@@ -145,7 +165,7 @@ Gaps que siguen abiertos, ver roadmap de rondas al final del archivo:
    2026-09-20): cliente de escritorio, app móvil, sincronización selectiva, acceso offline
    real y edición colaborativa en tiempo real quedan fuera del alcance actual del roadmap de
    construcción — no son un olvido, es una decisión tomada.
-6. Sin etiquetas/categorías. Planificado: Ronda 2.
+6. ~~Sin etiquetas/categorías.~~ Resuelto en Ronda 2.
 7. Multi-tenant real a nivel de datos (schema-per-tenant, bien implementado, activo solo si
    `DEPLOYMENT_MODE=cloud`) pero sin ninguna UI de gestión — solo utilizable vía CLI/API
    interna, no es autoservicio hoy. Planificado: Ronda 8.
@@ -196,11 +216,15 @@ Gaps que siguen abiertos, ver roadmap de rondas al final del archivo:
   `audit-test@wolfgrimm.local` — este último permanentemente bloqueado para login, ver bug
   puntual más abajo) — no es producción. Se puede tirar abajo con `docker compose down -v`
   cuando se quiera.
-- Suite de tests (`filemeshy_back/tests/`, `filemeshy_back/requirements-dev.txt`) sigue en el
-  working tree sin commitear — pendiente decidir si se incorpora al repo.
-- Todo el código de la Ronda 1 (backend + frontend) está en el working tree, sin commitear
-  todavía — pendiente confirmación explícita del usuario antes de commitear (regla del
-  proyecto: nunca commitear sin pedido explícito).
+- Ronda 1 commiteada (`d91a47f`, 2026-09-20). Todo el código de la Ronda 2 (backend `app/tags/`
+  + wiring en `files/*` + frontend) está en el working tree, sin commitear todavía — pendiente
+  confirmación explícita del usuario antes de commitear (regla del proyecto: nunca commitear
+  sin pedido explícito).
+- El stack de prueba se cayó dos veces por reinicios del host durante el trabajo de Ronda 2 —
+  ambas veces se recuperó sin pérdida de código (todo en disco) ni de datos de prueba (volumen
+  de Postgres persistente); solo hubo que recrear el contenedor backend con `--force-recreate`
+  (un error transitorio de permisos en el primer arranque en bloque tras cada reinicio, no un
+  bug real).
 
 ### Roadmap de construcción (rondas siguientes, backlog completo)
 
@@ -209,7 +233,7 @@ Aprobado con el usuario el 2026-09-20. Cada ronda se diseña en detalle recién 
 | Ronda | Contenido |
 |---|---|
 | 1 (hecho) | 6 bugs de seguridad + tenant provisioning + favoritos + orden real + copiar + cuota visible — **completa** |
-| 2 | Etiquetas (tags many-to-many) |
+| 2 (hecho) | Etiquetas (tags many-to-many) — **completa** |
 | 3 | Compartir granular (contraseña, permisos lectura/escritura, compartir a usuario específico) + notificaciones de "te compartieron algo" |
 | 4 | Versionado de archivos (historial, restaurar versión anterior) |
 | 5 | Preview extendido (video, audio, documentos de Office) |
@@ -223,10 +247,11 @@ en tiempo real.
 
 ### Semáforo
 
-**Ronda 1 completa y verificada en vivo** (incluida verificación visual en navegador real).
-Listo para uso interno de un solo usuario/equipo pequeño en red cerrada — los 6 bloqueadores
-de seguridad de la auditoría del 19 están resueltos. **Todavía no listo para exposición
-pública a Internet sin decisión** sobre las 2 deudas residuales marcadas arriba
+**Rondas 1 y 2 completas y verificadas en vivo** (incluida verificación visual en navegador
+real). Listo para uso interno de un solo usuario/equipo pequeño en red cerrada — los 6
+bloqueadores de seguridad de la auditoría del 19 están resueltos, y el Drive ganó favoritos,
+orden real, copiar, cuota visible y etiquetas. **Todavía no listo para exposición pública a
+Internet sin decisión** sobre las 2 deudas residuales de seguridad marcadas arriba
 (`TRUSTED_PROXY_IPS` en producción real, y el balde compartido de rate-limit en shares
 públicos) — ninguna es explotable hoy, pero ambas dependen de configuración de producción que
 este repo de trabajo no controla directamente.

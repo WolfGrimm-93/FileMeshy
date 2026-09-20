@@ -3,6 +3,12 @@
  * (ver filemeshy_back, mismo contrato acordado en paralelo).
  */
 
+export interface TagOut {
+  id: string
+  name: string
+  color: string | null
+}
+
 export interface FolderOut {
   id: string
   name: string
@@ -12,6 +18,7 @@ export interface FolderOut {
   updated_at: string
   deleted_at: string | null
   is_favorite: boolean
+  tags: TagOut[]
 }
 
 export interface FileOut {
@@ -25,6 +32,7 @@ export interface FileOut {
   updated_at: string
   deleted_at: string | null
   is_favorite: boolean
+  tags: TagOut[]
 }
 
 export interface BreadcrumbItem {

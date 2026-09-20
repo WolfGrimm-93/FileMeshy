@@ -43,6 +43,14 @@ class FoldersService {
     return response.data
   }
 
+  /** Reemplaza el set completo de etiquetas de la carpeta. */
+  async setTags(folderId: string, tagIds: string[]): Promise<FolderOut> {
+    const response = await axiosInstance.put<FolderOut>(`${this.basePath}/${folderId}/tags`, {
+      tag_ids: tagIds,
+    })
+    return response.data
+  }
+
   async copy(folderId: string, parentId?: string | null): Promise<FolderOut> {
     const response = await axiosInstance.post<FolderOut>(`${this.basePath}/${folderId}/copy`, {
       folder_id: parentId ?? null,

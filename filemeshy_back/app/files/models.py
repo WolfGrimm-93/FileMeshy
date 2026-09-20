@@ -13,6 +13,7 @@ from sqlalchemy.sql import func
 
 from app.core.database import Base
 from app.shared.utils.uuid7 import uuid7
+from app.tags.models import file_tags, folder_tags
 
 
 class Folder(Base):
@@ -38,6 +39,7 @@ class Folder(Base):
 
     owner = relationship("User", foreign_keys=[owner_id], lazy="select")
     parent = relationship("Folder", remote_side=[id], foreign_keys=[parent_id], lazy="select")
+    tags = relationship("Tag", secondary=folder_tags, back_populates="folders", lazy="select")
 
 
 class File(Base):
@@ -67,6 +69,7 @@ class File(Base):
 
     owner = relationship("User", foreign_keys=[owner_id], lazy="select")
     folder = relationship("Folder", foreign_keys=[folder_id], lazy="select")
+    tags = relationship("Tag", secondary=file_tags, back_populates="files", lazy="select")
 
 
 class Share(Base):

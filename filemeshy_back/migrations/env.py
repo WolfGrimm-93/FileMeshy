@@ -29,6 +29,7 @@ from app.configuration.models import (
 from app.notifications.models import Notification
 from app.files.models import Folder, File, Share
 from app.storage_quota.models import UserStorageQuota
+from app.tags.models import Tag, file_tags, folder_tags
 
 # ===== CONFIGURATION =====
 config = context.config
