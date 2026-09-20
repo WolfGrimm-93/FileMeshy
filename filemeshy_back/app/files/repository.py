@@ -8,10 +8,10 @@ detección de ciclos, recursión de papelera) vive en router.py.
 from typing import List, Optional
 from uuid import UUID
 
-from sqlalchemy import text
+from sqlalchemy import func, text
 from sqlalchemy.orm import Session, selectinload
 
-from app.files.models import File, Folder, Share
+from app.files.models import File, FileVersion, Folder, Share
 from app.shared.repository_base import CRUDBase
 from app.tags.models import file_tags, folder_tags
 
@@ -254,6 +254,73 @@ class CRUDFile(CRUDBase[File, None, None]):
         return db.query(File).filter(File.folder_id.in_(folder_ids)).all()
 
 
+class CRUDFileVersion(CRUDBase[FileVersion, None, None]):
+    def get_for_file(self, db: Session, file_id: UUID) -> List[FileVersion]:
+        """Historial completo de `file_id`, más reciente primero -- mismo
+        orden que expone `GET /files/{id}/versions`."""
+        return (
+            db.query(FileVersion)
+            .filter(FileVersion.file_id == file_id)
+            .order_by(FileVersion.version_number.desc())
+            .all()
+        )
+
+    def get_max_version_number(self, db: Session, file_id: UUID) -> int:
+        """Último `version_number` ya usado por `file_id`, 0 si todavía no
+        tiene ninguna versión (no debería pasar en la práctica -- `upload_file`
+        siempre crea la versión 1 junto con el propio `File`, ver
+        `_validate_and_store_upload`). El próximo número a usar es
+        SIEMPRE `get_max_version_number(...) + 1`, nunca `len(...) + 1` --
+        si alguna vez se admite borrar una versión puntual del historial,
+        `len` reusaría números ya usados."""
+        result = (
+            db.query(func.max(FileVersion.version_number))
+            .filter(FileVersion.file_id == file_id)
+            .scalar()
+        )
+        return int(result or 0)
+
+    def get_by_id_for_file(self, db: Session, version_id: UUID, file_id: UUID) -> Optional[FileVersion]:
+        """Una versión puntual, validando que pertenezca REALMENTE a
+        `file_id` -- 404 en el router si no (nunca confiar en que el cliente
+        mande un `version_id` de un archivo ajeno solo porque adivinó el
+        UUID, mismo criterio anti-IDOR que el resto del módulo)."""
+        return (
+            db.query(FileVersion)
+            .filter(FileVersion.id == version_id, FileVersion.file_id == file_id)
+            .first()
+        )
+
+    def get_total_size_for_file(self, db: Session, file_id: UUID) -> int:
+        """Cuota real ocupada por `file_id`: suma de `size_bytes` de sus
+        blobs ÚNICOS en MinIO, deduplicados por `storage_key` -- NUNCA sumar
+        `size_bytes` fila por fila de `file_versions` sin deduplicar (bug
+        real encontrado en la revisión adversarial de Ronda 4, 2026-09-20):
+        `restore_file_version` crea una fila de historial NUEVA que
+        REAPUNTA al `storage_key` de una versión vieja, sin reservar cuota
+        nueva (ver su docstring en el router -- es a propósito, el blob ya
+        estaba contado). Sumar por fila en vez de por blob único cuenta ESE
+        mismo blob dos veces, inflando cuánto libera la purga y arrastrando
+        cuota de OTROS archivos del mismo dueño que nunca se tocaron.
+
+        `MIN(size_bytes)` en el `GROUP BY storage_key` es arbitrario a
+        propósito -- todas las filas que comparten un `storage_key` tienen,
+        por construcción, el mismo `size_bytes` (apuntan al mismo blob
+        real), así que cualquier función de agregación de un solo valor da
+        el mismo resultado."""
+        per_blob = (
+            db.query(
+                FileVersion.storage_key,
+                func.min(FileVersion.size_bytes).label("size_bytes"),
+            )
+            .filter(FileVersion.file_id == file_id)
+            .group_by(FileVersion.storage_key)
+            .subquery()
+        )
+        result = db.query(func.coalesce(func.sum(per_blob.c.size_bytes), 0)).scalar()
+        return int(result or 0)
+
+
 class CRUDShare(CRUDBase[Share, None, None]):
     def get_by_token(self, db: Session, token: str) -> Optional[Share]:
         return db.query(Share).filter(Share.token == token).first()
@@ -289,4 +356,5 @@ class CRUDShare(CRUDBase[Share, None, None]):
 
 folder_repo = CRUDFolder(Folder)
 file_repo = CRUDFile(File)
+file_version_repo = CRUDFileVersion(FileVersion)
 share_repo = CRUDShare(Share)

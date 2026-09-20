@@ -234,10 +234,24 @@ def purge_deleted_files_and_folders(days: int = 30):
     """
     Purga definitiva de la papelera: archivos y carpetas con `deleted_at` de
     más de N días, por tenant activo. Antes de borrar la fila de un ARCHIVO,
-    borra su objeto de MinIO -- si ese borrado falla, se loggea y se sigue
-    con el resto del batch en vez de abortar todo (un objeto huérfano en
-    MinIO es preferible a una fila sin storage_key borrable). Las carpetas no
-    tienen storage propio -- solo se borra la fila.
+    borra de MinIO el objeto de CADA una de sus versiones (Ronda 4 --
+    `file_versions`, no solo el `storage_key` actual: cada versión subió un
+    blob propio que se conserva como historial mientras el archivo existe, y
+    el `ON DELETE CASCADE` de la FK borra las filas de `file_versions` pero
+    NUNCA los objetos de MinIO -- eso hay que hacerlo a mano, ANTES de que el
+    CASCADE se dispare) -- si algún borrado falla, se loggea y se sigue con
+    el resto del batch en vez de abortar todo (un objeto huérfano en MinIO es
+    preferible a una fila sin storage_key borrable). La cuota liberada es la
+    suma de `size_bytes` de los blobs ÚNICOS de `file_versions`
+    (`file_version_repo.get_total_size_for_file`, deduplicado por
+    `storage_key` -- ver su docstring para el bug real que corrige: un
+    restore crea una fila de historial que reapunta a un `storage_key` ya
+    contado, sumar fila por fila sin deduplicar infla la liberación y
+    arrastra cuota de OTROS archivos del mismo dueño), no solo
+    `File.size_bytes` (la última) -- cada versión reservó cuota real y nunca
+    se liberó al crear la siguiente (ver `_create_new_file_version` en
+    app/files/router.py). Las carpetas no tienen storage propio -- solo se
+    borra la fila.
 
     Los `shares` que apunten a un archivo/carpeta purgado se limpian solos
     por el `ON DELETE CASCADE` de la FK -- no hace falta lógica extra acá.
@@ -266,7 +280,8 @@ def purge_deleted_files_and_folders(days: int = 30):
                 from app.access_control.models import (  # noqa: F401
                     Role, Permission, RolePermission, UserPermissionOverride,
                 )
-                from app.files.models import File, Folder
+                from app.files.models import File, FileVersion, Folder
+                from app.files.repository import file_version_repo
                 from app.files.service import delete_private_file
                 from app.storage_quota.repository import user_storage_quota_repo
 
@@ -280,14 +295,38 @@ def purge_deleted_files_and_folders(days: int = 30):
                 )
                 for file_obj in files_a_purgar:
                     file_id, storage_key = file_obj.id, file_obj.storage_key
-                    owner_id, size_bytes = file_obj.owner_id, file_obj.size_bytes
-                    try:
-                        delete_private_file(storage_key)
-                    except Exception:
-                        logger.exception(
-                            f"purge_deleted_files_and_folders: fallo borrando de MinIO "
-                            f"'{storage_key}' (file_id={file_id}), se continúa"
-                        )
+                    owner_id = file_obj.owner_id
+
+                    # Todas las versiones del archivo (incluida la 1, la del
+                    # upload original) -- cada una es un blob propio en
+                    # MinIO. `storage_key` (la fila `File`, la versión más
+                    # reciente) se agrega también por las dudas -- siempre
+                    # debería coincidir con la última `FileVersion`, pero no
+                    # cuesta nada cubrir el caso borde de que no coincida.
+                    # El `set()` acá SÍ dedupe por `storage_key` para saber
+                    # qué blobs ÚNICOS borrar de MinIO -- `total_size_bytes`
+                    # usa el mismo criterio de deduplicación, ver
+                    # `file_version_repo.get_total_size_for_file` (un restore
+                    # crea una fila de historial que reapunta a un
+                    # `storage_key` ya existente, sin bytes nuevos reales).
+                    version_rows = (
+                        db.query(FileVersion).filter(FileVersion.file_id == file_id).all()
+                    )
+                    storage_keys_to_delete = {storage_key} | {v.storage_key for v in version_rows}
+                    total_size_bytes = (
+                        file_version_repo.get_total_size_for_file(db, file_id)
+                        if version_rows
+                        else file_obj.size_bytes
+                    )
+
+                    for key in storage_keys_to_delete:
+                        try:
+                            delete_private_file(key)
+                        except Exception:
+                            logger.exception(
+                                f"purge_deleted_files_and_folders: fallo borrando de MinIO "
+                                f"'{key}' (file_id={file_id}), se continúa"
+                            )
                     try:
                         db.delete(file_obj)
                         db.commit()
@@ -303,8 +342,10 @@ def purge_deleted_files_and_folders(days: int = 30):
                     # Consumo real -- decrementar recién cuando la purga quedó
                     # confirmada (fila borrada). No se toca en soft-delete/restore
                     # (ver app/storage_quota/repository.py::adjust_bytes_used).
+                    # `total_size_bytes` es la SUMA de todas las versiones, no
+                    # solo la última (ver docstring de la tarea).
                     try:
-                        user_storage_quota_repo.adjust_bytes_used(db, owner_id, -size_bytes)
+                        user_storage_quota_repo.adjust_bytes_used(db, owner_id, -total_size_bytes)
                     except Exception:
                         # Mismo criterio que el except de arriba (borrado de fila): sin este
                         # rollback, un fallo transitorio de DB acá deja la sesión en

@@ -8,7 +8,7 @@
  */
 import axiosInstance from '@/shared/config/axios'
 import type { AxiosProgressEvent } from 'axios'
-import type { DirectoryListing, FileOut } from '../types'
+import type { DirectoryListing, FileOut, FileVersionOut } from '../types'
 
 export type FilesSortBy = 'name' | 'created_at' | 'updated_at' | 'size_bytes'
 export type FilesSortDir = 'asc' | 'desc'
@@ -116,6 +116,45 @@ class FilesService {
 
   async restore(fileId: string): Promise<FileOut> {
     const response = await axiosInstance.post<FileOut>(`${this.basePath}/${fileId}/restore`)
+    return response.data
+  }
+
+  /**
+   * Ronda 4 -- sube una nueva versión del contenido de un archivo existente
+   * (mismo patrón multipart + progreso que `upload()`, pero contra el
+   * subrecurso `/versions` en vez de `/upload`). El backend devuelve el
+   * `FileOut` actualizado (tamaño/mime/updated_at ya reflejan la versión
+   * nueva).
+   */
+  async uploadNewVersion(
+    fileId: string,
+    file: File,
+    onProgress?: (percent: number) => void
+  ): Promise<FileOut> {
+    const form = new FormData()
+    form.append('file', file)
+
+    const response = await axiosInstance.post<FileOut>(`${this.basePath}/${fileId}/versions`, form, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      onUploadProgress: (event: AxiosProgressEvent) => {
+        if (!onProgress || !event.total) return
+        onProgress(Math.round((event.loaded / event.total) * 100))
+      },
+    })
+    return response.data
+  }
+
+  /** Ronda 4 -- historial de versiones del archivo, más reciente primero. */
+  async listVersions(fileId: string): Promise<FileVersionOut[]> {
+    const response = await axiosInstance.get<FileVersionOut[]>(`${this.basePath}/${fileId}/versions`)
+    return response.data
+  }
+
+  /** Ronda 4 -- restaura una versión anterior como la versión activa del archivo. */
+  async restoreVersion(fileId: string, versionId: string): Promise<FileOut> {
+    const response = await axiosInstance.post<FileOut>(
+      `${this.basePath}/${fileId}/versions/${versionId}/restore`
+    )
     return response.data
   }
 }

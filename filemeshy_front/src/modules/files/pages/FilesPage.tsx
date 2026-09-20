@@ -32,6 +32,7 @@ import {
   ArrowUpNarrowWide,
   ArrowDownWideNarrow,
   Tags,
+  History,
 } from 'lucide-react'
 import { DataTable, type Column } from '@/ui/tables/DataTable'
 import { TableFilters } from '@/ui/tables/TableFilters'
@@ -55,6 +56,7 @@ import UploadModal from '../components/UploadModal'
 import ShareModal, { type ShareTarget } from '../components/ShareModal'
 import PreviewModal, { type PreviewTarget } from '../components/PreviewModal'
 import TagsModal, { type TagsTarget } from '../components/TagsModal'
+import FileVersionsModal, { type FileVersionsTarget } from '../components/FileVersionsModal'
 import TagChips from '../components/TagChips'
 import FileGridView from '../components/FileGridView'
 import type { DirectoryListing, FileOut, FolderOut } from '../types'
@@ -123,6 +125,7 @@ export default function FilesPage() {
   const [shareTarget, setShareTarget] = useState<ShareTarget | null>(null)
   const [previewTarget, setPreviewTarget] = useState<PreviewTarget | null>(null)
   const [tagsTarget, setTagsTarget] = useState<TagsTarget | null>(null)
+  const [versionsTarget, setVersionsTarget] = useState<FileVersionsTarget | null>(null)
 
   const [viewMode, setViewModeState] = useState<ViewMode>(() => {
     const stored = localStorage.getItem(VIEW_MODE_STORAGE_KEY)
@@ -485,6 +488,17 @@ export default function FilesPage() {
       })
     }
 
+    // Versiones: solo archivos (las carpetas no tienen versionado) -- mismo gate de
+    // permiso de visualización que Favorito/Etiquetas, la validación de ownership la
+    // hace el backend.
+    if (row.type === 'file' && hasPermission(Permission.VIEW_FILES)) {
+      items.push({
+        label: 'Ver versiones',
+        icon: <History className="size-4" />,
+        onClick: () => setVersionsTarget({ id: row.id, name: row.name }),
+      })
+    }
+
     const canDelete =
       row.type === 'folder' ? hasPermission(Permission.DELETE_FOLDERS) : hasPermission(Permission.DELETE_FILES)
     if (canDelete) {
@@ -781,6 +795,12 @@ export default function FilesPage() {
       <PreviewModal target={previewTarget} onClose={() => setPreviewTarget(null)} />
 
       <TagsModal target={tagsTarget} onClose={() => setTagsTarget(null)} onSaved={() => loadListing()} />
+
+      <FileVersionsModal
+        target={versionsTarget}
+        onClose={() => setVersionsTarget(null)}
+        onSaved={() => loadListing()}
+      />
 
       {deleteTarget && (
         <DeleteConfirmDialog

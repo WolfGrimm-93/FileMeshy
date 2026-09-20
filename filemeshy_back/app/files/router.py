@@ -42,8 +42,8 @@ from app.auth.service import RateLimiter, get_current_active_user
 from app.core.config import settings
 from app.core.database import SessionLocal, get_db
 from app.core.security import get_password_hash, verify_password
-from app.files.models import File as FileModel, Folder, Share
-from app.files.repository import file_repo, folder_repo, share_repo
+from app.files.models import File as FileModel, FileVersion, Folder, Share
+from app.files.repository import file_repo, file_version_repo, folder_repo, share_repo
 from app.files.schemas import (
     BreadcrumbItem,
     CopyRequest,
@@ -51,6 +51,7 @@ from app.files.schemas import (
     DownloadUrlResponse,
     FileOut,
     FileUpdate,
+    FileVersionOut,
     FolderCreate,
     FolderDetail,
     FolderOut,
@@ -860,13 +861,21 @@ def _validate_and_store_upload(
     folder_id: Optional[UUID],
     upload: UploadFile,
     content: bytes,
+    created_by_id: UUID,
 ) -> FileModel:
     """Valida el contenido real de un upload (magic bytes) y lo persiste:
-    reserva de cuota contra `owner_id`, subida a MinIO y la fila `File`
-    resultante. Extraído de `upload_file` (Hito 1) para reusarlo tal cual en
-    `upload_file_via_share` (Ronda 3: el destinatario de un share de carpeta
-    con `permission='edit'` sube un archivo nuevo) -- MISMA verificación de
-    tipo real y MISMO patrón de reserva/rollback de cuota en los dos casos.
+    reserva de cuota contra `owner_id`, subida a MinIO, la fila `File`
+    resultante y su `FileVersion` 1 (Ronda 4: un archivo SIEMPRE tiene al
+    menos una versión, la del upload original). Extraído de `upload_file`
+    (Hito 1) para reusarlo tal cual en `upload_file_via_share` (Ronda 3: el
+    destinatario de un share de carpeta con `permission='edit'` sube un
+    archivo nuevo) -- MISMA verificación de tipo real y MISMO patrón de
+    reserva/rollback de cuota en los dos casos.
+
+    `created_by_id` es quien subió el archivo (no necesariamente `owner_id`
+    -- en un upload vía share de carpeta, el archivo queda a nombre del
+    DUEÑO de la carpeta pero lo subió el destinatario, ver
+    `upload_file_via_share`).
 
     El caller ya validó tamaño máximo (`file.size`/`len(content)`) ANTES de
     llamar acá -- esta función asume que `content` ya está dentro del límite."""
@@ -933,6 +942,18 @@ def _validate_and_store_upload(
         mime_type=content_type,
     )
     db.add(db_file)
+    db.flush()
+
+    db.add(
+        FileVersion(
+            file_id=db_file.id,
+            version_number=1,
+            storage_key=storage_key,
+            size_bytes=len(content),
+            mime_type=content_type,
+            created_by_id=created_by_id,
+        )
+    )
     db.commit()
     db.refresh(db_file)
     return db_file
@@ -972,7 +993,10 @@ async def upload_file(
             detail=f"El archivo supera el tamaño máximo permitido ({settings.MAX_UPLOAD_SIZE_MB} MB)",
         )
 
-    return _validate_and_store_upload(db, owner_id=current_user.id, folder_id=folder_id, upload=file, content=content)
+    return _validate_and_store_upload(
+        db, owner_id=current_user.id, folder_id=folder_id, upload=file, content=content,
+        created_by_id=current_user.id,
+    )
 
 
 @files_router.get("/{file_id}", response_model=FileOut)
@@ -1129,6 +1153,210 @@ def copy_file(
         raise
     db.refresh(new_file)
     return new_file
+
+
+# ============================================================
+# VERSIONES -- historial de versiones de un archivo (Ronda 4)
+# ============================================================
+
+def _create_new_file_version(
+    db: Session,
+    file_obj: FileModel,
+    *,
+    content: bytes,
+    original_filename: Optional[str],
+    declared_content_type: Optional[str],
+    created_by_id: UUID,
+    quota_owner_id: UUID,
+) -> FileModel:
+    """Crea una versión NUEVA de `file_obj`: sube el contenido a MinIO con
+    una `storage_key` NUEVA (nunca pisa la vieja -- el blob anterior se
+    conserva como historial real), reserva cuota por el tamaño COMPLETO del
+    contenido nuevo contra `quota_owner_id`, crea la fila `FileVersion`
+    (`version_number = max + 1`) y actualiza
+    `File.storage_key/size_bytes/mime_type` a los datos de la versión nueva
+    (`updated_at` se actualiza solo, vía `onupdate=func.now()`).
+
+    A diferencia del reemplazo de contenido de Ronda 3 (que liberaba el
+    tamaño viejo antes de reservar el nuevo), acá NO se libera nada -- cada
+    versión ocupa espacio real adicional en MinIO porque el blob anterior
+    sigue existiendo como historial, así que la cuota tiene que reflejar la
+    suma de todas las versiones, no solo la última. Igual que en
+    `_validate_and_store_upload`, la reserva de cuota es ANTES de subir a
+    MinIO (si falla la reserva, no se sube nada) y se revierte si la subida
+    falla después.
+
+    Reusado por `POST /files/{id}/versions` (subida directa, `created_by_id`
+    = el propio dueño) y `PUT /shares/{share_id}/content` (reemplazo vía
+    share de Ronda 3, `created_by_id` = el destinatario que subió el
+    reemplazo) -- MISMO comportamiento de versionado y cuota en los dos
+    casos, ver reporte de Ronda 4."""
+    _, extension = os.path.splitext(original_filename or file_obj.name)
+    content_type = declared_content_type or "application/octet-stream"
+    detected_format = detect_image_type(content)
+    if detected_format in _VERIFIED_IMAGE_MIME_BY_FORMAT:
+        content_type = _VERIFIED_IMAGE_MIME_BY_FORMAT[detected_format]
+    elif is_pdf_content(content):
+        content_type = "application/pdf"
+    elif content_type in INLINE_SAFE_MIME_TYPES:
+        content_type = "application/octet-stream"
+
+    reserve_upload_bytes(db, quota_owner_id, len(content))
+
+    try:
+        new_storage_key = upload_private_file(
+            path=f"files/{file_obj.owner_id}",
+            content=content,
+            extension=extension,
+            content_type=content_type,
+        )
+    except Exception:
+        release_upload_bytes(db, quota_owner_id, len(content))
+        raise
+
+    next_version_number = file_version_repo.get_max_version_number(db, file_obj.id) + 1
+    db.add(
+        FileVersion(
+            file_id=file_obj.id,
+            version_number=next_version_number,
+            storage_key=new_storage_key,
+            size_bytes=len(content),
+            mime_type=content_type,
+            created_by_id=created_by_id,
+        )
+    )
+
+    file_obj.storage_key = new_storage_key
+    file_obj.size_bytes = len(content)
+    file_obj.mime_type = content_type
+    db.commit()
+    db.refresh(file_obj)
+    return file_obj
+
+
+def _file_version_to_out(version: FileVersion) -> FileVersionOut:
+    """Enriquece una `FileVersion` con el email/nombre de quien la subió,
+    resolviendo la relación `FileVersion.created_by` (mismo criterio de no
+    guardar el email en el propio modelo que ya usa `_share_to_out` para
+    `shared_by_email`, ver su docstring)."""
+    created_by_email = None
+    created_by_name = None
+    if version.created_by is not None:
+        created_by_email = version.created_by.email
+        created_by_name = f"{version.created_by.first_name} {version.created_by.last_name or ''}".strip() or None
+
+    return FileVersionOut(
+        id=version.id,
+        file_id=version.file_id,
+        version_number=version.version_number,
+        size_bytes=version.size_bytes,
+        mime_type=version.mime_type,
+        created_at=version.created_at,
+        created_by_id=version.created_by_id,
+        created_by_email=created_by_email,
+        created_by_name=created_by_name,
+    )
+
+
+@files_router.post("/{file_id}/versions", response_model=FileOut, status_code=status.HTTP_201_CREATED)
+async def upload_file_version(
+    file_id: UUID,
+    file: UploadFile = UploadFileParam(...),
+    db: Session = Depends(get_db),
+    # Mismo permiso base que subir un archivo nuevo (`upload_file`) --
+    # subir una versión nueva es, en los hechos, subir contenido nuevo.
+    # Ownership del archivo lo valida `_get_owned_file` más abajo.
+    current_user: User = Depends(has_permission(["files.upload"])),
+):
+    """Sube una versión NUEVA del contenido de `file_id` -- no reemplaza el
+    blob viejo (se conserva como historial, ver `_create_new_file_version`),
+    reserva cuota real por el tamaño completo del contenido nuevo contra el
+    dueño del archivo. Devuelve el `File` ya actualizado a la versión
+    nueva (mismo shape que `upload_file`/`replace_file_via_share`)."""
+    file_obj = _get_owned_file(db, file_id, current_user, active_only=True)
+
+    max_bytes = settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024
+    if file.size is not None and file.size > max_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"El archivo supera el tamaño máximo permitido ({settings.MAX_UPLOAD_SIZE_MB} MB)",
+        )
+
+    content = await file.read()
+    if len(content) > max_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"El archivo supera el tamaño máximo permitido ({settings.MAX_UPLOAD_SIZE_MB} MB)",
+        )
+
+    return _create_new_file_version(
+        db,
+        file_obj,
+        content=content,
+        original_filename=file.filename,
+        declared_content_type=file.content_type,
+        created_by_id=current_user.id,
+        quota_owner_id=file_obj.owner_id,
+    )
+
+
+@files_router.get("/{file_id}/versions", response_model=List[FileVersionOut])
+def list_file_versions(
+    file_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(has_permission(["files.view"])),
+):
+    """Historial completo de versiones de `file_id`, más reciente primero.
+    Ownership del archivo requerido (`_get_owned_file`) -- mismo criterio
+    anti-IDOR que el resto del módulo."""
+    file_obj = _get_owned_file(db, file_id, current_user, active_only=True)
+    versions = file_version_repo.get_for_file(db, file_obj.id)
+    return [_file_version_to_out(v) for v in versions]
+
+
+@files_router.post("/{file_id}/versions/{version_id}/restore", response_model=FileOut)
+def restore_file_version(
+    file_id: UUID,
+    version_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(has_permission(["files.upload"])),
+):
+    """Restaura `version_id` como el contenido actual de `file_id`. NO sube
+    nada nuevo a MinIO -- el blob de esa versión vieja ya existe, se le
+    apunta `File.storage_key/size_bytes/mime_type` directo. Se crea una
+    `FileVersion` NUEVA (`version_number = max + 1`) que apunta al MISMO
+    `storage_key` de la versión restaurada, para que el historial muestre
+    "se restauró la vN" como un evento nuevo sin duplicar el blob -- esto NO
+    consume cuota adicional (no hay bytes nuevos, ya estaban contados).
+
+    `version_id` tiene que pertenecer REALMENTE a `file_id` -- 404 si no
+    (`file_version_repo.get_by_id_for_file`, mismo criterio anti-IDOR que el
+    resto del módulo: nunca confiar en que el cliente mande un `version_id`
+    de un archivo ajeno solo porque adivinó el UUID)."""
+    file_obj = _get_owned_file(db, file_id, current_user, active_only=True)
+
+    version = file_version_repo.get_by_id_for_file(db, version_id, file_obj.id)
+    if not version:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Versión no encontrada")
+
+    next_version_number = file_version_repo.get_max_version_number(db, file_obj.id) + 1
+    db.add(
+        FileVersion(
+            file_id=file_obj.id,
+            version_number=next_version_number,
+            storage_key=version.storage_key,
+            size_bytes=version.size_bytes,
+            mime_type=version.mime_type,
+            created_by_id=current_user.id,
+        )
+    )
+
+    file_obj.storage_key = version.storage_key
+    file_obj.size_bytes = version.size_bytes
+    file_obj.mime_type = version.mime_type
+    db.commit()
+    db.refresh(file_obj)
+    return file_obj
 
 
 # ============================================================
@@ -1466,6 +1694,7 @@ async def upload_file_via_share(
         folder_id=target_folder.id,
         upload=file,
         content=content,
+        created_by_id=current_user.id,
     )
 
 
@@ -1477,15 +1706,19 @@ async def replace_file_via_share(
     current_user: User = Depends(has_permission(["files.upload"])),
 ):
     """El destinatario de un share de ARCHIVO con `permission='edit'`
-    reemplaza su contenido: mismo `file_id`, `storage_key` nuevo, ajusta
-    `size_bytes` y la cuota del DUEÑO real del archivo (libera el tamaño
-    viejo, reserva el nuevo). El nombre del archivo NO se toca -- se
+    reemplaza su contenido: mismo `file_id`, versión NUEVA (Ronda 4 -- ver
+    `_create_new_file_version`). El nombre del archivo NO se toca -- se
     reemplaza el contenido "in place", no se renombra (decisión de diseño,
     ver reporte final).
 
-    El objeto viejo en MinIO se borra DESPUÉS de confirmar el nuevo -- si ese
-    borrado falla, se loguea un warning y la operación principal (el
-    reemplazo, ya commiteado) NO se revierte ni falla por eso."""
+    Refactor de Ronda 4: antes este endpoint liberaba la cuota del tamaño
+    viejo y borraba su `storage_key` de MinIO al reemplazar (sin dejar
+    rastro del contenido anterior). Ahora reusa la MISMA lógica de "crear
+    versión nueva" que `POST /files/{id}/versions` -- el blob viejo se
+    conserva como historial real (consume cuota real adicional, ya NO se
+    libera) y queda una `FileVersion` con `created_by_id` = el destinatario
+    que subió el reemplazo (no el dueño), mientras que la cuota se sigue
+    reservando contra el DUEÑO real del archivo (mismo criterio de Ronda 3)."""
     share = _get_share_for_write(db, share_id, current_user)
     _require_edit_permission(share)
     if share.file_id is None:
@@ -1509,61 +1742,15 @@ async def replace_file_via_share(
             detail=f"El archivo supera el tamaño máximo permitido ({settings.MAX_UPLOAD_SIZE_MB} MB)",
         )
 
-    owner_id = target_file.owner_id
-    old_storage_key = target_file.storage_key
-    old_size = target_file.size_bytes
-
-    _, extension = os.path.splitext(file.filename or target_file.name)
-    content_type = file.content_type or "application/octet-stream"
-    detected_format = detect_image_type(content)
-    if detected_format in _VERIFIED_IMAGE_MIME_BY_FORMAT:
-        content_type = _VERIFIED_IMAGE_MIME_BY_FORMAT[detected_format]
-    elif is_pdf_content(content):
-        content_type = "application/pdf"
-    elif content_type in INLINE_SAFE_MIME_TYPES:
-        content_type = "application/octet-stream"
-
-    # Libera el tamaño viejo y reserva el nuevo contra el DUEÑO real -- no es
-    # una única operación atómica (reserve_upload_bytes ya es atómica EN SÍ
-    # MISMA contra la carrera de uploads concurrentes del propio dueño, ver
-    # su docstring; encadenar liberar+reservar no necesita más que eso para
-    # este caso de uso, que no es concurrente consigo mismo).
-    release_upload_bytes(db, owner_id, old_size)
-    try:
-        reserve_upload_bytes(db, owner_id, len(content))
-    except HTTPException:
-        # Sin cupo para el contenido nuevo -- revertir la liberación, el
-        # archivo viejo sigue intacto, no se subió nada todavía.
-        reserve_upload_bytes(db, owner_id, old_size)
-        raise
-
-    try:
-        new_storage_key = upload_private_file(
-            path=f"files/{owner_id}",
-            content=content,
-            extension=extension,
-            content_type=content_type,
-        )
-    except Exception:
-        release_upload_bytes(db, owner_id, len(content))
-        reserve_upload_bytes(db, owner_id, old_size)
-        raise
-
-    target_file.storage_key = new_storage_key
-    target_file.size_bytes = len(content)
-    target_file.mime_type = content_type
-    db.commit()
-    db.refresh(target_file)
-
-    try:
-        delete_private_file(old_storage_key)
-    except Exception as exc:
-        logger.warning(
-            f"No se pudo borrar el storage_key viejo ({old_storage_key}) tras reemplazar "
-            f"contenido vía share {share_id}: {exc}"
-        )
-
-    return target_file
+    return _create_new_file_version(
+        db,
+        target_file,
+        content=content,
+        original_filename=file.filename or target_file.name,
+        declared_content_type=file.content_type,
+        created_by_id=current_user.id,
+        quota_owner_id=target_file.owner_id,
+    )
 
 
 # ============================================================

@@ -6,7 +6,18 @@ en un job de Celery futuro (Hito 2), no acá -- este archivo es solo el
 esquema de columnas/relaciones.
 """
 
-from sqlalchemy import Column, String, DateTime, BigInteger, Boolean, ForeignKey, Index, CheckConstraint
+from sqlalchemy import (
+    Column,
+    String,
+    DateTime,
+    BigInteger,
+    Integer,
+    Boolean,
+    ForeignKey,
+    Index,
+    CheckConstraint,
+    UniqueConstraint,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -70,6 +81,76 @@ class File(Base):
     owner = relationship("User", foreign_keys=[owner_id], lazy="select")
     folder = relationship("Folder", foreign_keys=[folder_id], lazy="select")
     tags = relationship("Tag", secondary=file_tags, back_populates="files", lazy="select")
+    versions = relationship(
+        "FileVersion",
+        back_populates="file",
+        foreign_keys="FileVersion.file_id",
+        lazy="select",
+        order_by="FileVersion.version_number.desc()",
+        # `passive_deletes=True` -- SIN esto, al hacer `db.delete(file_obj)`
+        # (purga de papelera) el ORM por defecto intenta poner `file_id=NULL`
+        # en cada `FileVersion` hija ANTES de borrar el `File` padre, algo
+        # que la columna NOT NULL rechaza (IntegrityError, confirmado en vivo
+        # con un smoke test real durante la verificación de Ronda 4: la
+        # purga fallaba silenciosamente -- "se continúa" en el log, fila de
+        # File NUNCA se borraba). Con `passive_deletes=True`, el ORM no
+        # toca las filas hijas y deja que el `ON DELETE CASCADE` real de la
+        # FK (ver `FileVersion.file_id`) se encargue solo, tal como se
+        # documenta en el docstring de `purge_deleted_files_and_folders`.
+        passive_deletes=True,
+    )
+
+
+class FileVersion(Base):
+    """Historial de versiones de un `File` (Ronda 4: versionado de archivos).
+
+    `File.storage_key`/`size_bytes`/`mime_type` SIEMPRE reflejan la versión
+    más reciente (denormalizado para lecturas rápidas, igual que antes de
+    esta ronda) -- `file_versions` es la fuente de verdad del historial
+    completo, incluida la versión 1 (la del upload original, creada junto
+    con el propio `File` en `upload_file`). Un archivo SIEMPRE tiene al
+    menos una versión.
+
+    Cada versión nueva sube un blob NUEVO a MinIO (nunca pisa el anterior) --
+    a diferencia del reemplazo de contenido de Ronda 3 (que sí liberaba la
+    cuota vieja), acá el blob viejo se conserva como historial real y
+    consume cuota real adicional contra el dueño del archivo (ver
+    `_create_new_file_version` en el router). Restaurar una versión anterior
+    NO sube nada nuevo -- crea una fila de historial que apunta al MISMO
+    `storage_key` que la versión restaurada, sin costo de cuota adicional
+    (ver `restore_file_version`).
+
+    Sin soft-delete propio: el historial completo de versiones de un
+    archivo se borra en cascada (`ON DELETE CASCADE`) cuando el archivo se
+    purga definitivamente de la papelera (ver
+    `app/worker/tasks/maintenance.py::purge_deleted_files_and_folders`,
+    que borra a mano los objetos de MinIO de TODAS las versiones antes de
+    dejar que el CASCADE borre las filas)."""
+
+    __tablename__ = "file_versions"
+    __table_args__ = (
+        UniqueConstraint("file_id", "version_number", name="uq_file_version_number"),
+        Index("ix_file_version_file_id", "file_id"),
+    )
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid7)
+
+    file_id = Column(UUID(as_uuid=True), ForeignKey("files.id", ondelete="CASCADE"), nullable=False)
+    version_number = Column(Integer, nullable=False)
+
+    storage_key = Column(String(500), nullable=False)
+    size_bytes = Column(BigInteger, nullable=False)
+    mime_type = Column(String(255), nullable=False)
+
+    # Quién subió ESTA versión -- puede ser el dueño del archivo o un
+    # destinatario de share con permission='edit' (ver
+    # `replace_file_via_share`, que reusa `_create_new_file_version` pasando
+    # el id del destinatario, no el del dueño).
+    created_by_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    file = relationship("File", back_populates="versions", foreign_keys=[file_id], lazy="select")
+    created_by = relationship("User", foreign_keys=[created_by_id], lazy="select")
 
 
 class Share(Base):

@@ -35,6 +35,22 @@ export interface FileOut {
   tags: TagOut[]
 }
 
+/**
+ * Ronda 4 -- una versión histórica de un archivo (`GET /files/{id}/versions`).
+ * `created_by_email` viene `null` cuando el backend no puede resolver el
+ * usuario que la subió (ej. usuario borrado), mismo criterio que otros
+ * campos "resueltos" opcionales del contrato (ver `shared_by_email` en
+ * `ShareOut`).
+ */
+export interface FileVersionOut {
+  id: string
+  version_number: number
+  size_bytes: number
+  mime_type: string
+  created_at: string
+  created_by_email: string | null
+}
+
 export interface BreadcrumbItem {
   id: string
   name: string

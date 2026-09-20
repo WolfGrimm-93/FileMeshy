@@ -115,6 +115,39 @@ exigiendo `current_user.id` en `(shared_with_user_id, created_by_id)`, y UUIDv7 
 de aleatoriedad), pero falta defensa en profundidad contra abuso/hostigamiento desde una cuenta
 ya autenticada.
 
+**Hecho (2026-09-20) — Ronda 4 del plan de construcción: versionado de archivos.** Tabla
+`file_versions` nueva: todo archivo tiene una v1 automática al subirse (y las Rondas 1-3 que ya
+existían recibieron backfill real de su v1 con la migración, 1029 filas), cada versión nueva
+(`POST /files/{id}/versions`, o un reemplazo vía share con `permission=edit` de Ronda 3,
+refactorizado para reusar la misma lógica) reserva cuota completa sin liberar la anterior (los
+blobs viejos se conservan como historial real), y restaurar una versión vieja
+(`POST .../versions/{id}/restore`) no sube nada nuevo — solo reapunta al blob existente, sin
+costo de cuota adicional. La purga de papelera borra los blobs de TODAS las versiones, no solo
+la actual. Pasó por implementación → revisión adversarial (2 agentes) → dos rondas de feedback
+por **dos bugs ALTOS reales**:
+
+1. La purga sobre-liberaba cuota de OTROS archivos del mismo dueño cuando el archivo purgado
+   tenía un `restore` en su historial (`get_total_size_for_file` sumaba el mismo blob dos veces
+   por no deduplicar por `storage_key` — mismo blob, dos filas de versión). Corregido, con un
+   test de regresión que se confirmó atrapaba el bug original revirtiendo el fix a propósito.
+2. La migración no hacía backfill de v1 para archivos preexistentes — subir una versión nueva
+   sobre uno de esos archivos perdía el contenido original en silencio, sin aviso. Corregido
+   con backfill idempotente dentro de la propia migración (con un segundo bug de idempotencia
+   detectado y corregido en el camino).
+
+Suite: 51 tests. El Auditor Final encontró además un **hallazgo de infraestructura, no de
+código**: el contenedor `celery_worker` (el que ejecuta la purga real en producción, con
+`--beat` embebido según `docker-compose.prod.yml`) había quedado con la imagen VIEJA, sin
+`FileVersion` ni el fix — un rebuild de `backend` no alcanza si otro servicio comparte el mismo
+código. Ya reconstruido y confirmado (`FileVersion` presente, código de purga corregido
+verificado por inspección del módulo real cargado en ese contenedor).
+
+**Nota de proceso para rondas futuras y para cualquier deploy real:** cualquier cambio a
+código compartido (ej. `app/files`, `app/worker`) exige reconstruir TODOS los servicios que lo
+importan (`backend` Y `celery_worker`, al menos), no solo el que se probó manualmente — quedó
+demostrado que es fácil dar una ronda por "desplegada" cuando en realidad un servicio secundario
+sigue corriendo código viejo sin que nada lo avise.
+
 ### 🟠 Seguridad — importante pero no bloqueante
 
 - `SECRET_KEY` con default hardcodeado en `core/config.py:32` — mitigado por una guarda que
@@ -143,19 +176,28 @@ ya autenticada.
 - Rate-limit de shares públicos (`files/router.py:719-732`) usa `request.client.host` directo
   — detrás de nginx en prod es un balde único compartido por todo el tráfico público, no limita
   por visitante real.
+- **Bug de UI preexistente** (encontrado incidentalmente en la revisión de Ronda 4, no
+  introducido por ninguna ronda de construcción): el menú de acciones (⋮) de la tabla de
+  Archivos queda clippeado/invisible cuando se abre sobre la última fila visible de un listado
+  corto — el wrapper `overflow-x-auto` de `DataTable.tsx` recorta el dropdown verticalmente sin
+  scroll perceptible (confirmado con `getComputedStyle`: el menú mide 335px de alto contra un
+  `clientHeight` visible de 71px). Afecta a TODAS las acciones del menú (Renombrar, Compartir,
+  Ver versiones, etc.), no solo a una feature puntual. Fix típico: portal para el dropdown, o
+  `overflow: visible` en el wrapper mientras el menú está abierto.
 
 ### 🧪 Testing — antes no existía nada
 
 - Antes de la auditoría del 19: **0% de cobertura**, sin pytest ni vitest configurado en
   ningún lado del repo.
-- Tras las Rondas 1-3: `filemeshy_back/tests/` (43 tests) + `filemeshy_back/requirements-dev.txt`
+- Tras las Rondas 1-4: `filemeshy_back/tests/` (51 tests) + `filemeshy_back/requirements-dev.txt`
   — decidir si se incorporan al repo. Cubre: auth (registro, login, 2FA end-to-end), IDOR de
-  archivos, carpetas y shares (copy, tags, compartir a usuario, escalación vía permission=edit),
-  favoritos/orden con regresión explícita del bug de permisos, cuota propia, CRUD de etiquetas
-  con ownership, contraseña en links públicos, y regresión de los 3 fixes de seguridad más
-  fáciles de reproducir automatizadamente (spoofing de IP, DoS 2FA, flag de registro).
-- Última corrida (contra la imagen final reconstruida): **43 passed, 0 failed**, sin
-  flakiness.
+  archivos, carpetas, shares y versiones (copy, tags, compartir a usuario, escalación vía
+  permission=edit, restore/purga de versiones), favoritos/orden con regresión explícita del bug
+  de permisos, cuota propia y bajo versionado, CRUD de etiquetas con ownership, contraseña en
+  links públicos, backfill de versiones vía migración, y regresión de los 3 fixes de seguridad
+  más fáciles de reproducir automatizadamente (spoofing de IP, DoS 2FA, flag de registro).
+- Última corrida (contra la imagen final reconstruida, backend Y `celery_worker`): **51
+  passed, 0 failed**, sin flakiness.
 - Falta: tests de frontend (cero — la Ronda 1 se verificó visualmente a mano con Playwright
   ad-hoc, no queda como suite automatizada), tests de aislamiento multi-tenant, y CI que
   corra esto automáticamente (no hay ningún pipeline en el repo).
@@ -179,23 +221,21 @@ Gaps que siguen abiertos, ver roadmap de rondas al final del archivo:
 
 1. Sin backups automáticos de Postgres/MinIO — cero rastro en todo el repo, ni siquiera un
    cron de `pg_dump`. Planificado: Ronda 7.
-2. Sin versionado de archivos (historial de cambios) — ni modelo ni concepto en el código.
-   Planificado: Ronda 4.
-3. **Decisión de producto explícita, diferida sin fecha** (confirmado con el usuario
+2. **Decisión de producto explícita, diferida sin fecha** (confirmado con el usuario
    2026-09-20): cliente de escritorio, app móvil, sincronización selectiva, acceso offline
    real y edición colaborativa en tiempo real quedan fuera del alcance actual del roadmap de
    construcción — no son un olvido, es una decisión tomada.
-4. Multi-tenant real a nivel de datos (schema-per-tenant, bien implementado, activo solo si
+3. Multi-tenant real a nivel de datos (schema-per-tenant, bien implementado, activo solo si
    `DEPLOYMENT_MODE=cloud`) pero sin ninguna UI de gestión — solo utilizable vía CLI/API
    interna, no es autoservicio hoy. Planificado: Ronda 8.
-5. Búsqueda solo por nombre, no por contenido de archivo. Sin filtros avanzados (tipo, fecha,
+4. Búsqueda solo por nombre, no por contenido de archivo. Sin filtros avanzados (tipo, fecha,
    tamaño) en la página de Archivos, aunque el componente ya existe y se usa en otros módulos.
    Búsqueda por contenido + OCR planificados: Ronda 6 (confirmado en alcance con el usuario).
-6. Vista previa solo de imagen/PDF — video, audio y documentos de Office fuerzan descarga.
+5. Vista previa solo de imagen/PDF — video, audio y documentos de Office fuerzan descarga.
    Planificado: Ronda 5.
-7. Formato de error inconsistente entre excepciones tipadas (`{status,message,data}`) y
+6. Formato de error inconsistente entre excepciones tipadas (`{status,message,data}`) y
    errores de validación Pydantic (`{"detail":[...]}`) — dos formatos conviven en la API.
-8. Sin escaneo de virus/malware. Planificado: Ronda 7.
+7. Sin escaneo de virus/malware. Planificado: Ronda 7.
 
 ### 🏗️ Estándares técnicos — gaps priorizados (vs. `docs/estandares-cliente-servidor-2026/`)
 
@@ -235,12 +275,12 @@ Gaps que siguen abiertos, ver roadmap de rondas al final del archivo:
   `audit-test@wolfgrimm.local` — este último permanentemente bloqueado para login, ver bug
   puntual más abajo) — no es producción. Se puede tirar abajo con `docker compose down -v`
   cuando se quiera.
-- Ronda 1 (`d91a47f`) y Ronda 2 (`61ca9f1`) commiteadas, 2026-09-20. Todo el código de la
-  Ronda 3 (backend: `Share` extendido + endpoints nuevos; frontend: `ShareModal`,
-  `SharedWithMePage`, `PublicSharePage`) está en el working tree, sin commitear todavía —
-  pendiente confirmación explícita del usuario antes de commitear.
+- Rondas 1 (`d91a47f`), 2 (`61ca9f1`) y 3 (`9b08c35`) commiteadas, 2026-09-20. Todo el código
+  de la Ronda 4 (backend: `FileVersion` + endpoints nuevos + backfill; frontend:
+  `FileVersionsModal`) está en el working tree, sin commitear todavía — pendiente confirmación
+  explícita del usuario antes de commitear.
 - El stack de prueba se cayó por reinicios del host varias veces durante el trabajo de las
-  Rondas 2 y 3 — siempre se recuperó sin pérdida de código (todo en disco) ni de datos de
+  Rondas 2 a 4 — siempre se recuperó sin pérdida de código (todo en disco) ni de datos de
   prueba (volumen de Postgres persistente); solo hizo falta recrear el contenedor backend con
   `--force-recreate` (un error transitorio de permisos en el primer arranque en bloque tras
   cada reinicio, no un bug real).
@@ -254,7 +294,7 @@ Aprobado con el usuario el 2026-09-20. Cada ronda se diseña en detalle recién 
 | 1 (hecho) | 6 bugs de seguridad + tenant provisioning + favoritos + orden real + copiar + cuota visible — **completa** |
 | 2 (hecho) | Etiquetas (tags many-to-many) — **completa** |
 | 3 (hecho) | Compartir granular (contraseña, permisos lectura/escritura, compartir a usuario específico) + notificaciones de "te compartieron algo" — **completa** |
-| 4 | Versionado de archivos (historial, restaurar versión anterior) |
+| 4 (hecho) | Versionado de archivos (historial, restaurar versión anterior) — **completa** |
 | 5 | Preview extendido (video, audio, documentos de Office) |
 | 6 | Búsqueda por contenido + OCR |
 | 7 | Antivirus (ClamAV) en upload + backups automáticos de Postgres/MinIO |
@@ -266,14 +306,20 @@ en tiempo real.
 
 ### Semáforo
 
-**Rondas 1, 2 y 3 completas y verificadas en vivo** (incluida verificación visual en navegador
-real y, en Ronda 3, reproducción de dos escenarios de punta a punta por el propio Auditor
+**Rondas 1 a 4 completas y verificadas en vivo** (incluida verificación visual en navegador
+real, y en Rondas 3-4, reproducción de escenarios de punta a punta por el propio Auditor
 Final). Listo para uso interno de un solo usuario/equipo pequeño en red cerrada — los 6
 bloqueadores de seguridad de la auditoría del 19 están resueltos, y el Drive ganó favoritos,
-orden real, copiar, cuota visible, etiquetas, y compartir granular (contraseña, permisos,
-usuarios específicos) con notificaciones reales. **Todavía no listo para exposición pública a
-Internet sin decisión** sobre 3 deudas residuales de seguridad (todas confirmadas no
-explotables hoy, pero dependen de configuración de producción que este repo de trabajo no
-controla directamente o de defensa en profundidad pendiente): `TRUSTED_PROXY_IPS` vacío en
-producción real, el balde compartido de rate-limit en shares públicos, y la falta de
-rate-limit en los endpoints autenticados de shares dirigidos.
+orden real, copiar, cuota visible, etiquetas, compartir granular (contraseña, permisos,
+usuarios específicos) con notificaciones reales, y versionado de archivos con historial
+completo. **Todavía no listo para exposición pública a Internet sin decisión** sobre 3 deudas
+residuales de seguridad (todas confirmadas no explotables hoy, pero dependen de configuración
+de producción que este repo de trabajo no controla directamente o de defensa en profundidad
+pendiente): `TRUSTED_PROXY_IPS` vacío en producción real, el balde compartido de rate-limit en
+shares públicos, y la falta de rate-limit en los endpoints autenticados de shares dirigidos.
+
+**Lección de proceso confirmada en Ronda 4** (ya aplicada, dejar como recordatorio para
+rondas futuras y para cualquier deploy real): reconstruir solo `backend` no alcanza cuando el
+cambio toca código que también importa `celery_worker` — hay que reconstruir/recrear todos los
+servicios que comparten ese código, y verificarlo explícitamente (no asumirlo) antes de dar una
+ronda por desplegada.

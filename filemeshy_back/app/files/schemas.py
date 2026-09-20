@@ -111,6 +111,32 @@ class TagIdsUpdate(BaseModel):
     tag_ids: List[UUID] = Field(default_factory=list)
 
 
+# ==================== Versiones (Ronda 4) ====================
+
+class FileVersionOut(BaseModel):
+    """Una entrada del historial de versiones de un archivo (`GET
+    /files/{id}/versions`, orden `version_number` desc).
+
+    `created_by_email`/`created_by_name` se resuelven en el router vía la
+    relación `FileVersion.created_by` (mismo criterio de enriquecer la
+    respuesta que ya usa `_share_to_out(with_resource_info=True)` para
+    `shared_by_email` en Ronda 3) -- quedan en `None` si el usuario que
+    subió esa versión fue borrado después (no debería pasar, la FK es
+    `ondelete=CASCADE`, pero no hace falta que reviente si pasara)."""
+    id: UUID
+    file_id: UUID
+    version_number: int
+    size_bytes: int
+    mime_type: str
+    created_at: datetime
+    created_by_id: UUID
+    created_by_email: Optional[str] = None
+    created_by_name: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
 # ==================== Listado de directorio ====================
 
 class DirectoryListing(BaseModel):

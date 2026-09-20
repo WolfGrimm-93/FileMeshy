@@ -98,13 +98,22 @@ def test_view_permission_forbids_recipient_upload(client, db_session):
 
 
 def test_edit_permission_lets_recipient_replace_file_content(client, db_session):
+    """Ronda 4: `PUT /shares/{id}/content` fue refactorizado para reusar la
+    MISMA lógica de "crear versión nueva" que `POST /files/{id}/versions` --
+    el reemplazo vía share ahora también queda versionado (con
+    `created_by_id` = el destinatario, no el dueño) y YA NO libera la cuota
+    del tamaño viejo (antes de esta ronda sí lo hacía: liberaba el tamaño
+    viejo y reservaba solo el nuevo). El blob viejo se conserva como
+    historial real, así que la cuota del dueño ahora refleja la SUMA de
+    ambas versiones."""
     creds_a, token_a = _register_login(client, db_session, permissions=["shares.create"])
     creds_b, token_b = _register_login(client, db_session)
 
+    old_content = b"version vieja"
     upload_resp = client.post(
         "/files/upload",
         headers=auth_headers(token_a),
-        files={"file": ("pytest_archivo_editable.txt", io.BytesIO(b"version vieja"), "text/plain")},
+        files={"file": ("pytest_archivo_editable.txt", io.BytesIO(old_content), "text/plain")},
     )
     assert upload_resp.status_code == 201, upload_resp.text
     file_obj = upload_resp.json()
@@ -116,6 +125,8 @@ def test_edit_permission_lets_recipient_replace_file_content(client, db_session)
     )
     assert share_resp.status_code == 201, share_resp.text
     share = share_resp.json()
+
+    bytes_used_a_before_replace = _my_quota_bytes_used(client, token_a)
 
     new_content = b"version nueva subida por B"
     replace_resp = client.put(
@@ -130,3 +141,21 @@ def test_edit_permission_lets_recipient_replace_file_content(client, db_session)
 
     download_resp = client.get(f"/files/{file_obj['id']}/download", headers=auth_headers(token_a))
     assert download_resp.status_code == 200, download_resp.text
+
+    # Ronda 4 -- la cuota de A (el DUEÑO real) ahora refleja la SUMA de las
+    # dos versiones (vieja + nueva), NO solo la nueva: el blob viejo se
+    # conserva como historial y nunca se libera.
+    bytes_used_a_after_replace = _my_quota_bytes_used(client, token_a)
+    assert bytes_used_a_after_replace == bytes_used_a_before_replace + len(new_content)
+
+    # Ronda 4 -- el reemplazo vía share queda versionado: 2 entradas de
+    # historial, la más reciente subida por B (el destinatario), no por A.
+    versions_resp = client.get(f"/files/{file_obj['id']}/versions", headers=auth_headers(token_a))
+    assert versions_resp.status_code == 200, versions_resp.text
+    versions = versions_resp.json()
+    assert len(versions) == 2
+    assert [v["version_number"] for v in versions] == [2, 1]
+    assert versions[0]["size_bytes"] == len(new_content)
+    assert versions[0]["created_by_id"] == creds_b["user"]["id"]
+    assert versions[1]["size_bytes"] == len(old_content)
+    assert versions[1]["created_by_id"] == creds_a["user"]["id"]
