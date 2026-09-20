@@ -30,6 +30,11 @@ x-backend-env: &backend-env
   MINIO_PRIVATE_BUCKET: filemeshy-media-private
   BACKEND_CORS_ORIGINS: '["http://localhost:58100"]'
   DEPLOYMENT_MODE: local
+  # Vacío a propósito -- en este stack de dev nada llega al backend a través
+  # de un proxy real (el frontend expone su propio puerto, 58100, pero las
+  # pruebas/uso manual le pegan directo al backend en 58101). Ver
+  # app/core/config.py::TRUSTED_PROXY_IPS / app/auth/router.py::_get_real_ip.
+  TRUSTED_PROXY_IPS: "[]"
 
 services:
   postgres:
@@ -59,7 +64,11 @@ services:
       retries: 10
 
   minio:
-    image: minio/minio:latest
+    # Pin de version -- `minio/minio:latest` en Docker Hub ademas quedo
+    # despublicado por MinIO (movieron sus imagenes a quay.io), asi que
+    # "latest" sin pin ni siquiera resuelve mas. RELEASE.2025-09-07 es la
+    # ultima tag estable conocida al momento de este fix.
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: filemeshy_minio_admin
@@ -75,6 +84,16 @@ services:
       context: ./filemeshy_back
     environment:
       <<: *backend-env
+    # Filesystem de solo lectura -- el proceso corre como `appuser` no-root
+    # (ver filemeshy_back/Dockerfile) y no tiene ningun motivo para escribir
+    # sobre su propio codigo en runtime. `/tmp` (temporales de pyvips/etc.) y
+    # `/app/logs` (app_logger, ver app/core/logging_config.py) son las UNICAS
+    # rutas donde escribe -- quedan como tmpfs (efimero, se pierde al
+    # reiniciar el contenedor; aceptable para logs de dev).
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /app/logs
     depends_on:
       postgres:
         condition: service_healthy

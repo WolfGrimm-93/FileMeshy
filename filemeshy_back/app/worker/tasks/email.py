@@ -137,11 +137,3 @@ def send_welcome_email(self, tenant_schema: str | None, user_id: UUID):
     except Exception as exc:
         logger.error(f"send_welcome_email error: {exc}")
         raise self.retry(exc=exc, countdown=120 * (self.request.retries + 1))
-
-
-# send_credit_exceeded_email, send_low_stock_summary, send_daily_summary,
-# send_weekly_summary y send_monthly_summary se podaron: eran 100% resúmenes
-# de negocio no relacionado (ventas, stock, compras, clientes) -- ver también
-# la poda equivalente en maintenance.py (worker/tasks/notifications.py, que
-# tenía la poda equivalente, se borró por completo más adelante junto con
-# notify_acceso_fuera_horario, su único task restante).

@@ -36,6 +36,20 @@ class FoldersService {
     return response.data
   }
 
+  async setFavorite(folderId: string, isFavorite: boolean): Promise<FolderOut> {
+    const response = await axiosInstance.patch<FolderOut>(`${this.basePath}/${folderId}`, {
+      is_favorite: isFavorite,
+    })
+    return response.data
+  }
+
+  async copy(folderId: string, parentId?: string | null): Promise<FolderOut> {
+    const response = await axiosInstance.post<FolderOut>(`${this.basePath}/${folderId}/copy`, {
+      folder_id: parentId ?? null,
+    })
+    return response.data
+  }
+
   async remove(folderId: string): Promise<void> {
     await axiosInstance.delete(`${this.basePath}/${folderId}`)
   }

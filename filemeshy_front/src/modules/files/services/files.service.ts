@@ -10,6 +10,9 @@ import axiosInstance from '@/shared/config/axios'
 import type { AxiosProgressEvent } from 'axios'
 import type { DirectoryListing, FileOut } from '../types'
 
+export type FilesSortBy = 'name' | 'created_at' | 'updated_at' | 'size_bytes'
+export type FilesSortDir = 'asc' | 'desc'
+
 export interface ListFilesParams {
   /** Carpeta a listar. Omitido = raíz. Ignorado si `q` viene seteado. */
   folderId?: string
@@ -17,6 +20,12 @@ export interface ListFilesParams {
   q?: string
   /** Listar la papelera del usuario en vez del árbol activo. */
   trash?: boolean
+  /** Campo de orden. Omitido = orden default del backend (nombre asc). */
+  sortBy?: FilesSortBy
+  /** Dirección del orden. Omitido = orden default del backend (asc). */
+  sortDir?: FilesSortDir
+  /** Listar únicamente favoritos (archivos y carpetas marcadas). */
+  favoritesOnly?: boolean
 }
 
 class FilesService {
@@ -27,6 +36,9 @@ class FilesService {
     if (params.folderId) query.folder_id = params.folderId
     if (params.q) query.q = params.q
     if (params.trash) query.trash = true
+    if (params.sortBy) query.sort_by = params.sortBy
+    if (params.sortDir) query.sort_dir = params.sortDir
+    if (params.favoritesOnly) query.favorites_only = true
 
     const response = await axiosInstance.get<DirectoryListing>(this.basePath, { params: query })
     return response.data
@@ -72,6 +84,20 @@ class FilesService {
   async move(fileId: string, folderId: string | null): Promise<FileOut> {
     const response = await axiosInstance.patch<FileOut>(`${this.basePath}/${fileId}`, {
       folder_id: folderId,
+    })
+    return response.data
+  }
+
+  async setFavorite(fileId: string, isFavorite: boolean): Promise<FileOut> {
+    const response = await axiosInstance.patch<FileOut>(`${this.basePath}/${fileId}`, {
+      is_favorite: isFavorite,
+    })
+    return response.data
+  }
+
+  async copy(fileId: string, folderId?: string | null): Promise<FileOut> {
+    const response = await axiosInstance.post<FileOut>(`${this.basePath}/${fileId}/copy`, {
+      folder_id: folderId ?? null,
     })
     return response.data
   }

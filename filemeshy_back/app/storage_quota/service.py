@@ -38,6 +38,52 @@ def reserve_upload_bytes(db: Session, user_id: UUID, additional_bytes: int) -> N
             detail="Se alcanzó el límite de almacenamiento asignado",
         )
 
+    _notify_if_near_limit(db, user_id)
+
+
+# Umbral de aviso: 90% del límite asignado -- ni tan temprano que sea ruido
+# (a mitad de cupo no hay nada urgente que avisar) ni tan tarde que el
+# usuario se entere recién cuando ya no puede subir nada más (413).
+_QUOTA_WARNING_THRESHOLD = 0.9
+
+
+def _notify_if_near_limit(db: Session, user_id: UUID) -> None:
+    """Tras una reserva exitosa de `reserve_upload_bytes`, si el usuario
+    tiene un `limit_bytes` configurado (no ilimitado) y su uso ya supera
+    `_QUOTA_WARNING_THRESHOLD`, notifica al dueño. Best-effort a propósito --
+    nunca debe romper una subida que ya se reservó con éxito.
+
+    Dedup vía `_is_duplicate` (mismo helper que usa `worker/tasks/security.py`
+    para no espamear): mientras el usuario no haya leído el aviso anterior
+    (o lo leyó hace menos de 4hs), subir más archivos por encima del umbral
+    no genera una notificación nueva por cada upload."""
+    try:
+        quota = user_storage_quota_repo.get_by_user_id(db, user_id)
+        if not quota or not quota.limit_bytes:
+            return  # sin límite configurado -- nada que avisar
+
+        usage_ratio = quota.bytes_used / quota.limit_bytes
+        if usage_ratio < _QUOTA_WARNING_THRESHOLD:
+            return
+
+        from app.worker.tasks.notification_helpers import _is_duplicate, create_notification
+
+        if _is_duplicate(db, user_id, "almacenamiento", reference_id=user_id):
+            return
+
+        create_notification(
+            db=db,
+            user_id=user_id,
+            title="Tu almacenamiento está por agotarse",
+            message=f"Ya usaste el {round(usage_ratio * 100)}% de tu límite de almacenamiento asignado.",
+            notif_type="almacenamiento",
+            severity="warning",
+            action_url="/configuracion/almacenamiento",
+            extra_data={"reference_id": str(user_id), "usage_ratio": usage_ratio},
+        )
+    except Exception as exc:
+        logger.warning(f"[StorageQuota] No se pudo notificar cuota cerca del límite user={user_id}: {exc}")
+
 
 def release_upload_bytes(db: Session, user_id: UUID, bytes_to_release: int) -> None:
     """Compensa una reserva de `reserve_upload_bytes` cuando la subida a

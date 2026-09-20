@@ -6,7 +6,7 @@ en un job de Celery futuro (Hito 2), no acá -- este archivo es solo el
 esquema de columnas/relaciones.
 """
 
-from sqlalchemy import Column, String, DateTime, BigInteger, ForeignKey, Index, CheckConstraint
+from sqlalchemy import Column, String, DateTime, BigInteger, Boolean, ForeignKey, Index, CheckConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -34,6 +34,7 @@ class Folder(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
     deleted_at = Column(DateTime(timezone=True), nullable=True)
+    is_favorite = Column(Boolean, nullable=False, server_default='false')
 
     owner = relationship("User", foreign_keys=[owner_id], lazy="select")
     parent = relationship("Folder", remote_side=[id], foreign_keys=[parent_id], lazy="select")
@@ -62,6 +63,7 @@ class File(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
     deleted_at = Column(DateTime(timezone=True), nullable=True)
+    is_favorite = Column(Boolean, nullable=False, server_default='false')
 
     owner = relationship("User", foreign_keys=[owner_id], lazy="select")
     folder = relationship("Folder", foreign_keys=[folder_id], lazy="select")

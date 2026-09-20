@@ -12,9 +12,11 @@ from typing import Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.access_control.service import has_permission
+from app.auth.service import get_current_active_user
 from app.core.database import get_db
 from app.storage_quota.repository import user_storage_quota_repo
 from app.storage_quota.schemas import (
@@ -27,6 +29,14 @@ from app.storage_quota.service import get_disk_capacity
 from app.users.models import User
 
 router = APIRouter(prefix="/storage-quotas", tags=["storage-quotas"])
+
+
+class StorageQuotaMeResponse(BaseModel):
+    """Schema local al router (mismo criterio que configuration/router.py
+    para schemas de un solo endpoint) -- storage_quota/schemas.py queda fuera
+    del alcance de este fix puntual."""
+    limit_bytes: Optional[int] = None
+    bytes_used: int = 0
 
 
 def _to_item(user: User, quota) -> StorageQuotaItem:
@@ -94,6 +104,23 @@ def get_storage_capacity(
     """Capacidad real de disco del volumen de MinIO (todos los campos en
     `null` si no se pudo leer -- ver service.py::get_disk_capacity)."""
     return StorageCapacityResponse(**get_disk_capacity())
+
+
+@router.get("/me", response_model=StorageQuotaMeResponse)
+def get_my_storage_quota(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """Cuota de almacenamiento del usuario autenticado -- a diferencia del
+    resto de este router (storage_quotas.view/manage), NO requiere permiso
+    admin: cualquier usuario puede ver SU PROPIA cuota. Nunca acepta un
+    `user_id` de otro usuario -- siempre lee `current_user.id`, así que no
+    hay forma de pedir la cuota de otra persona por acá."""
+    quota = user_storage_quota_repo.get_by_user_id(db, current_user.id)
+    return StorageQuotaMeResponse(
+        limit_bytes=quota.limit_bytes if quota else None,
+        bytes_used=quota.bytes_used if quota else 0,
+    )
 
 
 @router.put("/{user_id}", response_model=StorageQuotaItem)

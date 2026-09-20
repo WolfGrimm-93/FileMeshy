@@ -441,8 +441,6 @@ def update_system_config(
 
 # ===== ENDPOINTS PARA FRONTEND (notification-types) =====
 
-# Los tipos de negocio no relacionado (stock/pagos/ventas/compras/clientes) se
-# podaron junto con sus tasks -- ver worker/tasks/notification_helpers.py::_DEFAULT_NOTIF_TYPES.
 _DEFAULT_NOTIF_TYPES_CONFIG: dict = {}
 
 

@@ -23,6 +23,7 @@ from uuid import UUID
 
 from fastapi import (
     APIRouter,
+    Body,
     Depends,
     File as UploadFileParam,
     Form,
@@ -37,11 +38,12 @@ from sqlalchemy.orm import Session
 from app.access_control.service import has_permission
 from app.auth.service import RateLimiter
 from app.core.config import settings
-from app.core.database import get_db
+from app.core.database import SessionLocal, get_db
 from app.files.models import File as FileModel, Folder, Share
 from app.files.repository import file_repo, folder_repo, share_repo
 from app.files.schemas import (
     BreadcrumbItem,
+    CopyRequest,
     DirectoryListing,
     DownloadUrlResponse,
     FileOut,
@@ -57,6 +59,7 @@ from app.files.schemas import (
     ShareOut,
 )
 from app.files.service import (
+    delete_private_file,
     detect_image_type,
     generate_presigned_url,
     is_pdf_content,
@@ -272,6 +275,199 @@ def _restore_folder_recursive(db: Session, folder: Folder) -> None:
 
 
 # ============================================================
+# COPIA -- helpers compartidos por /files/{id}/copy y /folders/{id}/copy
+# ============================================================
+
+def _read_private_object(storage_key: str) -> bytes:
+    """Lee el contenido crudo de un objeto del bucket privado de MinIO
+    directo por el cliente S3 interno (mismo cliente que usa `upload_private_file`),
+    en vez de generar una URL firmada e ir por HTTP -- una URL firmada por
+    `generate_presigned_url` apunta a `MINIO_PUBLIC_URL` (pensado para que la
+    resuelva el navegador del usuario), que no necesariamente es alcanzable
+    desde DENTRO del propio contenedor del backend."""
+    from app.files.service import _get_client  # helper interno del módulo, ver su docstring
+
+    client = _get_client()
+    if not client:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="El servicio de almacenamiento no está disponible",
+        )
+    try:
+        obj = client.get_object(Bucket=settings.MINIO_PRIVATE_BUCKET, Key=storage_key)
+        return obj["Body"].read()
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="No se pudo leer el archivo original",
+        ) from e
+
+
+def _copy_with_suffix(name: str, *, same_location: bool) -> str:
+    """Nombre de una copia: si el destino es el mismo lugar que el original
+    lleva el sufijo " (copia)" (para no chocar con el nombre existente); si
+    el destino es otro lugar, se conserva el nombre tal cual. Trunca la base
+    si hiciera falta para no superar `String(255)` de la columna `name`."""
+    if not same_location:
+        return name
+    suffix = " (copia)"
+    if len(name) + len(suffix) > 255:
+        name = name[: 255 - len(suffix)]
+    return name + suffix
+
+
+def _resolve_copy_destination(
+    db: Session,
+    owner_id: UUID,
+    default_parent_id: Optional[UUID],
+    payload: Optional[CopyRequest],
+) -> Optional[UUID]:
+    """Resuelve el `folder_id` destino de una copia. Si el cliente no mandó
+    el campo (body ausente o `{}`), el destino es `default_parent_id` (el
+    mismo lugar que el original) -- si lo mandó explícito (incluido `null`),
+    se respeta tal cual. `null` explícito = raíz. Un UUID puntual se valida
+    con el mismo helper de ownership que usa el resto del router (404 si no
+    existe o es de otro dueño)."""
+    if payload is not None and "folder_id" in payload.model_fields_set:
+        if payload.folder_id is None:
+            return None
+        target = _get_target_parent_folder(db, payload.folder_id, owner_id)
+        return target.id
+    return default_parent_id
+
+
+def _reserve_copy_quota(owner_id: UUID, size: int) -> None:
+    """Reserva cuota para un archivo copiado, en una sesión de DB PROPIA --
+    NUNCA la sesión de la request.
+
+    `reserve_upload_bytes`/`release_upload_bytes` hacen su propio `db.commit()`
+    atómico (ver storage_quota/service.py) -- si compartieran la sesión de la
+    request, ese commit finalizaría TAMBIÉN cualquier Folder/File que la copia
+    recursiva ya haya agregado con `db.flush()` pero que todavía no debería
+    quedar permanente (se necesita `flush` sin commit para conocer el `id`
+    del Folder padre antes de crear sus hijos). Confirmado en vivo con un
+    smoke test manual: sin este aislamiento, una copia de carpeta que falla a
+    mitad de camino (ej. cuota agotada en el segundo archivo) dejaba la
+    carpeta ya creada a pesar del `db.rollback()` posterior, porque la
+    reserva de cuota del PRIMER archivo ya había comprometido esa fila."""
+    quota_db = SessionLocal()
+    try:
+        reserve_upload_bytes(quota_db, owner_id, size)
+    finally:
+        quota_db.close()
+
+
+def _release_copy_quota(owner_id: UUID, size: int) -> None:
+    """Compensa `_reserve_copy_quota` -- misma razón de sesión propia."""
+    quota_db = SessionLocal()
+    try:
+        release_upload_bytes(quota_db, owner_id, size)
+    finally:
+        quota_db.close()
+
+
+def _rollback_copy(db: Session, reservations: List[tuple], uploaded_keys: List[str]) -> None:
+    """Compensa una copia (de archivo o de carpeta completa) que falló a
+    mitad de camino: libera toda cuota ya reservada, borra todo objeto ya
+    subido a MinIO, y descarta las filas de File/Folder todavía sin commit
+    (gracias a que la cuota se reserva en una sesión aparte, ver
+    `_reserve_copy_quota`, este `rollback` sí las descarta de verdad)."""
+    for owner_id, size in reservations:
+        _release_copy_quota(owner_id, size)
+    for key in uploaded_keys:
+        delete_private_file(key)
+    db.rollback()
+
+
+def _copy_file_object(
+    db: Session,
+    source_file: FileModel,
+    *,
+    owner_id: UUID,
+    folder_id: Optional[UUID],
+    name: str,
+    reservations: List[tuple],
+    uploaded_keys: List[str],
+) -> FileModel:
+    """Copia un único archivo (bytes + fila nueva), reservando cuota real
+    igual que `upload_file`. No hace `commit` -- lo hace el caller una vez
+    que terminó (todo el archivo, o todo el subárbol de una carpeta)."""
+    content = _read_private_object(source_file.storage_key)
+    size = len(content)
+
+    _reserve_copy_quota(owner_id, size)
+    reservations.append((owner_id, size))
+
+    try:
+        storage_key = upload_private_file(
+            path=f"files/{owner_id}",
+            content=content,
+            extension=os.path.splitext(source_file.name)[1],
+            content_type=source_file.mime_type,
+        )
+    except Exception:
+        _release_copy_quota(owner_id, size)
+        reservations.pop()
+        raise
+    uploaded_keys.append(storage_key)
+
+    new_file = FileModel(
+        name=name,
+        folder_id=folder_id,
+        owner_id=owner_id,
+        storage_key=storage_key,
+        size_bytes=size,
+        mime_type=source_file.mime_type,
+    )
+    db.add(new_file)
+    db.flush()
+    return new_file
+
+
+def _copy_folder_tree(
+    db: Session,
+    source_folder: Folder,
+    *,
+    owner_id: UUID,
+    parent_id: Optional[UUID],
+    name: str,
+    reservations: List[tuple],
+    uploaded_keys: List[str],
+) -> Folder:
+    """Copia recursiva de `source_folder` (la carpeta en sí + todo su
+    subárbol de subcarpetas y archivos activos) bajo `parent_id`. La
+    profundidad máxima ya se validó ANTES de llamar a esto (ver
+    `copy_folder`) -- acá solo se recorre y se copia."""
+    new_folder = Folder(name=name, parent_id=parent_id, owner_id=owner_id)
+    db.add(new_folder)
+    db.flush()
+
+    for child_file in file_repo.get_children(db, source_folder.owner_id, source_folder.id):
+        _copy_file_object(
+            db,
+            child_file,
+            owner_id=owner_id,
+            folder_id=new_folder.id,
+            name=child_file.name,
+            reservations=reservations,
+            uploaded_keys=uploaded_keys,
+        )
+
+    for child_folder in folder_repo.get_children(db, source_folder.owner_id, source_folder.id):
+        _copy_folder_tree(
+            db,
+            child_folder,
+            owner_id=owner_id,
+            parent_id=new_folder.id,
+            name=child_folder.name,
+            reservations=reservations,
+            uploaded_keys=uploaded_keys,
+        )
+
+    return new_folder
+
+
+# ============================================================
 # FOLDERS
 # ============================================================
 
@@ -313,7 +509,16 @@ def update_folder(
     folder_id: UUID,
     payload: FolderUpdate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(has_permission(["folders.rename", "folders.move"])),
+    # Gate de la dependency bajado a "folders.view" (lo tiene el rol USER por
+    # defecto) -- "folders.rename"/"folders.move" se siguen exigiendo
+    # EXPLÍCITAMENTE más abajo, campo por campo, cuando "name"/"parent_id"
+    # vienen seteados. Marcar/desmarcar favorito es una preferencia personal
+    # sobre un recurso que ya se valida por ownership (_get_owned_folder) --
+    # no debería exigir el mismo permiso que renombrar o mover (hallazgo del
+    # auditor final de Ronda 1, 2026-09-20: con el gate viejo, el rol USER
+    # por defecto no podía favoritear nada, el caso de uso principal de esta
+    # ronda quedaba inutilizable para cualquiera sin folders.rename/move).
+    current_user: User = Depends(has_permission(["folders.view"])),
 ):
     folder = _get_owned_folder(db, folder_id, current_user, active_only=True)
     fields_set = payload.model_fields_set
@@ -344,6 +549,9 @@ def update_folder(
                     detail="Profundidad máxima de carpetas alcanzada",
                 )
         folder.parent_id = new_parent_id
+
+    if "is_favorite" in fields_set and payload.is_favorite is not None:
+        folder.is_favorite = payload.is_favorite
 
     db.commit()
     db.refresh(folder)
@@ -376,6 +584,67 @@ def restore_folder(
     return folder
 
 
+@folders_router.post("/{folder_id}/copy", response_model=FolderOut, status_code=status.HTTP_201_CREATED)
+def copy_folder(
+    folder_id: UUID,
+    payload: Optional[CopyRequest] = Body(default=None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(has_permission(["files.upload"])),
+):
+    """Copia recursiva de una carpeta y todo su contenido activo (subcarpetas
+    + archivos). Requiere `files.upload` -- mismo criterio que copiar un
+    archivo: copiar una carpeta consume cuota real por cada archivo que
+    arrastra, ni más ni menos que subirlos de nuevo uno por uno.
+
+    Ownership del origen validado por `_get_owned_folder` (mismo patrón que
+    el resto del router). El destino, si se pasa explícito, se valida con
+    `_get_target_parent_folder` dentro de `_resolve_copy_destination` --
+    nunca se copia hacia una carpeta de otro dueño."""
+    source_folder = _get_owned_folder(db, folder_id, current_user, active_only=True)
+
+    dest_parent_id = _resolve_copy_destination(db, source_folder.owner_id, source_folder.parent_id, payload)
+
+    if dest_parent_id is not None:
+        dest_parent = folder_repo.get(db, dest_parent_id)
+        if not dest_parent:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Carpeta destino no encontrada")
+        dest_parent_depth = _folder_depth(db, dest_parent)
+    else:
+        dest_parent_depth = 0
+
+    # Misma fórmula que valida update_folder al mover un subárbol completo
+    # (ver arriba): profundidad del destino + 1 (la carpeta copiada en sí) +
+    # la altura de su propio subárbol no puede superar MAX_FOLDER_DEPTH.
+    subtree_height = folder_repo.get_subtree_height(db, source_folder.id)
+    if dest_parent_depth + 1 + subtree_height > MAX_FOLDER_DEPTH:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Profundidad máxima de carpetas alcanzada",
+        )
+
+    same_location = dest_parent_id == source_folder.parent_id
+    new_name = _copy_with_suffix(source_folder.name, same_location=same_location)
+
+    reservations: List[tuple] = []
+    uploaded_keys: List[str] = []
+    try:
+        new_folder = _copy_folder_tree(
+            db,
+            source_folder,
+            owner_id=source_folder.owner_id,
+            parent_id=dest_parent_id,
+            name=new_name,
+            reservations=reservations,
+            uploaded_keys=uploaded_keys,
+        )
+        db.commit()
+    except Exception:
+        _rollback_copy(db, reservations, uploaded_keys)
+        raise
+    db.refresh(new_folder)
+    return new_folder
+
+
 # ============================================================
 # FILES
 # ============================================================
@@ -385,12 +654,15 @@ def list_directory(
     folder_id: Optional[UUID] = Query(None),
     q: Optional[str] = Query(None),
     trash: bool = Query(False),
+    sort_by: str = Query("name"),
+    sort_dir: str = Query("asc"),
+    favorites_only: bool = Query(False),
     db: Session = Depends(get_db),
     current_user: User = Depends(has_permission(["files.view"])),
 ):
     if q:
-        folders = folder_repo.search(db, current_user.id, q)
-        files = file_repo.search(db, current_user.id, q)
+        folders = folder_repo.search(db, current_user.id, q, sort_by, sort_dir, favorites_only)
+        files = file_repo.search(db, current_user.id, q, sort_by, sort_dir, favorites_only)
         return DirectoryListing(folders=folders, files=files, breadcrumb=[])
 
     if trash:
@@ -398,8 +670,8 @@ def list_directory(
         # arriba: admin accede a recursos puntuales por ID (ver _get_owned_folder/_get_owned_file),
         # no ve la papelera ajena solo por tener rol admin (hallazgo del auditor final, 2026-09-05).
         owner_filter = current_user.id
-        folders = folder_repo.get_trash(db, owner_filter)
-        files = file_repo.get_trash(db, owner_filter)
+        folders = folder_repo.get_trash(db, owner_filter, sort_by, sort_dir, favorites_only)
+        files = file_repo.get_trash(db, owner_filter, sort_by, sort_dir, favorites_only)
         return DirectoryListing(folders=folders, files=files, breadcrumb=[])
 
     breadcrumb: List[BreadcrumbItem] = []
@@ -410,8 +682,8 @@ def list_directory(
     else:
         owner_scope = current_user.id
 
-    folders = folder_repo.get_children(db, owner_scope, folder_id)
-    files = file_repo.get_children(db, owner_scope, folder_id)
+    folders = folder_repo.get_children(db, owner_scope, folder_id, sort_by, sort_dir, favorites_only)
+    files = file_repo.get_children(db, owner_scope, folder_id, sort_by, sort_dir, favorites_only)
     return DirectoryListing(folders=folders, files=files, breadcrumb=breadcrumb)
 
 
@@ -543,7 +815,13 @@ def update_file(
     file_id: UUID,
     payload: FileUpdate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(has_permission(["files.rename", "files.move"])),
+    # Gate de la dependency bajado a "files.view" (lo tiene el rol USER por
+    # defecto) -- "files.rename"/"files.move" se siguen exigiendo
+    # EXPLÍCITAMENTE más abajo, campo por campo, cuando "name"/"folder_id"
+    # vienen seteados. Mismo criterio y misma razón que update_folder (ver su
+    # comentario): favoritear es una preferencia personal ya protegida por
+    # ownership (_get_owned_file), no una operación de rename/move.
+    current_user: User = Depends(has_permission(["files.view"])),
 ):
     file_obj = _get_owned_file(db, file_id, current_user, active_only=True)
     fields_set = payload.model_fields_set
@@ -563,6 +841,9 @@ def update_file(
         if new_folder_id is not None:
             _get_target_parent_folder(db, new_folder_id, file_obj.owner_id)
         file_obj.folder_id = new_folder_id
+
+    if "is_favorite" in fields_set and payload.is_favorite is not None:
+        file_obj.is_favorite = payload.is_favorite
 
     db.commit()
     db.refresh(file_obj)
@@ -601,6 +882,47 @@ def restore_file(
     db.commit()
     db.refresh(file_obj)
     return file_obj
+
+
+@files_router.post("/{file_id}/copy", response_model=FileOut, status_code=status.HTTP_201_CREATED)
+def copy_file(
+    file_id: UUID,
+    payload: Optional[CopyRequest] = Body(default=None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(has_permission(["files.upload"])),
+):
+    """Copia un archivo propio a la misma carpeta (nombre con sufijo
+    " (copia)") o a otra carpeta del mismo dueño (mismo nombre). Requiere
+    `files.upload` -- copiar consume cuota real, ni más ni menos que subir un
+    archivo nuevo idéntico.
+
+    Ownership del origen validado por `_get_owned_file`, MISMO patrón que
+    `download_file`/`delete_file` -- nunca se copia un archivo ajeno solo
+    porque el caller conoce/adivina su ID (ver test_files_copy.py, caso IDOR)."""
+    source = _get_owned_file(db, file_id, current_user, active_only=True)
+
+    dest_folder_id = _resolve_copy_destination(db, source.owner_id, source.folder_id, payload)
+    same_location = dest_folder_id == source.folder_id
+    new_name = _copy_with_suffix(source.name, same_location=same_location)
+
+    reservations: List[tuple] = []
+    uploaded_keys: List[str] = []
+    try:
+        new_file = _copy_file_object(
+            db,
+            source,
+            owner_id=source.owner_id,
+            folder_id=dest_folder_id,
+            name=new_name,
+            reservations=reservations,
+            uploaded_keys=uploaded_keys,
+        )
+        db.commit()
+    except Exception:
+        _rollback_copy(db, reservations, uploaded_keys)
+        raise
+    db.refresh(new_file)
+    return new_file
 
 
 # ============================================================

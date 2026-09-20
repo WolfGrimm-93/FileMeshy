@@ -10,11 +10,15 @@ Secuencia atómica/reintentable:
   2. CREATE SCHEMA para el schema ya persistido y validado.
   3. Corre las migraciones de negocio contra ese schema (mecanismo de
      `-x schema=` de migrations/env.py).
-  4. Siembra los datos base reusando, sin modificarlos, los 13 scripts de
-     `scripts/instalacion/cliente_nuevo/` -- se cargan por ruta de archivo
-     (sus nombres empiezan con dígito, no son importables como módulo
-     normal) y se invoca su `main()` con `tenant_schema_ctx` ya seteado al
-     schema del tenant.
+  4. Siembra los datos base del tenant llamando directo a la lógica de
+     `scripts/seed_permissions.py` (roles/permisos) y
+     `scripts/create_super_admin.py` (super admin inicial), con
+     `tenant_schema_ctx` ya seteado al schema del tenant -- ver
+     `sembrar_cliente_nuevo` más abajo. Reemplaza la implementación anterior,
+     que cargaba por ruta de archivo 6 scripts de
+     `scripts/instalacion/cliente_nuevo/` -- ese directorio NUNCA existió en
+     el repo (confirmado en pendiente.md, bloqueador #6), así que cualquier
+     provisioning fallaba siempre acá con `FileNotFoundError`.
   5. Solo si (2), (3) y (4) corrieron sin error: UPDATE tenants SET
      is_active = true. Activar al final (no apenas migran, ver auditoría
      2026-07-25) -- si la siembra falla a mitad de camino, el tenant NUNCA
@@ -26,8 +30,9 @@ Secuencia atómica/reintentable:
 """
 
 import logging
+import secrets
 import subprocess
-import importlib.util
+import sys
 from pathlib import Path
 
 from sqlalchemy import text
@@ -41,20 +46,6 @@ from app.shared.utils.uuid7 import uuid7
 logger = logging.getLogger(__name__)
 
 FILEMESHY_BACK_ROOT = Path(__file__).resolve().parent.parent.parent
-CLIENTE_NUEVO_DIR = FILEMESHY_BACK_ROOT / "scripts" / "instalacion" / "cliente_nuevo"
-
-# Mismo orden documentado en scripts/instalacion/cliente_nuevo/README.md.
-# Varios scripts de siembra de modelos de negocio no relacionado (geografía,
-# configuración de punto de venta, fidelización, tipos de unidad, almacenes)
-# se quitaron: sembraban modelos podados en esta misma pasada.
-CLIENTE_NUEVO_SCRIPTS = [
-    "01_roles.py",
-    "04_system_configuration.py",
-    "07_security_policies.py",
-    "08_company_settings.py",
-    "09_super_admin.py",
-    "10_payment_methods.py",
-]
 
 # Nombres de schema reservados/ya-existentes en cualquier base de Postgres.
 # Canónico acá (no en app/schemas/platform.py, que lo importa de acá): esto
@@ -159,21 +150,51 @@ def activar_tenant(tenant_id) -> None:
         db.close()
 
 
-def _cargar_script_por_ruta(path: Path):
-    spec = importlib.util.spec_from_file_location(f"_seed_{path.stem}", path)
-    modulo = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(modulo)
-    return modulo
+def sembrar_cliente_nuevo(schema_name: str, *, slug: str, company_name: str) -> dict:
+    """Siembra los datos base de un tenant nuevo: roles/permisos
+    (`scripts/seed_permissions.py::seed`) y un primer usuario SUPER_ADMIN
+    (`scripts/create_super_admin.py::create_super_admin`) para poder entrar
+    por primera vez -- ambos corridos con `tenant_schema_ctx` ya seteado al
+    schema del tenant, así que sus INSERT caen en el schema correcto.
 
+    `scripts/` no tiene `__init__.py` (no es un paquete formal) y estos
+    scripts asumen que se corren standalone -- por eso se asegura acá que
+    `FILEMESHY_BACK_ROOT` esté en `sys.path` antes de importarlos, igual que
+    hacen ellos mismos para poder importar `app.*` cuando se corren solos.
 
-def sembrar_cliente_nuevo(schema_name: str) -> None:
+    Devuelve {"admin_email": str, "admin_password": str}: la credencial
+    generada para el super admin. `TenantCreateResponse`
+    (app/platform/schemas.py) no tiene un campo para devolverla por API --
+    queda solo en el log/stdout del contenedor backend (visible para quien
+    tiene acceso al servidor, el mismo nivel de confianza que ya requiere
+    X-Platform-Key para llegar hasta acá). El operador que da de alta el
+    tenant tiene que copiarla de ahí y entregarla al cliente por un canal
+    seguro -- no se reenvía por ningún otro lado.
+    """
+    if str(FILEMESHY_BACK_ROOT) not in sys.path:
+        sys.path.insert(0, str(FILEMESHY_BACK_ROOT))
+
+    from scripts.create_super_admin import SuperAdminCreationError, create_super_admin
+    from scripts.seed_permissions import seed as seed_roles_y_permisos
+
     token = tenant_schema_ctx.set(schema_name)
     try:
-        for filename in CLIENTE_NUEVO_SCRIPTS:
-            path = CLIENTE_NUEVO_DIR / filename
-            print(f"  -> {filename}")
-            modulo = _cargar_script_por_ruta(path)
-            modulo.main()
+        print("  -> seed_permissions (roles/permisos)")
+        seed_roles_y_permisos()
+
+        admin_email = f"admin@{slug}.filemeshy"
+        admin_password = secrets.token_urlsafe(18)
+        print(f"  -> create_super_admin ({admin_email})")
+        try:
+            create_super_admin(admin_email, admin_password, first_name="Admin", last_name=company_name)
+        except SuperAdminCreationError as exc:
+            raise ProvisioningError(str(exc)) from exc
+
+        print(
+            "  -- Credencial del super admin generada (única vez, no se vuelve a "
+            f"mostrar): email={admin_email} password={admin_password}"
+        )
+        return {"admin_email": admin_email, "admin_password": admin_password}
     finally:
         tenant_schema_ctx.reset(token)
 
@@ -247,9 +268,13 @@ def provisionar_tenant(slug: str, schema_name: str, company_name: str, plan: str
         raise
     print("    OK")
 
-    print("4/4 Sembrando datos base (scripts/instalacion/cliente_nuevo/)...")
+    print("4/4 Sembrando datos base (roles/permisos + super admin inicial)...")
     try:
-        sembrar_cliente_nuevo(schema_name)
+        credenciales_admin = sembrar_cliente_nuevo(schema_name, slug=slug, company_name=company_name)
+    except ProvisioningError:
+        logger.error(f"[Platform] Error sembrando datos base en '{schema_name}'")
+        print(mensaje_limpieza_manual(slug, schema_name, tenant_id))
+        raise
     except Exception as exc:
         logger.error(f"[Platform] Error sembrando datos base en '{schema_name}': {exc}")
         print(mensaje_limpieza_manual(slug, schema_name, tenant_id))
@@ -263,7 +288,12 @@ def provisionar_tenant(slug: str, schema_name: str, company_name: str, plan: str
     activar_tenant(tenant_id)
     print(f"OK -- tenant '{slug}' provisionado y activo.")
 
-    return {"tenant_id": str(tenant_id), "slug": slug, "schema_name": schema_name}
+    return {
+        "tenant_id": str(tenant_id),
+        "slug": slug,
+        "schema_name": schema_name,
+        "admin_email": credenciales_admin["admin_email"],
+    }
 
 
 # ============================================================

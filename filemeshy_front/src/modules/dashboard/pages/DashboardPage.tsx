@@ -1,10 +1,7 @@
 /**
  * PÁGINA: DASHBOARD
  *
- * Placeholder minimo -- el dashboard original (DashboardPage.tsx) fue
- * borrado en la limpieza de modulos de negocio no relacionado. Diseñar el
- * dashboard real de FileMeshy es trabajo de producto, fuera del alcance de
- * esta limpieza.
+ * Placeholder mínimo — falta diseñar el dashboard real de FileMeshy.
  */
 
 import { LayoutDashboard } from 'lucide-react'

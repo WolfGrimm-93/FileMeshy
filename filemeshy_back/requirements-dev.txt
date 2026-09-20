@@ -1,0 +1,5 @@
+# Dependencias solo para testing -- NO se instalan en la imagen de producción
+# (ver Dockerfile, que solo copia requirements.txt). Instalar dentro del
+# contenedor backend ya corriendo con:
+#   docker compose exec backend pip install -r requirements-dev.txt
+pytest==7.4.4

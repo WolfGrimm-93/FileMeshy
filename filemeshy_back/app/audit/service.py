@@ -178,18 +178,7 @@ SKIP_PREFIXES = (
     "/openapi",
 )
 
-# TODO: TABLE_NAME_MAP y SUFFIX_OVERRIDES todavía tienen restos de negocio
-# no relacionado (payment-methods, tickets, support, external-services, stock,
-# volume-prices) sin consumidor real hoy -- confirmado en RECON_RIESGOS.md.
-# Migrado tal cual (migración estructural, no corrección de comportamiento);
-# limpiarlos es una decisión de producto aparte.
-
 # Segmentos de URL → nombre descriptivo en español
-# Se quitaron las entradas de rutas de negocio no relacionado ya borradas
-# (customers, products, suppliers, sales, invoices, cash-register-closes,
-# warehouses, purchase-orders, inventory-*, document-types, unit-types,
-# reports, product-extras, brands, categories, printing, geographic) -- ver
-# poda equivalente de sus routers/endpoints.
 TABLE_NAME_MAP = {
     "users":                  "users",  # unificado con el table_name="users" que ya usan los log_audit() explícitos de app/users/router.py -- antes quedaba "usuarios" acá (via AuditMiddleware) vs "users" allá para la misma acción de borrado
     "payment-methods":        "metodos_pago",

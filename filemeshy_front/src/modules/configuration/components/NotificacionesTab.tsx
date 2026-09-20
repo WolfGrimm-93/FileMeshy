@@ -10,8 +10,6 @@ const ENCRYPTION_OPTIONS = [
   { value: 'ninguno', label: 'Sin cifrado (no recomendado)' },
 ]
 
-// Los tipos de negocio no relacionado (stock/pagos/ventas/compras/clientes) se
-// podaron junto con sus tasks del backend -- ver app/configuration/router.py::_DEFAULT_NOTIF_TYPES_CONFIG.
 // Vacío hasta que existan eventos reales del dominio de archivos que notificar.
 const TIPOS_NOTIFICACIONES: { id: string; label: string }[] = []
 

@@ -51,7 +51,7 @@ def notify_login_failures(self, tenant_schema: str | None, user_id: UUID, ip_add
                 return  # Aún por debajo del umbral
 
             # Notificar a todos los admins
-            from app.worker.tasks.notification_helpers import _get_admin_users_with_notifications, _create_notification
+            from app.worker.tasks.notification_helpers import _get_admin_users_with_notifications, create_notification
 
             admin_users = _get_admin_users_with_notifications(db)
             for admin in admin_users:
@@ -71,7 +71,7 @@ def notify_login_failures(self, tenant_schema: str | None, user_id: UUID, ip_add
                 if ya_notificado:
                     continue
 
-                _create_notification(
+                create_notification(
                     db=db,
                     user_id=admin.id,
                     title="Intentos de acceso fallidos detectados",
@@ -173,13 +173,13 @@ def audit_suspicious_activity():
 
                 # ── Notificar si hay alertas ──
                 if alertas:
-                    from app.worker.tasks.notification_helpers import _get_admin_users_with_notifications, _create_notification
+                    from app.worker.tasks.notification_helpers import _get_admin_users_with_notifications, create_notification
 
                     with get_worker_db(schema_name=schema) as db2:
                         admin_users = _get_admin_users_with_notifications(db2)
                         for alerta in alertas:
                             for admin in admin_users:
-                                _create_notification(
+                                create_notification(
                                     db=db2,
                                     user_id=admin.id,
                                     title="Actividad sospechosa detectada",

@@ -37,6 +37,11 @@ export interface StorageCapacity {
   free_bytes: number | null
 }
 
+export interface MyStorageQuota {
+  limit_bytes: number | null // null = sin límite
+  bytes_used: number
+}
+
 // ===== SERVICE =====
 class StorageQuotaService {
   private basePath = '/storage-quotas'
@@ -64,6 +69,14 @@ class StorageQuotaService {
    */
   async getCapacity(): Promise<StorageCapacity> {
     const response = await axiosInstance.get<StorageCapacity>(`${this.basePath}/capacity`)
+    return response.data
+  }
+
+  /**
+   * Obtener la cuota propia del usuario logueado (para el indicador del sidebar).
+   */
+  async getMyQuota(): Promise<MyStorageQuota> {
+    const response = await axiosInstance.get<MyStorageQuota>(`${this.basePath}/me`)
     return response.data
   }
 }

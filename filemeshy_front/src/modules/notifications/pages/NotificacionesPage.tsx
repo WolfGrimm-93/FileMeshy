@@ -25,8 +25,6 @@ import { toast } from '@/ui/toast/CustomToast'
 import { formatDateMedium } from '@/shared/utils/dates'
 
 // Mapeo de tipos a iconos y colores -- solo tipos reales del dominio FileMeshy
-// (los de negocio no relacionado -- stock/pagos/ventas/compras/clientes -- se
-// podaron junto con sus tasks del backend, ver NotificacionesTab.tsx en Configuración).
 const TYPE_CONFIG: Record<string, { icon: typeof Bell; label: string; color: string }> = {
   seguridad: { icon: Shield, label: 'Seguridad', color: 'text-red-600' },
 }

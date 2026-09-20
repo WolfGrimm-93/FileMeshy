@@ -26,10 +26,16 @@ import {
   LayoutGrid,
   Grid2X2,
   UploadCloud,
+  Copy,
+  Star,
+  StarOff,
+  ArrowUpNarrowWide,
+  ArrowDownWideNarrow,
 } from 'lucide-react'
 import { DataTable, type Column } from '@/ui/tables/DataTable'
 import { TableFilters } from '@/ui/tables/TableFilters'
 import { Dropdown, type DropdownItem } from '@/ui/dropdown/Dropdown'
+import { Select } from '@/ui/inputs/Select'
 import { Button } from '@/ui/buttons/Button'
 import { EmptyState } from '@/ui/empty-states/EmptyState'
 import DeleteConfirmDialog from '@/ui/dialogs/DeleteConfirmDialog'
@@ -38,7 +44,7 @@ import { formatBytes } from '@/shared/utils/downloadFile'
 import { extractErrorMessage } from '@/shared/utils/errors'
 import { useAuth } from '@/modules/auth/hooks/useAuth'
 import { Permission } from '@/app/routes'
-import { filesService } from '../services/files.service'
+import { filesService, type FilesSortBy, type FilesSortDir } from '../services/files.service'
 import { foldersService } from '../services/folders.service'
 import { useFileUpload } from '../hooks/useFileUpload'
 import CreateFolderModal from '../components/CreateFolderModal'
@@ -58,6 +64,17 @@ const VIEW_MODE_OPTIONS: { value: ViewMode; label: string; icon: typeof List }[]
   { value: 'list', label: 'Lista', icon: List },
   { value: 'grid', label: 'Íconos', icon: LayoutGrid },
   { value: 'grid-lg', label: 'Íconos grandes', icon: Grid2X2 },
+]
+
+/** Persistencia del orden, mismo patrón simple que VIEW_MODE_STORAGE_KEY arriba. */
+const SORT_BY_STORAGE_KEY = 'filemeshy_files_sort_by'
+const SORT_DIR_STORAGE_KEY = 'filemeshy_files_sort_dir'
+
+const SORT_BY_OPTIONS: { value: FilesSortBy; label: string }[] = [
+  { value: 'name', label: 'Nombre' },
+  { value: 'size_bytes', label: 'Tamaño' },
+  { value: 'updated_at', label: 'Fecha de modificación' },
+  { value: 'created_at', label: 'Fecha de creación' },
 ]
 
 export interface Row {
@@ -113,6 +130,29 @@ export default function FilesPage() {
     setViewModeState(mode)
   }
 
+  const [sortBy, setSortByState] = useState<FilesSortBy>(() => {
+    const stored = localStorage.getItem(SORT_BY_STORAGE_KEY)
+    if (stored === 'name' || stored === 'created_at' || stored === 'updated_at' || stored === 'size_bytes') {
+      return stored
+    }
+    return 'name'
+  })
+  const setSortBy = (value: FilesSortBy) => {
+    localStorage.setItem(SORT_BY_STORAGE_KEY, value)
+    setSortByState(value)
+  }
+
+  const [sortDir, setSortDirState] = useState<FilesSortDir>(() => {
+    const stored = localStorage.getItem(SORT_DIR_STORAGE_KEY)
+    return stored === 'asc' || stored === 'desc' ? stored : 'asc'
+  })
+  const setSortDir = (value: FilesSortDir) => {
+    localStorage.setItem(SORT_DIR_STORAGE_KEY, value)
+    setSortDirState(value)
+  }
+
+  const [favoritesOnly, setFavoritesOnly] = useState(false)
+
   // Debounce de la búsqueda (300ms) para no pegarle a la API en cada tecla
   useEffect(() => {
     const timer = setTimeout(() => setDebouncedSearch(searchTerm.trim()), 300)
@@ -128,6 +168,9 @@ export default function FilesPage() {
         folderId: canModifyHere ? currentFolderId ?? undefined : undefined,
         q: debouncedSearch || undefined,
         trash: showTrash,
+        sortBy,
+        sortDir,
+        favoritesOnly: favoritesOnly || undefined,
       })
       setListing(data)
     } catch (error: unknown) {
@@ -136,7 +179,7 @@ export default function FilesPage() {
       setLoading(false)
       setIsFirstLoad(false)
     }
-  }, [currentFolderId, debouncedSearch, showTrash, canModifyHere])
+  }, [currentFolderId, debouncedSearch, showTrash, canModifyHere, sortBy, sortDir, favoritesOnly])
 
   useEffect(() => {
     loadListing()
@@ -237,28 +280,28 @@ export default function FilesPage() {
 
   const rows: Row[] = useMemo(() => {
     if (!listing) return []
-    const folderRows: Row[] = [...listing.folders]
-      .sort((a, b) => a.name.localeCompare(b.name))
-      .map((f) => ({
-        rowId: `folder:${f.id}`,
-        type: 'folder' as const,
-        id: f.id,
-        name: f.name,
-        size: null,
-        updatedAt: f.updated_at,
-        raw: f,
-      }))
-    const fileRows: Row[] = [...listing.files]
-      .sort((a, b) => a.name.localeCompare(b.name))
-      .map((f) => ({
-        rowId: `file:${f.id}`,
-        type: 'file' as const,
-        id: f.id,
-        name: f.name,
-        size: f.size_bytes,
-        updatedAt: f.updated_at,
-        raw: f,
-      }))
+    // El orden (nombre/tamaño/fecha, asc/desc) ahora lo aplica el backend vía
+    // sort_by/sort_dir (ver loadListing) -- acá solo mapeamos a Row respetando el
+    // orden que ya viene en la respuesta, carpetas primero (convención de la UI,
+    // independiente del criterio de orden elegido).
+    const folderRows: Row[] = listing.folders.map((f) => ({
+      rowId: `folder:${f.id}`,
+      type: 'folder' as const,
+      id: f.id,
+      name: f.name,
+      size: null,
+      updatedAt: f.updated_at,
+      raw: f,
+    }))
+    const fileRows: Row[] = listing.files.map((f) => ({
+      rowId: `file:${f.id}`,
+      type: 'file' as const,
+      id: f.id,
+      name: f.name,
+      size: f.size_bytes,
+      updatedAt: f.updated_at,
+      raw: f,
+    }))
     return [...folderRows, ...fileRows]
   }, [listing])
 
@@ -292,6 +335,35 @@ export default function FilesPage() {
       await loadListing()
     } catch (error: unknown) {
       toast.error(extractErrorMessage(error, 'Error al restaurar'))
+    }
+  }
+
+  const handleCopy = async (row: Row) => {
+    try {
+      if (row.type === 'folder') {
+        await foldersService.copy(row.id)
+      } else {
+        await filesService.copy(row.id)
+      }
+      toast.success('Copia creada correctamente')
+      await loadListing()
+    } catch (error: unknown) {
+      toast.error(extractErrorMessage(error, 'Error al copiar'))
+    }
+  }
+
+  const handleToggleFavorite = async (row: Row) => {
+    const isFavorite = Boolean(row.raw?.is_favorite)
+    try {
+      if (row.type === 'folder') {
+        await foldersService.setFavorite(row.id, !isFavorite)
+      } else {
+        await filesService.setFavorite(row.id, !isFavorite)
+      }
+      toast.success(isFavorite ? 'Quitado de favoritos' : 'Marcado como favorito')
+      await loadListing()
+    } catch (error: unknown) {
+      toast.error(extractErrorMessage(error, 'Error al actualizar favorito'))
     }
   }
 
@@ -364,6 +436,33 @@ export default function FilesPage() {
       })
     }
 
+    // Copiar: mismo permiso para archivo y carpeta -- el backend exige files.upload en ambos
+    // casos (POST /files/{id}/copy y POST /folders/{id}/copy), porque copiar consume cuota
+    // real igual que subir de nuevo el contenido, no porque se esté creando una carpeta vacía.
+    const canCopy = hasPermission(Permission.UPLOAD_FILES)
+    if (canCopy) {
+      items.push({
+        label: 'Copiar',
+        icon: <Copy className="size-4" />,
+        onClick: () => handleCopy(row),
+      })
+    }
+
+    // Favorito: no depende de un permiso de escritura sobre el elemento, el backend solo
+    // exige el permiso de visualización correspondiente (files.view/folders.view) -- mismo
+    // gate que ya se aplica al resto de acciones condicionales de buildActions, para no
+    // mostrar la opción a un usuario al que el backend se la va a rechazar con un 403.
+    const canFavorite =
+      row.type === 'folder' ? hasPermission(Permission.VIEW_FOLDERS) : hasPermission(Permission.VIEW_FILES)
+    if (canFavorite) {
+      const isFavorite = Boolean(row.raw?.is_favorite)
+      items.push({
+        label: isFavorite ? 'Quitar de favoritos' : 'Marcar como favorito',
+        icon: isFavorite ? <StarOff className="size-4" /> : <Star className="size-4" />,
+        onClick: () => handleToggleFavorite(row),
+      })
+    }
+
     const canDelete =
       row.type === 'folder' ? hasPermission(Permission.DELETE_FOLDERS) : hasPermission(Permission.DELETE_FILES)
     if (canDelete) {
@@ -400,6 +499,9 @@ export default function FilesPage() {
             <FileIcon className="size-4 text-gray-400 shrink-0" />
           )}
           <span className="truncate font-medium text-gray-900 dark:text-white">{row.name}</span>
+          {Boolean(row.raw?.is_favorite) && (
+            <Star className="size-3.5 shrink-0 fill-current text-yellow-500" aria-label="Favorito" />
+          )}
         </div>
       ),
     },
@@ -519,7 +621,31 @@ export default function FilesPage() {
         onSearchChange={setSearchTerm}
         searchPlaceholder="Buscar archivos y carpetas por nombre..."
         extraFilters={
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
+            {/* Orden: campo + dirección. Se persiste igual que el modo de vista. */}
+            <Select
+              options={SORT_BY_OPTIONS}
+              value={sortBy}
+              onChange={(e) => setSortBy(e.target.value as FilesSortBy)}
+              placeholder=""
+              fullWidth={false}
+              className="py-1.5!"
+              aria-label="Ordenar por"
+            />
+            <button
+              type="button"
+              onClick={() => setSortDir(sortDir === 'asc' ? 'desc' : 'asc')}
+              title={sortDir === 'asc' ? 'Orden ascendente' : 'Orden descendente'}
+              aria-label={sortDir === 'asc' ? 'Orden ascendente' : 'Orden descendente'}
+              className="inline-flex items-center justify-center rounded-md p-1.5 text-gray-500 hover:text-gray-700 hover:bg-gray-100 dark:text-gray-400 dark:hover:text-gray-200 dark:hover:bg-gray-800 transition-colors"
+            >
+              {sortDir === 'asc' ? (
+                <ArrowUpNarrowWide className="size-4" />
+              ) : (
+                <ArrowDownWideNarrow className="size-4" />
+              )}
+            </button>
+
             <div className="inline-flex items-center rounded-lg bg-gray-100 dark:bg-gray-800 p-0.5">
               {VIEW_MODE_OPTIONS.map(({ value, label, icon: Icon }) => (
                 <button
@@ -539,12 +665,24 @@ export default function FilesPage() {
                 </button>
               ))}
             </div>
+
+            {!showTrash && (
+              <Button
+                variant={favoritesOnly ? 'primary' : 'secondary'}
+                leftIcon={<Star className="size-4" />}
+                onClick={() => setFavoritesOnly((v) => !v)}
+              >
+                Favoritos
+              </Button>
+            )}
+
             <Button
               variant={showTrash ? 'primary' : 'secondary'}
               leftIcon={<Trash2 className="size-4" />}
               onClick={() => {
                 setShowTrash((v) => !v)
                 setSearchTerm('')
+                setFavoritesOnly(false)
               }}
             >
               {showTrash ? 'Volver a Archivos' : 'Papelera'}

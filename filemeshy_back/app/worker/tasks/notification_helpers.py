@@ -1,11 +1,6 @@
 """
 Helpers genéricos de notificaciones — compartidos entre
 worker/tasks/notifications.py y worker/tasks/security.py.
-
-Extraído de notifications.py (que mezclaba estos helpers genéricos con tasks
-de negocio no relacionado -- stock bajo, crédito excedido, resumen de ventas
--- podadas junto con el resto de esa lógica de negocio) para que security.py
-no dependa de un módulo que iba a quedar mayormente vacío de lógica.
 """
 
 import logging
@@ -17,10 +12,8 @@ from sqlalchemy.orm import Session
 logger = logging.getLogger(__name__)
 
 # Mapeo: notif_type (backend) → clave en la config de tipos del admin.
-# Los tipos de negocio no relacionado (stock/crédito/ventas/compras/clientes)
-# y el control de horario de acceso se podaron junto con sus tasks -- hoy no queda ningún
-# tipo con control admin configurable (todos se crean siempre), pero se deja
-# el mapeo listo por si un tipo futuro lo necesita.
+# Hoy no queda ningún tipo con control admin configurable (todos se crean
+# siempre); el mapeo queda listo por si un tipo futuro lo necesita.
 _NOTIF_TYPE_CONFIG_KEY: dict[str, str | None] = {}
 
 _DEFAULT_NOTIF_TYPES: dict[str, dict] = {}
@@ -111,13 +104,17 @@ def _is_duplicate(db: Session, user_id: UUID, notif_type: str, reference_id: UUI
     return exists is not None
 
 
-def _create_notification(db: Session, user_id: UUID, title: str, message: str,
-                          notif_type: str, severity: str, action_url: str = None,
-                          extra_data: dict = None) -> bool:
+def create_notification(db: Session, user_id: UUID, title: str, message: str,
+                         notif_type: str, severity: str, action_url: str = None,
+                         extra_data: dict = None) -> bool:
     """
     Crea una notificación en BD y despacha email al usuario si tiene
     email_notifications=True en sus preferencias Y el tipo tiene email habilitado.
     Retorna True si se creó, False si el tipo está deshabilitado o hubo error.
+
+    Pública (antes `_create_notification`) -- la llaman también módulos
+    fuera de `worker/tasks` (ver app/storage_quota/service.py, notificación
+    de cuota cerca del límite), no solo otras tasks del worker.
     """
     from app.notifications.repository import notification as crud_notification
     from app.notifications.schemas import NotificationCreate, NotificationType, NotificationSeverity

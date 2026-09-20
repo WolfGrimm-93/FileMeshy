@@ -184,16 +184,26 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 def _get_real_ip(request: Request) -> str:
     """Obtiene la IP real del cliente.
-    Prioriza CF-Connecting-IP (puesta por Cloudflare, no falsificable),
-    luego X-Real-IP (nginx), y como último recurso request.client.host.
+
+    `direct_ip` (request.client.host) es la IP de la conexión TCP real -- la
+    única que ningún cliente puede falsificar. Los headers CF-Connecting-IP
+    (Cloudflare) y X-Real-IP (nginx) SOLO se confían si `direct_ip` está en
+    `settings.TRUSTED_PROXY_IPS` -- es decir, si la request de verdad pasó
+    por un proxy conocido que los pone. Sin esta validación, cualquier
+    cliente podía mandar esos headers con el valor que quisiera y evadir por
+    completo el rate-limit/CAPTCHA por IP de /auth (hallazgo de auditoría de
+    seguridad -- confirmado en vivo rotando X-Real-IP contra /auth/register).
     """
+    direct_ip = request.client.host if request.client else "unknown"
+    if direct_ip not in settings.TRUSTED_PROXY_IPS:
+        return direct_ip
     cf_ip = request.headers.get("cf-connecting-ip")
     if cf_ip:
         return cf_ip.strip()
     real_ip = request.headers.get("x-real-ip")
     if real_ip:
         return real_ip.strip()
-    return request.client.host if request.client else "unknown"
+    return direct_ip
 
 
 def _is_local_ip(ip: str) -> bool:
@@ -247,6 +257,21 @@ async def register(
 ):
     """Registra un nuevo usuario."""
     import re
+
+    # Flag de registro público -- mismo patrón de lectura de config que usa
+    # GET /public/config (app/platform/router.py) para reportar este mismo
+    # valor al frontend. Antes de este fix, un admin podía "apagar" el
+    # registro desde el panel y /auth/register igual devolvía 201 (hallazgo
+    # de auditoría de seguridad, ver pendiente.md). Solo bloquea si el flag
+    # existe y está EXPLÍCITAMENTE en false -- si todavía no se configuró
+    # nada (config inexistente), el registro sigue permitido, igual que el
+    # comportamiento de siempre.
+    registration_cfg = get_system_config(db, "user_registration_enabled")
+    if registration_cfg is not None and registration_cfg.value_boolean is False:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="El registro de nuevos usuarios está deshabilitado",
+        )
 
     ip_address = _get_real_ip(request)
 
@@ -1165,14 +1190,11 @@ def verify_2fa_login(
     Completa el login verificando el código TOTP.
     Recibe el pre_auth_token del paso anterior y retorna los tokens completos.
     """
-    # Rate limiting por token para evitar fuerza bruta de códigos TOTP
     ip_address = request.client.host if request.client else "unknown"
-    rl_key = f"totp:{ip_address}:{body.pre_auth_token[:16]}"
-    is_allowed, rl_message = RateLimiter.check_rate_limit(rl_key)
-    if not is_allowed:
-        raise HTTPException(status_code=429, detail=rl_message)
 
-    # Validar pre_auth_token
+    # Validar pre_auth_token PRIMERO -- necesitamos su `jti` (único por sesión
+    # de pre-autenticación, generado en /login) para poder armar una clave de
+    # rate-limit que aísle a cada sesión de login pendiente.
     payload = decode_token(body.pre_auth_token)
     if not payload or payload.get("type") != "pre_auth":
         raise HTTPException(
@@ -1180,8 +1202,23 @@ def verify_2fa_login(
             detail="Token de pre-autenticación inválido o expirado"
         )
 
-    # Pre_auth_token de un solo uso — verificar que el JTI no haya sido consumido
+    # Rate limiting por sesión de pre-autenticación (jti) para evitar fuerza
+    # bruta de códigos TOTP. ANTES la clave usaba `pre_auth_token[:16]` --
+    # los primeros 16 caracteres de CUALQUIER JWT HS256 son siempre el mismo
+    # string (el header base64 fijo `{"alg":"HS256","typ":"JWT"}`), así que
+    # ese componente de la clave era constante sin importar el usuario/sesión:
+    # el límite terminaba siendo compartido por TODAS las sesiones de
+    # pre-autenticación detrás de la misma IP (dos usuarios distintos
+    # probando códigos en paralelo se bloqueaban entre sí -- DoS, hallazgo de
+    # auditoría de seguridad). `jti` sí es único por sesión, así que cada
+    # intento de 2FA queda aislado a SU PROPIO login pendiente.
     jti = payload.get("jti")
+    rl_key = f"totp:{jti}" if jti else f"totp:{ip_address}:{body.pre_auth_token}"
+    is_allowed, rl_message = RateLimiter.check_rate_limit(rl_key)
+    if not is_allowed:
+        raise HTTPException(status_code=429, detail=rl_message)
+
+    # Pre_auth_token de un solo uso — verificar que el JTI no haya sido consumido
     if jti:
         try:
             from app.core.cache import cache

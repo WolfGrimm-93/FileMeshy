@@ -8,7 +8,7 @@
  * sin preview real de imagen/PDF -- evita cargar archivos completos al
  * listar carpetas grandes (decisión de producto ya definida).
  */
-import { Folder, MoreVertical } from 'lucide-react'
+import { Folder, MoreVertical, Star } from 'lucide-react'
 import { Dropdown, type DropdownItem } from '@/ui/dropdown/Dropdown'
 import { getFileTypeIcon } from '@/shared/utils/fileTypeIcon'
 import type { Row } from '../pages/FilesPage'
@@ -71,6 +71,9 @@ export default function FileGridView({ rows, size, showTrash, onNavigate, onPrev
                   items={items}
                 />
               </div>
+            )}
+            {Boolean(row.raw?.is_favorite) && (
+              <Star className="absolute left-1 top-1 size-3.5 fill-current text-yellow-500" aria-label="Favorito" />
             )}
             <Icon className={`${ICON_SIZE_CLASSES[size]} ${iconColorClass} flex-shrink-0`} />
             <span className="w-full truncate text-sm font-medium text-gray-900 dark:text-white">{row.name}</span>

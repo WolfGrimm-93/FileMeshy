@@ -11,6 +11,7 @@ export interface FolderOut {
   created_at: string
   updated_at: string
   deleted_at: string | null
+  is_favorite: boolean
 }
 
 export interface FileOut {
@@ -23,6 +24,7 @@ export interface FileOut {
   created_at: string
   updated_at: string
   deleted_at: string | null
+  is_favorite: boolean
 }
 
 export interface BreadcrumbItem {

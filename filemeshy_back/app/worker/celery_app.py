@@ -43,9 +43,6 @@ def create_celery_app() -> Celery:
         task_default_routing_key="default",
 
         # ─── Routing por tarea ──────────────────────────────────────────────
-        # Las rutas de varias tasks de negocio no relacionado (notificaciones
-        # de stock/crédito/ventas/compras y tasks fiscales) se quitaron junto
-        # con esas tasks.
         task_routes={
             # Email (rate limited)
             "app.worker.tasks.email.*":                               {"queue": "emails"},
@@ -70,10 +67,6 @@ def create_celery_app() -> Celery:
         broker_connection_retry_on_startup=True,
 
         # ─── Beat schedule (tareas periódicas) ──────────────────────────────
-        # Se quitaron todas las tareas periódicas de negocio no relacionado
-        # (stock, pagos vencidos, dashboard/reportes, crédito, resúmenes de
-        # ventas/compras, y varios reintentos fiscales) -- solo quedan las
-        # genéricas.
         beat_schedule={
             # Sesiones expiradas — cada 6 horas
             "cleanup-expired-sessions": {

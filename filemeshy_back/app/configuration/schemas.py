@@ -194,9 +194,3 @@ class UserPreferencesUpdate(BaseModel):
     active_kpis: Optional[List[str]] = None
     real_time_updates: Optional[bool] = None
     custom_preferences: Optional[Dict[str, Any]] = None
-
-
-# NOTA (2026-09-12): CompanySettings/PaymentMethodConfig (modelos, schemas,
-# CRUD y sus usos en platform/router.py y shared/utils/tenant.py) se borraron
-# por completo -- resto de negocio no relacionado confirmado por auditoría de
-# arquitectura, sin encaje real en un drive personal.

@@ -10,9 +10,7 @@ config de seguridad organizacional consumida por configuration/repository.py
 y configuration/router.py.
 
 El resto (SystemConfiguration, UserPreferences) viene de
-app/models/configuration.py, fusionado acá tal cual. CompanySettings y
-PaymentMethodConfig (resto de negocio no relacionado confirmado por
-auditoría de arquitectura) se borraron por completo el 2026-09-12.
+app/models/configuration.py, fusionado acá tal cual.
 """
 from sqlalchemy import Column, Integer, String, Numeric, DateTime, Boolean, Text, JSON, Index
 from sqlalchemy.dialects.postgresql import UUID

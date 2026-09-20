@@ -18,9 +18,9 @@ def _json_default(obj):
     """Serializador de respaldo para json.dumps al cachear.
 
     Decimal se trata aparte de todo lo demas: dejarlo caer a str() (como antes)
-    le hacia perder su naturaleza numerica en cada cache HIT -- un stock
+    le hacia perder su naturaleza numerica en cada cache HIT -- un valor
     Numeric(14,4) volvia como "0.0000" en vez de 0, y comparaciones estrictas
-    contra 0 en el frontend (ej. el POS) nunca se disparaban. Mismo criterio
+    contra 0 en el frontend nunca se disparaban. Mismo criterio
     que fastapi.encoders.decimal_encoder para que lo que se relee de Redis siga
     siendo un numero real, no una respuesta que "se ve bien" al ojo pero rompe
     en runtime. Cualquier otro tipo sin serializador nativo sigue cayendo a
@@ -335,10 +335,10 @@ def invalidate_permissions_cache():
 
 
 # ── Módulos de negocio activables/desactivables ─────────────────────────────
-# Flags booleanos en system_configuration (compras_enabled, fidelizacion_enabled,
-# etc.) que gatean el acceso a routers completos vía app.api.deps.require_module.
-# TTL corto: al desactivar un módulo, invalidate_module_flag_cache lo saca de
-# inmediato, pero igual conviene que expire solo por si la invalidación falla.
+# Flags booleanos en system_configuration que gatean el acceso a routers
+# completos vía app.api.deps.require_module. TTL corto: al desactivar un
+# módulo, invalidate_module_flag_cache lo saca de inmediato, pero igual
+# conviene que expire solo por si la invalidación falla.
 MODULE_FLAG_CACHE_PREFIX = "module_flag:"
 MODULE_FLAG_CACHE_TTL = 60
 

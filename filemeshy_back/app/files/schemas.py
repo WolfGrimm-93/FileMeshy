@@ -26,6 +26,7 @@ class FolderOut(BaseModel):
     created_at: datetime
     updated_at: datetime
     deleted_at: Optional[datetime] = None
+    is_favorite: bool = False
 
     class Config:
         from_attributes = True
@@ -48,6 +49,9 @@ class FolderUpdate(BaseModel):
     parent_id: Optional[UUID] = None
     # Distingue "no tocar parent_id" (campo ausente) de "mover a la raíz"
     # (parent_id=None explícito) -- ver uso de `model_fields_set` en el router.
+    is_favorite: Optional[bool] = None
+    # Mismo mecanismo (model_fields_set): campo ausente = no tocar, presente
+    # (true o false) = valor nuevo.
 
 
 # ==================== File ====================
@@ -63,6 +67,7 @@ class FileOut(BaseModel):
     created_at: datetime
     updated_at: datetime
     deleted_at: Optional[datetime] = None
+    is_favorite: bool = False
 
     class Config:
         from_attributes = True
@@ -72,10 +77,24 @@ class FileUpdate(BaseModel):
     """Mismo patrón dual de permisos que FolderUpdate."""
     name: Optional[str] = Field(None, min_length=1, max_length=255)
     folder_id: Optional[UUID] = None
+    # Mismo mecanismo de model_fields_set que FolderUpdate.is_favorite.
+    is_favorite: Optional[bool] = None
 
 
 class DownloadUrlResponse(BaseModel):
     download_url: str
+
+
+class CopyRequest(BaseModel):
+    """Body opcional de `POST /files/{id}/copy` y `POST /folders/{id}/copy`.
+
+    `folder_id` es la carpeta destino de la copia. Campo AUSENTE (body vacío
+    u omitido) = copiar al mismo lugar que el original (mismo criterio de
+    `model_fields_set` que `FileUpdate`/`FolderUpdate`); `folder_id: null`
+    explícito = copiar a la raíz; `folder_id: <uuid>` = una carpeta puntual
+    (debe pertenecer al mismo dueño del original, ver `_get_target_parent_folder`
+    en el router)."""
+    folder_id: Optional[UUID] = None
 
 
 # ==================== Listado de directorio ====================

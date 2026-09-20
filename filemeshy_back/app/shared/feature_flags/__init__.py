@@ -1,9 +1,7 @@
 """Feature flags de módulos de negocio activables/desactivables.
 
-Extraído de app/api/deps.py (require_module) y de app/routers/admin_configuration.py
-(MODULE_FLAGS + endpoints /modules, /modules/{module_key}) durante la migración
-a monolito modular. `invalidate_module_flag_cache` sigue viviendo en
-app/core/cache.py (no se movió, solo se importa desde acá).
+`invalidate_module_flag_cache` vive en app/core/cache.py (solo se importa
+desde acá).
 """
 from fastapi import APIRouter, Depends, HTTPException, status
 from typing import Callable
@@ -23,11 +21,10 @@ from app.users.models import User
 def require_module(module_key: str) -> Callable:
     """
     Crea una dependencia que verifica que un módulo de negocio esté activado
-    (flag booleano en system_configuration, ej: 'compras_enabled').
+    (flag booleano en system_configuration).
 
     Se usa como dependency a nivel de router completo (include_router) para
-    módulos activables/desactivables (Compras, Servicios Externos,
-    Fidelización, Soporte, POS). Devuelve 403 (no 404) para que el
+    módulos activables/desactivables. Devuelve 403 (no 404) para que el
     frontend distinga "módulo apagado" de "endpoint inexistente".
 
     El valor se cachea en Redis con TTL corto; se invalida de inmediato al
@@ -57,20 +54,16 @@ def require_module(module_key: str) -> Callable:
 
 
 # ========================================================================
-# MÓDULOS DE NEGOCIO ACTIVABLES/DESACTIVABLES (Iniciativa A)
+# MÓDULOS DE NEGOCIO ACTIVABLES/DESACTIVABLES
 # ========================================================================
-# Extraído de app/routers/admin_configuration.py. Flags booleanos en
-# system_configuration; el enforcement real (403) es require_module() arriba,
-# aplicado como dependency de router en app/api/v1/router.py.
+# Flags booleanos en system_configuration; el enforcement real (403) es
+# require_module() arriba, aplicado como dependency de router en
+# app/api/v1/router.py.
 
-# Varios flags de módulos de negocio no relacionado (punto de venta, compras,
-# fidelización, cuentas por cobrar/pagar) se quitaron junto con esos módulos.
-# servicios_externos_enabled/soporte_enabled se quitaron junto con
-# ExternalService/SupportTicket (legacy sin consumidor real, ver
-# app/models/external_service.py y app/models/support_ticket.py, borrados).
-# No queda ningún módulo activable/desactivable por ahora -- dict vacío a propósito,
-# no borrado, para no tener que rearmar get_modules_status/update_module_status
-# si se agrega un módulo nuevo con este mismo mecanismo más adelante.
+# No queda ningún módulo activable/desactivable por ahora -- dict vacío a
+# propósito, no borrado, para no tener que rearmar
+# get_modules_status/update_module_status si se agrega un módulo nuevo con
+# este mismo mecanismo más adelante.
 MODULE_FLAGS: dict[str, dict[str, str]] = {}
 
 router = APIRouter()
@@ -108,8 +101,7 @@ async def update_module_status(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin),
 ):
-    """Activar/desactivar un módulo de negocio (Compras, Servicios Externos,
-    Fidelización, Soporte, POS)."""
+    """Activar/desactivar un módulo de negocio."""
     from app.configuration import service as configuration_service
 
     meta = MODULE_FLAGS.get(module_key)

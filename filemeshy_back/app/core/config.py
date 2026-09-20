@@ -106,6 +106,19 @@ class Settings(BaseSettings):
     # ===== FILES (Almacenamiento) =====
     MAX_UPLOAD_SIZE_MB: int = 100  # Nginx (filemeshy_front/nginx.conf) limita a 100MB -- nunca superar ese valor acá
 
+    # ===== PROXIES DE CONFIANZA (ver app/auth/router.py::_get_real_ip) =====
+    # Los headers CF-Connecting-IP/X-Real-IP los puede mandar CUALQUIER cliente
+    # con el valor que quiera -- solo son confiables si la conexión TCP real
+    # (request.client.host, no falsificable) viene de una IP en esta lista.
+    # Vacío por defecto (secure-by-default): sin esto, rotar el header evadía
+    # por completo el rate-limit/CAPTCHA por IP de /auth (hallazgo de
+    # auditoría de seguridad, ver pendiente.md).
+    # Producción: setear con la IP del contenedor frontend/nginx (el único
+    # proxy real delante del backend, ver docker-compose.prod.yml) -- o
+    # dejar vacío si Cloudflare Tunnel entrega directo sin un proxy
+    # intermedio que reescriba esos headers.
+    TRUSTED_PROXY_IPS: List[str] = []
+
     class Config:
         env_file = ".env"
         case_sensitive = True

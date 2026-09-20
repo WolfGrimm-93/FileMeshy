@@ -4,6 +4,8 @@ import logging
 import logging.handlers
 from pathlib import Path
 
+from app.core.config import settings
+
 # Crear directorio de logs si no existe
 LOG_DIR = Path("logs")
 LOG_DIR.mkdir(exist_ok=True)
@@ -35,7 +37,18 @@ def setup_logging():
     
     # ===== APLICACIÓN: Logger de la app =====
     app_logger = logging.getLogger("app")
-    app_logger.setLevel(logging.DEBUG)
+    # DEBUG solo en development/local -- en cualquier otro entorno, INFO.
+    # Sin esto, app_logger quedaba SIEMPRE en DEBUG sin importar el entorno,
+    # así que app_logger.debug(f"[DEV] Código para {email}: {code}")
+    # (auth/router.py, fallback cuando falla el envío de email de reset de
+    # contraseña) terminaba escribiendo el código de un solo uso en
+    # logs/app.log en producción -- un código de reset de contraseña en
+    # texto plano en disco (hallazgo de auditoría de seguridad). Con el
+    # logger en INFO, ese `.debug(...)` ni se evalúa/escribe, sin tener que
+    # tocar ese call site.
+    app_logger.setLevel(
+        logging.DEBUG if settings.ENVIRONMENT in ("development", "local") else logging.INFO
+    )
     
     # Handler: Log de aplicación a archivo (rotación diaria)
     app_handler = logging.handlers.TimedRotatingFileHandler(

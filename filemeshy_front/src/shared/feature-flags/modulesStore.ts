@@ -1,11 +1,10 @@
 import { create } from 'zustand'
 
 /**
- * Estado de los módulos de negocio activables/desactivables (Iniciativa A).
+ * Estado de los módulos de negocio activables/desactivables.
  *
- * NOTA: tras la limpieza de módulos de negocio no relacionado, `FeaturesConfig` (config.service.ts)
- * ya no trae ningún flag de módulo y ConfigProvider dejó de poblar este store
- * (ver syncModulesStore, removido). Se conserva el mecanismo genérico
+ * Hoy `FeaturesConfig` (config.service.ts) no trae ningún flag de módulo y
+ * ConfigProvider no puebla este store. Se conserva el mecanismo genérico
  * (isModuleEnabled fail-open) porque `requireModule`/`requireModulePublic`
  * (app/routes/loaders.ts) todavía lo usan como factory reutilizable, aunque
  * ninguna ruta activa los llama por ahora.

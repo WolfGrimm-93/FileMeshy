@@ -11,6 +11,7 @@ class NotificationType(str, Enum):
     """Tipos de notificación del sistema."""
     SEGURIDAD = "seguridad"
     SISTEMA = "sistema"
+    ALMACENAMIENTO = "almacenamiento"
 
 
 class NotificationSeverity(str, Enum):

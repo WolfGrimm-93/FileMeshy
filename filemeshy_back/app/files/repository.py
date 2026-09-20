@@ -14,6 +14,34 @@ from sqlalchemy.orm import Session
 from app.files.models import File, Folder, Share
 from app.shared.repository_base import CRUDBase
 
+# Whitelist de columnas ordenables por modelo -- el valor de `sort_by` llega
+# directo de un query param del cliente, NUNCA se interpola en el `order_by`
+# sin pasar por acá (riesgo de SQL injection vía nombre de columna si se
+# usara `getattr`/texto crudo sin validar contra un set cerrado). Cualquier
+# valor de `sort_by` fuera de estas claves cae a "name" en vez de tirar error
+# (ver `_resolve_sort_column`).
+_FOLDER_SORT_COLUMNS = {
+    "name": Folder.name,
+    "created_at": Folder.created_at,
+    "updated_at": Folder.updated_at,
+}
+
+_FILE_SORT_COLUMNS = {
+    "name": File.name,
+    "created_at": File.created_at,
+    "updated_at": File.updated_at,
+    "size_bytes": File.size_bytes,
+}
+
+
+def _resolve_sort_column(columns: dict, sort_by: str, sort_dir: str):
+    """Resuelve `sort_by`/`sort_dir` a una expresión `order_by` real contra la
+    whitelist de `columns`. `sort_by` desconocido cae a "name" (sin tirar
+    error -- un valor inesperado del cliente no debería romper el listado).
+    Cualquier `sort_dir` distinto de "desc" cae a ascendente."""
+    column = columns.get(sort_by, columns["name"])
+    return column.desc() if sort_dir == "desc" else column.asc()
+
 
 class CRUDFolder(CRUDBase[Folder, None, None]):
     def get_active(self, db: Session, folder_id: UUID) -> Optional[Folder]:
@@ -24,7 +52,13 @@ class CRUDFolder(CRUDBase[Folder, None, None]):
         )
 
     def get_children(
-        self, db: Session, owner_id: UUID, parent_id: Optional[UUID]
+        self,
+        db: Session,
+        owner_id: UUID,
+        parent_id: Optional[UUID],
+        sort_by: str = "name",
+        sort_dir: str = "asc",
+        favorites_only: bool = False,
     ) -> List[Folder]:
         query = db.query(Folder).filter(
             Folder.owner_id == owner_id, Folder.deleted_at.is_(None)
@@ -33,25 +67,42 @@ class CRUDFolder(CRUDBase[Folder, None, None]):
             query = query.filter(Folder.parent_id.is_(None))
         else:
             query = query.filter(Folder.parent_id == parent_id)
-        return query.order_by(Folder.name).all()
+        if favorites_only:
+            query = query.filter(Folder.is_favorite.is_(True))
+        return query.order_by(_resolve_sort_column(_FOLDER_SORT_COLUMNS, sort_by, sort_dir)).all()
 
-    def get_trash(self, db: Session, owner_id: Optional[UUID]) -> List[Folder]:
+    def get_trash(
+        self,
+        db: Session,
+        owner_id: Optional[UUID],
+        sort_by: str = "name",
+        sort_dir: str = "asc",
+        favorites_only: bool = False,
+    ) -> List[Folder]:
         query = db.query(Folder).filter(Folder.deleted_at.isnot(None))
         if owner_id is not None:
             query = query.filter(Folder.owner_id == owner_id)
-        return query.order_by(Folder.name).all()
+        if favorites_only:
+            query = query.filter(Folder.is_favorite.is_(True))
+        return query.order_by(_resolve_sort_column(_FOLDER_SORT_COLUMNS, sort_by, sort_dir)).all()
 
-    def search(self, db: Session, owner_id: UUID, q: str) -> List[Folder]:
-        return (
-            db.query(Folder)
-            .filter(
-                Folder.owner_id == owner_id,
-                Folder.deleted_at.is_(None),
-                Folder.name.ilike(f"%{q}%"),
-            )
-            .order_by(Folder.name)
-            .all()
+    def search(
+        self,
+        db: Session,
+        owner_id: UUID,
+        q: str,
+        sort_by: str = "name",
+        sort_dir: str = "asc",
+        favorites_only: bool = False,
+    ) -> List[Folder]:
+        query = db.query(Folder).filter(
+            Folder.owner_id == owner_id,
+            Folder.deleted_at.is_(None),
+            Folder.name.ilike(f"%{q}%"),
         )
+        if favorites_only:
+            query = query.filter(Folder.is_favorite.is_(True))
+        return query.order_by(_resolve_sort_column(_FOLDER_SORT_COLUMNS, sort_by, sort_dir)).all()
 
     def get_descendant_ids(self, db: Session, folder_id: UUID) -> List[UUID]:
         """Todos los descendientes (subcarpetas) de `folder_id`, incluidos
@@ -114,7 +165,13 @@ class CRUDFile(CRUDBase[File, None, None]):
         )
 
     def get_children(
-        self, db: Session, owner_id: UUID, folder_id: Optional[UUID]
+        self,
+        db: Session,
+        owner_id: UUID,
+        folder_id: Optional[UUID],
+        sort_by: str = "name",
+        sort_dir: str = "asc",
+        favorites_only: bool = False,
     ) -> List[File]:
         query = db.query(File).filter(
             File.owner_id == owner_id, File.deleted_at.is_(None)
@@ -123,25 +180,42 @@ class CRUDFile(CRUDBase[File, None, None]):
             query = query.filter(File.folder_id.is_(None))
         else:
             query = query.filter(File.folder_id == folder_id)
-        return query.order_by(File.name).all()
+        if favorites_only:
+            query = query.filter(File.is_favorite.is_(True))
+        return query.order_by(_resolve_sort_column(_FILE_SORT_COLUMNS, sort_by, sort_dir)).all()
 
-    def get_trash(self, db: Session, owner_id: Optional[UUID]) -> List[File]:
+    def get_trash(
+        self,
+        db: Session,
+        owner_id: Optional[UUID],
+        sort_by: str = "name",
+        sort_dir: str = "asc",
+        favorites_only: bool = False,
+    ) -> List[File]:
         query = db.query(File).filter(File.deleted_at.isnot(None))
         if owner_id is not None:
             query = query.filter(File.owner_id == owner_id)
-        return query.order_by(File.name).all()
+        if favorites_only:
+            query = query.filter(File.is_favorite.is_(True))
+        return query.order_by(_resolve_sort_column(_FILE_SORT_COLUMNS, sort_by, sort_dir)).all()
 
-    def search(self, db: Session, owner_id: UUID, q: str) -> List[File]:
-        return (
-            db.query(File)
-            .filter(
-                File.owner_id == owner_id,
-                File.deleted_at.is_(None),
-                File.name.ilike(f"%{q}%"),
-            )
-            .order_by(File.name)
-            .all()
+    def search(
+        self,
+        db: Session,
+        owner_id: UUID,
+        q: str,
+        sort_by: str = "name",
+        sort_dir: str = "asc",
+        favorites_only: bool = False,
+    ) -> List[File]:
+        query = db.query(File).filter(
+            File.owner_id == owner_id,
+            File.deleted_at.is_(None),
+            File.name.ilike(f"%{q}%"),
         )
+        if favorites_only:
+            query = query.filter(File.is_favorite.is_(True))
+        return query.order_by(_resolve_sort_column(_FILE_SORT_COLUMNS, sort_by, sort_dir)).all()
 
     def get_by_folder_ids(self, db: Session, folder_ids: List[UUID]) -> List[File]:
         if not folder_ids:
