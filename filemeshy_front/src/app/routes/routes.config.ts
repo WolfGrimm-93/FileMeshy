@@ -183,6 +183,19 @@ export const routeConfig: RouteConfig[] = [
     },
   },
   {
+    path: '/compartido-conmigo',
+    title: 'Compartido conmigo',
+    icon: 'Share2',
+    component: 'SharedWithMePage',
+    showInNav: true,
+    requiredPermissions: [Permission.VIEW_FILES],
+    meta: {
+      title: 'Compartido conmigo - FileMeshy',
+      description: 'Archivos y carpetas compartidos directamente con tu usuario',
+      keywords: ['compartido', 'shares', 'compartir', 'archivos'],
+    },
+  },
+  {
     path: '/cuotas-almacenamiento',
     title: 'Cuotas de Almacenamiento',
     icon: 'HardDrive',

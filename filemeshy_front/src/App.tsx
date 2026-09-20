@@ -26,6 +26,7 @@ const DashboardPage = lazy(() => import('./modules/dashboard/pages/DashboardPage
 // Archivos
 const FilesPage = lazy(() => import('./modules/files/pages/FilesPage'))
 const PublicSharePage = lazy(() => import('./modules/files/pages/PublicSharePage'))
+const SharedWithMePage = lazy(() => import('./modules/files/pages/SharedWithMePage'))
 
 // Usuarios
 const UsuariosPage = lazy(() => import('./modules/users/pages/UsuariosPage'))
@@ -132,6 +133,13 @@ const router = createBrowserRouter([
           {
             path: 'archivos',
             element: <FilesPage />,
+            loader: requirePermissions([Permission.VIEW_FILES]),
+          },
+          // Compartido conmigo (Ronda 3) -- mismo permiso que Archivos, ya
+          // que es otra vista del mismo módulo de archivos/carpetas.
+          {
+            path: 'compartido-conmigo',
+            element: <SharedWithMePage />,
             loader: requirePermissions([Permission.VIEW_FILES]),
           },
 

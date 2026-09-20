@@ -90,6 +90,31 @@ no debería requerir un permiso de escritura elevado). Ownership sigue validado 
 permisos simultáneamente. Solo importaría si en el futuro se crea un rol con `files.view` pero
 sin `tags.manage` a propósito.
 
+**Hecho (2026-09-20) — Ronda 3 del plan de construcción: compartir granular.** `Share`
+extendido con contraseña opcional en links públicos (`password_hash`, header
+`X-Share-Password`, nunca query param — evita que quede en logs/Referer), permiso
+lectura/escritura (`permission`, solo aplica a shares dirigidos, un link público siempre es de
+solo lectura), y compartir a un usuario específico por email (`shared_with_user_id`) con
+notificación real al destinatario (`GET /shares/with-me`, página nueva "Compartido conmigo").
+Con `permission=edit`: el destinatario puede subir archivos a una carpeta compartida o
+reemplazar el contenido de un archivo compartido, con las MISMAS validaciones que un upload
+normal (magic bytes, cuota) — la cuota se descuenta del dueño real, nunca del destinatario, y
+el archivo subido queda con `owner_id` del dueño (el destinatario no puede gestionarlo como
+propio ni re-compartirlo). Pasó por implementación → revisión adversarial (2 agentes) →
+feedback (backend: enriquecer `with-me` con nombre del recurso y quién compartió; frontend:
+agregar el formulario de contraseña que faltaba en la página pública) → una segunda vuelta de
+feedback por un **bug crítico** que encontró la revisión adversarial (mismatch `id` vs
+`share_id` entre backend y frontend, dejaba "Compartido conmigo" 100% inutilizable — ya
+corregido y reverificado con las 5 acciones funcionando de punta a punta, incluida
+confirmación visual del Auditor Final en navegador real) → auditor final. Suite: 43 tests.
+
+**Deuda residual nueva, no bloqueante:** los endpoints autenticados de shares dirigidos
+(`GET /shares/{id}`, su download, `POST .../files`, `PUT .../content`) no tienen rate-limit
+propio (sí lo tienen los públicos). Confirmado en vivo que no es explotable como IDOR (sigue
+exigiendo `current_user.id` en `(shared_with_user_id, created_by_id)`, y UUIDv7 da ~122 bits
+de aleatoriedad), pero falta defensa en profundidad contra abuso/hostigamiento desde una cuenta
+ya autenticada.
+
 ### 🟠 Seguridad — importante pero no bloqueante
 
 - `SECRET_KEY` con default hardcodeado en `core/config.py:32` — mitigado por una guarda que
@@ -109,9 +134,6 @@ sin `tags.manage` a propósito.
   contenido de archivos de usuario en MinIO no tiene SSE aplicado por la aplicación.
 - `AuditLog` solo cubre POST/PUT/PATCH/DELETE — lecturas y descargas de archivos no dejan
   rastro; un acceso indebido de solo lectura no es detectable vía auditoría.
-- Compartir por link público: sin protección por contraseña, ni en API (`ShareCreate` no tiene
-  el campo) ni en UI — no es un bypass, es una feature no implementada. Si se manda un campo
-  `password` igual da 201 (se ignora silenciosamente).
 - `/health/detailed` (bien gateado a rol admin) expone versión detallada de Postgres/Python y
   el flag `debug:true` — innecesario para un healthcheck, reducir el payload.
 - Sin escaneo de virus/malware en archivos subidos — solo se valida tipo por magic bytes, no
@@ -126,13 +148,13 @@ sin `tags.manage` a propósito.
 
 - Antes de la auditoría del 19: **0% de cobertura**, sin pytest ni vitest configurado en
   ningún lado del repo.
-- Tras la Ronda 1 + Ronda 2: `filemeshy_back/tests/` (35 tests) + `filemeshy_back/requirements-dev.txt`
+- Tras las Rondas 1-3: `filemeshy_back/tests/` (43 tests) + `filemeshy_back/requirements-dev.txt`
   — decidir si se incorporan al repo. Cubre: auth (registro, login, 2FA end-to-end), IDOR de
-  archivos y carpetas (incluido copy y tags), favoritos/orden con regresión explícita del bug
-  de permisos, cuota propia, CRUD de etiquetas con ownership, y regresión de los 3 fixes de
-  seguridad más fáciles de reproducir automatizadamente (spoofing de IP, DoS 2FA, flag de
-  registro).
-- Última corrida (contra la imagen final reconstruida): **35 passed, 0 failed**, sin
+  archivos, carpetas y shares (copy, tags, compartir a usuario, escalación vía permission=edit),
+  favoritos/orden con regresión explícita del bug de permisos, cuota propia, CRUD de etiquetas
+  con ownership, contraseña en links públicos, y regresión de los 3 fixes de seguridad más
+  fáciles de reproducir automatizadamente (spoofing de IP, DoS 2FA, flag de registro).
+- Última corrida (contra la imagen final reconstruida): **43 passed, 0 failed**, sin
   flakiness.
 - Falta: tests de frontend (cero — la Ronda 1 se verificó visualmente a mano con Playwright
   ad-hoc, no queda como suite automatizada), tests de aislamiento multi-tenant, y CI que
@@ -147,36 +169,33 @@ visible para el usuario final (`GET /storage-quotas/me` + widget en el Sidebar) 
 automática cuando el uso supera el 90% del límite (con deduplicación). Todo verificado en vivo
 y visualmente en navegador, no solo en tests.
 
+**Resuelto en Ronda 3 (2026-09-20):** notificación real al compartir un archivo/carpeta con un
+usuario específico; compartir con permisos granulares (lectura/escritura) y a usuarios
+específicos (además del link público de siempre); protección por contraseña en links públicos.
+La única pieza de "colaboración" que sigue sin cubrir es comentar sobre un archivo (no
+planificado en ninguna ronda todavía).
+
 Gaps que siguen abiertos, ver roadmap de rondas al final del archivo:
 
-1. **Notificaciones de producto para compartir/modificar archivo** — solo se conectó la de
-   cuota (Ronda 1). Compartir/comentar/modificar todavía no disparan nada porque hoy no existe
-   un destinatario real (el share es anónimo) — queda planificado para la Ronda 3, junto con
-   el compartir granular que le da sentido a esta notificación.
-2. Compartir es solo por link público de **solo lectura** — sin compartir a usuarios
-   específicos, sin permisos granulares (lectura/escritura/comentar), sin protección por
-   contraseña. Es el corazón de "colaboración" y hoy es la parte más débil del checklist.
-   Planificado: Ronda 3.
-3. Sin backups automáticos de Postgres/MinIO — cero rastro en todo el repo, ni siquiera un
+1. Sin backups automáticos de Postgres/MinIO — cero rastro en todo el repo, ni siquiera un
    cron de `pg_dump`. Planificado: Ronda 7.
-4. Sin versionado de archivos (historial de cambios) — ni modelo ni concepto en el código.
+2. Sin versionado de archivos (historial de cambios) — ni modelo ni concepto en el código.
    Planificado: Ronda 4.
-5. **Decisión de producto explícita, diferida sin fecha** (confirmado con el usuario
+3. **Decisión de producto explícita, diferida sin fecha** (confirmado con el usuario
    2026-09-20): cliente de escritorio, app móvil, sincronización selectiva, acceso offline
    real y edición colaborativa en tiempo real quedan fuera del alcance actual del roadmap de
    construcción — no son un olvido, es una decisión tomada.
-6. ~~Sin etiquetas/categorías.~~ Resuelto en Ronda 2.
-7. Multi-tenant real a nivel de datos (schema-per-tenant, bien implementado, activo solo si
+4. Multi-tenant real a nivel de datos (schema-per-tenant, bien implementado, activo solo si
    `DEPLOYMENT_MODE=cloud`) pero sin ninguna UI de gestión — solo utilizable vía CLI/API
    interna, no es autoservicio hoy. Planificado: Ronda 8.
-8. Búsqueda solo por nombre, no por contenido de archivo. Sin filtros avanzados (tipo, fecha,
+5. Búsqueda solo por nombre, no por contenido de archivo. Sin filtros avanzados (tipo, fecha,
    tamaño) en la página de Archivos, aunque el componente ya existe y se usa en otros módulos.
    Búsqueda por contenido + OCR planificados: Ronda 6 (confirmado en alcance con el usuario).
-9. Vista previa solo de imagen/PDF — video, audio y documentos de Office fuerzan descarga.
+6. Vista previa solo de imagen/PDF — video, audio y documentos de Office fuerzan descarga.
    Planificado: Ronda 5.
-10. Formato de error inconsistente entre excepciones tipadas (`{status,message,data}`) y
-    errores de validación Pydantic (`{"detail":[...]}`) — dos formatos conviven en la API.
-11. Sin escaneo de virus/malware. Planificado: Ronda 7.
+7. Formato de error inconsistente entre excepciones tipadas (`{status,message,data}`) y
+   errores de validación Pydantic (`{"detail":[...]}`) — dos formatos conviven en la API.
+8. Sin escaneo de virus/malware. Planificado: Ronda 7.
 
 ### 🏗️ Estándares técnicos — gaps priorizados (vs. `docs/estandares-cliente-servidor-2026/`)
 
@@ -216,15 +235,15 @@ Gaps que siguen abiertos, ver roadmap de rondas al final del archivo:
   `audit-test@wolfgrimm.local` — este último permanentemente bloqueado para login, ver bug
   puntual más abajo) — no es producción. Se puede tirar abajo con `docker compose down -v`
   cuando se quiera.
-- Ronda 1 commiteada (`d91a47f`, 2026-09-20). Todo el código de la Ronda 2 (backend `app/tags/`
-  + wiring en `files/*` + frontend) está en el working tree, sin commitear todavía — pendiente
-  confirmación explícita del usuario antes de commitear (regla del proyecto: nunca commitear
-  sin pedido explícito).
-- El stack de prueba se cayó dos veces por reinicios del host durante el trabajo de Ronda 2 —
-  ambas veces se recuperó sin pérdida de código (todo en disco) ni de datos de prueba (volumen
-  de Postgres persistente); solo hubo que recrear el contenedor backend con `--force-recreate`
-  (un error transitorio de permisos en el primer arranque en bloque tras cada reinicio, no un
-  bug real).
+- Ronda 1 (`d91a47f`) y Ronda 2 (`61ca9f1`) commiteadas, 2026-09-20. Todo el código de la
+  Ronda 3 (backend: `Share` extendido + endpoints nuevos; frontend: `ShareModal`,
+  `SharedWithMePage`, `PublicSharePage`) está en el working tree, sin commitear todavía —
+  pendiente confirmación explícita del usuario antes de commitear.
+- El stack de prueba se cayó por reinicios del host varias veces durante el trabajo de las
+  Rondas 2 y 3 — siempre se recuperó sin pérdida de código (todo en disco) ni de datos de
+  prueba (volumen de Postgres persistente); solo hizo falta recrear el contenedor backend con
+  `--force-recreate` (un error transitorio de permisos en el primer arranque en bloque tras
+  cada reinicio, no un bug real).
 
 ### Roadmap de construcción (rondas siguientes, backlog completo)
 
@@ -234,7 +253,7 @@ Aprobado con el usuario el 2026-09-20. Cada ronda se diseña en detalle recién 
 |---|---|
 | 1 (hecho) | 6 bugs de seguridad + tenant provisioning + favoritos + orden real + copiar + cuota visible — **completa** |
 | 2 (hecho) | Etiquetas (tags many-to-many) — **completa** |
-| 3 | Compartir granular (contraseña, permisos lectura/escritura, compartir a usuario específico) + notificaciones de "te compartieron algo" |
+| 3 (hecho) | Compartir granular (contraseña, permisos lectura/escritura, compartir a usuario específico) + notificaciones de "te compartieron algo" — **completa** |
 | 4 | Versionado de archivos (historial, restaurar versión anterior) |
 | 5 | Preview extendido (video, audio, documentos de Office) |
 | 6 | Búsqueda por contenido + OCR |
@@ -247,11 +266,14 @@ en tiempo real.
 
 ### Semáforo
 
-**Rondas 1 y 2 completas y verificadas en vivo** (incluida verificación visual en navegador
-real). Listo para uso interno de un solo usuario/equipo pequeño en red cerrada — los 6
+**Rondas 1, 2 y 3 completas y verificadas en vivo** (incluida verificación visual en navegador
+real y, en Ronda 3, reproducción de dos escenarios de punta a punta por el propio Auditor
+Final). Listo para uso interno de un solo usuario/equipo pequeño en red cerrada — los 6
 bloqueadores de seguridad de la auditoría del 19 están resueltos, y el Drive ganó favoritos,
-orden real, copiar, cuota visible y etiquetas. **Todavía no listo para exposición pública a
-Internet sin decisión** sobre las 2 deudas residuales de seguridad marcadas arriba
-(`TRUSTED_PROXY_IPS` en producción real, y el balde compartido de rate-limit en shares
-públicos) — ninguna es explotable hoy, pero ambas dependen de configuración de producción que
-este repo de trabajo no controla directamente.
+orden real, copiar, cuota visible, etiquetas, y compartir granular (contraseña, permisos,
+usuarios específicos) con notificaciones reales. **Todavía no listo para exposición pública a
+Internet sin decisión** sobre 3 deudas residuales de seguridad (todas confirmadas no
+explotables hoy, pero dependen de configuración de producción que este repo de trabajo no
+controla directamente o de defensa en profundidad pendiente): `TRUSTED_PROXY_IPS` vacío en
+producción real, el balde compartido de rate-limit en shares públicos, y la falta de
+rate-limit en los endpoints autenticados de shares dirigidos.

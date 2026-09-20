@@ -12,6 +12,7 @@ class NotificationType(str, Enum):
     SEGURIDAD = "seguridad"
     SISTEMA = "sistema"
     ALMACENAMIENTO = "almacenamiento"
+    COMPARTIDO = "compartido"
 
 
 class NotificationSeverity(str, Enum):

@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import List, Literal, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, EmailStr, Field
 
 from app.tags.schemas import TagOut
 
@@ -122,14 +122,42 @@ class DirectoryListing(BaseModel):
 # ==================== Share (Hito 2: compartir por link) ====================
 
 class ShareCreate(BaseModel):
+    """Body de `POST /files/{id}/shares` y `POST /folders/{id}/shares`.
+
+    Dos modos, determinados por si viene `shared_with_email` (Ronda 3):
+    - Ausente -> link público anónimo (comportamiento de Hito 2 sin
+      cambios): se genera un `token` opaco; el share es SIEMPRE de solo
+      lectura sin importar `permission` (nadie anónimo puede escribir). Si
+      viene `password`, protege el acceso público (ver
+      `_verify_share_password` en el router).
+    - Presente -> share dirigido a ESE usuario (debe existir, 404 "Usuario
+      no encontrado" si no); NO se genera `token` (acceso siempre
+      autenticado, nunca por el link público) y `permission` sí aplica.
+
+    `password` viaja en texto plano en el request -- se hashea antes de
+    guardar (bcrypt, ver `get_password_hash`) y nunca se devuelve ni se
+    loguea."""
     expires_at: Optional[datetime] = None
+    password: Optional[str] = Field(None, min_length=1, max_length=255)
+    permission: Literal["view", "edit"] = "view"
+    shared_with_email: Optional[EmailStr] = None
 
 
 class ShareOut(BaseModel):
     """Respuesta de un share. `is_active` se calcula en el router (no es una
-    columna real) -- ver `_share_to_out`."""
+    columna real) -- ver `_share_to_out`. `token` puede ser `None` en un
+    share dirigido a un usuario (Ronda 3). `has_password` nunca expone el
+    hash, solo si el link público tiene contraseña configurada.
+
+    `resource_name`/`resource_type`/`shared_by_email` son SIEMPRE `None`
+    salvo en `GET /shares/with-me` (`_share_to_out(..., with_resource_info=True)`)
+    -- ahí sí se resuelven (nombre del archivo/carpeta compartido + email de
+    quien lo compartió) porque esa pantalla necesita mostrar algo más que
+    UUIDs pelados. Se agregan como opcionales a ESTE mismo schema (en vez de
+    uno aparte solo para with-me) para no duplicar los ~10 campos comunes ni
+    obligar al frontend a manejar dos tipos de "share" distintos."""
     id: UUID
-    token: str
+    token: Optional[str] = None
     file_id: Optional[UUID] = None
     folder_id: Optional[UUID] = None
     created_by_id: UUID
@@ -137,6 +165,13 @@ class ShareOut(BaseModel):
     revoked_at: Optional[datetime] = None
     created_at: datetime
     is_active: bool
+    permission: Literal["view", "edit"] = "view"
+    has_password: bool = False
+    resource_name: Optional[str] = None
+    resource_type: Optional[Literal["file", "folder"]] = None
+    shared_by_email: Optional[str] = None
+    shared_with_user_id: Optional[UUID] = None
+    shared_with_email: Optional[str] = None
 
     class Config:
         from_attributes = True

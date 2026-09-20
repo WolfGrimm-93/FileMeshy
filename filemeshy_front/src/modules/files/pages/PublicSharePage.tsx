@@ -1,5 +1,5 @@
 /**
- * PÁGINA PÚBLICA: `/compartido/:token` (Hito 2)
+ * PÁGINA PÚBLICA: `/compartido/:token` (Hito 2 + Ronda 3: links con contraseña)
  *
  * Sin autenticación — no vive dentro de ProtectedLayout ni tiene
  * sidebar/navbar. Consume GET /public/shares/{token} directo (sin
@@ -7,11 +7,22 @@
  * disparan refresh). Si el share es de archivo, muestra nombre/tamaño +
  * descarga + preview inline si aplica. Si es de carpeta, mini-explorador de
  * solo lectura navegando con `?path=`.
+ *
+ * Contraseña (Ronda 3): no se indica de antemano si el link la requiere --
+ * se intenta cargar sin contraseña y, si el backend responde 401 (ver
+ * `_verify_share_password` en filemeshy_back), se muestra un formulario
+ * pidiéndola. El backend la espera como header `X-Share-Password` (NUNCA
+ * query param, ver `shares.service.ts`). Una vez que un intento funciona, la
+ * contraseña se guarda en un ref del componente (nunca en localStorage --
+ * vive solo mientras dura esta pestaña) para reusarla al navegar subcarpetas
+ * y al descargar archivos dentro del share.
  */
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
 import { useParams, useSearchParams } from 'react-router-dom'
-import { ChevronRight, Download, File as FileIcon, Folder, Home } from 'lucide-react'
+import axios from 'axios'
+import { ChevronRight, Download, File as FileIcon, Folder, Home, Lock } from 'lucide-react'
 import { Button } from '@/ui/buttons/Button'
+import { PasswordInput } from '@/ui/inputs/Input'
 import { toast } from '@/ui/toast/CustomToast'
 import { formatBytes } from '@/shared/utils/downloadFile'
 import { extractErrorMessage } from '@/shared/utils/errors'
@@ -23,6 +34,8 @@ function isPreviewable(mimeType: string): boolean {
   return mimeType.startsWith('image/') || mimeType === 'application/pdf'
 }
 
+type FetchOutcome = 'ok' | 'unauthorized' | 'error'
+
 export default function PublicSharePage() {
   const { token } = useParams<{ token: string }>()
   const [searchParams, setSearchParams] = useSearchParams()
@@ -33,6 +46,56 @@ export default function PublicSharePage() {
   const [notFound, setNotFound] = useState(false)
   const [previewTarget, setPreviewTarget] = useState<PreviewTarget | null>(null)
 
+  // Contraseña del link (si aplica) -- ref (no state) para no forzar un
+  // re-render ni volver a disparar el efecto de carga cuando se confirma,
+  // y para que nunca termine persistida (localStorage, etc.), solo en
+  // memoria mientras dura esta pestaña.
+  const verifiedPasswordRef = useRef<string | undefined>(undefined)
+
+  const [passwordRequired, setPasswordRequired] = useState(false)
+  const [passwordInput, setPasswordInput] = useState('')
+  const [passwordError, setPasswordError] = useState<string | null>(null)
+  const [verifyingPassword, setVerifyingPassword] = useState(false)
+
+  const applyResponse = useCallback((response: PublicShareResponse) => {
+    setData(response)
+    // Punto 3 del contrato: si el share es de archivo y el mime es
+    // imagen/PDF, mostrar el mismo PreviewModal del Hito 2 (reusado, sin
+    // duplicar lógica de qué tipos son previsualizables).
+    if (response.type === 'file' && isPreviewable(response.mime_type)) {
+      setPreviewTarget({ name: response.name, mimeType: response.mime_type, downloadUrl: response.download_url })
+    } else {
+      setPreviewTarget(null)
+    }
+  }, [])
+
+  // Intenta cargar el share con la contraseña dada (o sin ninguna). Devuelve
+  // el resultado en vez de decidir qué pantalla mostrar -- eso lo maneja
+  // cada caller (`load`, disparado por el efecto/navegación, y el submit del
+  // formulario de contraseña), que necesitan loaders/mensajes distintos.
+  const attemptFetch = useCallback(
+    async (passwordAttempt?: string): Promise<FetchOutcome> => {
+      if (!token) return 'error'
+      try {
+        const response = await sharesService.getPublicShare(token, path ?? undefined, {
+          password: passwordAttempt,
+        })
+        applyResponse(response)
+        verifiedPasswordRef.current = passwordAttempt
+        setPasswordRequired(false)
+        return 'ok'
+      } catch (error: unknown) {
+        if (axios.isAxiosError(error) && error.response?.status === 401) {
+          setPasswordRequired(true)
+          setData(null)
+          return 'unauthorized'
+        }
+        return 'error'
+      }
+    },
+    [token, path, applyResponse]
+  )
+
   const load = useCallback(async () => {
     if (!token) {
       setNotFound(true)
@@ -41,24 +104,10 @@ export default function PublicSharePage() {
     }
     setLoading(true)
     setNotFound(false)
-    try {
-      const response = await sharesService.getPublicShare(token, path ?? undefined)
-      setData(response)
-
-      // Punto 3 del contrato: si el share es de archivo y el mime es
-      // imagen/PDF, mostrar el mismo PreviewModal del Hito 2 (reusado, sin
-      // duplicar lógica de qué tipos son previsualizables).
-      if (response.type === 'file' && isPreviewable(response.mime_type)) {
-        setPreviewTarget({ name: response.name, mimeType: response.mime_type, downloadUrl: response.download_url })
-      } else {
-        setPreviewTarget(null)
-      }
-    } catch {
-      setNotFound(true)
-    } finally {
-      setLoading(false)
-    }
-  }, [token, path])
+    const outcome = await attemptFetch(verifiedPasswordRef.current)
+    if (outcome === 'error') setNotFound(true)
+    setLoading(false)
+  }, [token, attemptFetch])
 
   useEffect(() => {
     load()
@@ -69,12 +118,27 @@ export default function PublicSharePage() {
     else setSearchParams({})
   }
 
+  const handlePasswordSubmit = async (e: FormEvent) => {
+    e.preventDefault()
+    if (!passwordInput.trim()) return
+    setVerifyingPassword(true)
+    setPasswordError(null)
+    const outcome = await attemptFetch(passwordInput)
+    if (outcome === 'unauthorized') {
+      setPasswordError('Contraseña incorrecta')
+    } else if (outcome === 'error') {
+      toast.error('Error al validar la contraseña')
+    }
+    setVerifyingPassword(false)
+  }
+
   const handleFileOpen = async (file: FileOut) => {
     if (!token) return
     const previewable = isPreviewable(file.mime_type)
     try {
       const url = await sharesService.getPublicDownloadUrl(token, file.id, {
         forceDownload: !previewable,
+        password: verifiedPasswordRef.current,
       })
       if (previewable) {
         setPreviewTarget({ name: file.name, mimeType: file.mime_type, downloadUrl: url })
@@ -92,6 +156,42 @@ export default function PublicSharePage() {
         <div className="flex flex-col items-center gap-4">
           <div className="size-10 animate-spin rounded-full border-4 border-brand-500 border-t-transparent" />
           <p className="text-sm text-muted-foreground">Cargando...</p>
+        </div>
+      </div>
+    )
+  }
+
+  if (passwordRequired) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-gray-50 p-4 dark:bg-gray-950">
+        <div className="w-full max-w-sm rounded-xl border border-border bg-card p-8 shadow-xs">
+          <Lock className="mx-auto mb-4 size-10 text-gray-400" strokeWidth={1.5} />
+          <h1 className="mb-1 text-center text-xl font-bold text-foreground">Enlace protegido</h1>
+          <p className="mb-6 text-center text-sm text-muted-foreground">
+            Este enlace requiere una contraseña para acceder.
+          </p>
+          <form onSubmit={handlePasswordSubmit} className="space-y-3">
+            <PasswordInput
+              value={passwordInput}
+              onChange={(e) => {
+                setPasswordInput(e.target.value)
+                setPasswordError(null)
+              }}
+              placeholder="Contraseña"
+              error={passwordError ?? undefined}
+              variant="outlined"
+              autoFocus
+            />
+            <Button
+              type="submit"
+              variant="primary"
+              fullWidth
+              isLoading={verifyingPassword}
+              loadingText="Verificando..."
+            >
+              Acceder
+            </Button>
+          </form>
         </div>
       </div>
     )
@@ -126,7 +226,10 @@ export default function PublicSharePage() {
                   // Forzar attachment incluso para imagen/PDF -- el download_url que ya
                   // tenemos en `data` es el de preview (sin forzar), pedimos uno nuevo.
                   try {
-                    const forced = await sharesService.getPublicShare(token!, path ?? undefined, { forceDownload: true })
+                    const forced = await sharesService.getPublicShare(token!, path ?? undefined, {
+                      forceDownload: true,
+                      password: verifiedPasswordRef.current,
+                    })
                     if (forced.type === 'file') {
                       window.location.href = forced.download_url
                     }

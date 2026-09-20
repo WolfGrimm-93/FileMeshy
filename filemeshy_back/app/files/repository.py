@@ -274,6 +274,18 @@ class CRUDShare(CRUDBase[Share, None, None]):
             .all()
         )
 
+    def get_for_recipient(self, db: Session, user_id: UUID) -> List[Share]:
+        """Shares dirigidos a `user_id` (Ronda 3) -- incluye revocados/
+        expirados (mismo criterio que `get_for_file`/`get_for_folder`: se
+        muestra el historial completo, `is_active` en `ShareOut` distingue
+        cuáles siguen vigentes)."""
+        return (
+            db.query(Share)
+            .filter(Share.shared_with_user_id == user_id)
+            .order_by(Share.created_at.desc())
+            .all()
+        )
+
 
 folder_repo = CRUDFolder(Folder)
 file_repo = CRUDFile(File)

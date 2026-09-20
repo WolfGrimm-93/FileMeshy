@@ -5,6 +5,7 @@ import {
   ScrollText,
   Folder,
   HardDrive,
+  Share2,
 } from 'lucide-react'
 import { useAuthStore } from '@/modules/auth/store/authStore'
 import { useSidebarStore } from '@/app/store/sidebarStore'
@@ -110,6 +111,14 @@ export default function Sidebar() {
       icon: <Folder className="w-5 h-5" />,
       to: '/archivos',
       tooltip: 'Archivos',
+      permission: 'files.view',
+    },
+    {
+      id: 'compartido-conmigo',
+      label: 'Compartido conmigo',
+      icon: <Share2 className="w-5 h-5" />,
+      to: '/compartido-conmigo',
+      tooltip: 'Compartido conmigo',
       permission: 'files.view',
     },
     {

@@ -15,6 +15,7 @@ shares) -- repository.py solo hace queries, siguiendo la convención ya usada
 en notifications/access_control de este proyecto.
 """
 
+import logging
 import os
 import secrets
 from datetime import datetime, timezone
@@ -27,6 +28,7 @@ from fastapi import (
     Depends,
     File as UploadFileParam,
     Form,
+    Header,
     HTTPException,
     Query,
     Request,
@@ -36,9 +38,10 @@ from fastapi import (
 from sqlalchemy.orm import Session
 
 from app.access_control.service import has_permission
-from app.auth.service import RateLimiter
+from app.auth.service import RateLimiter, get_current_active_user
 from app.core.config import settings
 from app.core.database import SessionLocal, get_db
+from app.core.security import get_password_hash, verify_password
 from app.files.models import File as FileModel, Folder, Share
 from app.files.repository import file_repo, folder_repo, share_repo
 from app.files.schemas import (
@@ -70,6 +73,9 @@ from app.storage_quota.service import reserve_upload_bytes, release_upload_bytes
 from app.tags.models import Tag
 from app.tags.repository import tag_repo
 from app.users.models import User
+from app.users.repository import user as user_repo
+
+logger = logging.getLogger(__name__)
 
 folders_router = APIRouter()
 files_router = APIRouter()
@@ -170,12 +176,43 @@ def _get_owned_file(db: Session, file_id: UUID, current_user: User, *, active_on
     return file_obj
 
 
-def _share_to_out(share: Share) -> ShareOut:
+def _share_to_out(share: Share, *, with_resource_info: bool = False) -> ShareOut:
     """`is_active` no es una columna real -- se calcula acá, un solo lugar,
-    para que las dos rutas que devuelven ShareOut (crear y listar) usen
-    siempre el mismo criterio."""
+    para que todas las rutas que devuelven ShareOut (crear, listar por
+    archivo/carpeta, `with-me`) usen siempre el mismo criterio.
+
+    `shared_with_email` sale de la relación `Share.shared_with` (lazy select
+    sobre la misma sesión de la request) -- evita una query aparte para el
+    caso común (share público, sin destinatario).
+
+    `with_resource_info=True` (solo lo usa `list_shares_with_me`) resuelve
+    ADEMÁS `resource_name`/`resource_type` (vía `Share.file`/`Share.folder`)
+    y `shared_by_email` (vía `Share.created_by`) -- mismo mecanismo lazy-select
+    que `shared_with_email`. Es opt-in y no el default porque los otros
+    callers (crear un share, listar los shares DE un archivo/carpeta propio)
+    ya conocen el recurso y a sí mismos por contexto; resolver estas tres
+    relaciones ahí sería trabajo de más sin ningún consumidor real. Si el
+    recurso ya no existe (fila borrada -- no debería pasar, `Share` tiene
+    `ondelete=CASCADE`) o el `created_by` fue borrado, quedan en `None` en
+    vez de reventar -- la UI de "compartido conmigo" no depende de esto para
+    renderizar el resto de la fila."""
     now = datetime.now(timezone.utc)
     is_active = share.revoked_at is None and (share.expires_at is None or share.expires_at > now)
+    shared_with_email = share.shared_with.email if share.shared_with_user_id and share.shared_with else None
+
+    resource_name = None
+    resource_type = None
+    shared_by_email = None
+    if with_resource_info:
+        if share.file_id is not None and share.file is not None:
+            resource_name = share.file.name
+            resource_type = "file"
+        elif share.folder_id is not None and share.folder is not None:
+            resource_name = share.folder.name
+            resource_type = "folder"
+        if share.created_by is not None:
+            shared_by_email = share.created_by.email
+
     return ShareOut(
         id=share.id,
         token=share.token,
@@ -186,7 +223,90 @@ def _share_to_out(share: Share) -> ShareOut:
         revoked_at=share.revoked_at,
         created_at=share.created_at,
         is_active=is_active,
+        permission=share.permission,
+        has_password=share.password_hash is not None,
+        shared_with_user_id=share.shared_with_user_id,
+        shared_with_email=shared_with_email,
+        resource_name=resource_name,
+        resource_type=resource_type,
+        shared_by_email=shared_by_email,
     )
+
+
+def _resolve_shared_with_user(db: Session, email: Optional[str]) -> Optional[User]:
+    """Resuelve `shared_with_email` (si vino) al usuario destinatario real.
+    404 claro si no existe nadie con ese email -- mismo criterio del resto
+    del módulo de no dejar que una FK inválida reviente en un 500, pero acá
+    SÍ se distingue el motivo (a diferencia de los helpers de ownership) por
+    ser un dato que el propio usuario que comparte tipeó a mano, no un id
+    adivinado por un tercero."""
+    if not email:
+        return None
+    target_user = user_repo.get_by_email(db, email)
+    if not target_user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Usuario no encontrado")
+    return target_user
+
+
+def _notify_share_recipient(db: Session, recipient_id: UUID, resource_name: str) -> None:
+    """Notifica al destinatario de un share dirigido recién creado (Ronda 3).
+    Import diferido de `create_notification` -- mismo patrón que
+    `app/storage_quota/service.py::_notify_if_near_limit`, evita un ciclo de
+    import a nivel de módulo entre `files` y `worker.tasks`. `create_notification`
+    ya es best-effort internamente (atrapa sus propias excepciones y devuelve
+    False) -- no hace falta envolver esta llamada en otro try/except."""
+    from app.worker.tasks.notification_helpers import create_notification
+
+    create_notification(
+        db=db,
+        user_id=recipient_id,
+        title="Te compartieron un elemento",
+        message=f"Te compartieron: {resource_name}",
+        notif_type="compartido",
+        severity="info",
+        action_url="/archivos/compartidos",
+        extra_data={},
+    )
+
+
+def _create_share(
+    db: Session,
+    *,
+    file_id: Optional[UUID],
+    folder_id: Optional[UUID],
+    resource_name: str,
+    current_user: User,
+    payload: ShareCreate,
+) -> Share:
+    """Crea un `Share` de archivo o carpeta -- lógica común a
+    `create_file_share`/`create_folder_share` (Ronda 3: password opcional,
+    permission, y resolución de `shared_with_email` a un destinatario real).
+
+    Si se resolvió un destinatario, NO se genera `token` (el acceso a un
+    share dirigido es siempre autenticado, nunca por el link público) y se
+    dispara una notificación al destinatario."""
+    target_user = _resolve_shared_with_user(db, payload.shared_with_email)
+    token = None if target_user else secrets.token_urlsafe(32)
+    password_hash = get_password_hash(payload.password) if payload.password else None
+
+    share = Share(
+        file_id=file_id,
+        folder_id=folder_id,
+        token=token,
+        created_by_id=current_user.id,
+        expires_at=payload.expires_at,
+        password_hash=password_hash,
+        permission=payload.permission,
+        shared_with_user_id=target_user.id if target_user else None,
+    )
+    db.add(share)
+    db.commit()
+    db.refresh(share)
+
+    if target_user is not None:
+        _notify_share_recipient(db, target_user.id, resource_name)
+
+    return share
 
 
 def _resolve_owned_tags(db: Session, owner_id: UUID, tag_ids: List[UUID]) -> List[Tag]:
@@ -733,6 +853,91 @@ def list_directory(
     return DirectoryListing(folders=folders, files=files, breadcrumb=breadcrumb)
 
 
+def _validate_and_store_upload(
+    db: Session,
+    *,
+    owner_id: UUID,
+    folder_id: Optional[UUID],
+    upload: UploadFile,
+    content: bytes,
+) -> FileModel:
+    """Valida el contenido real de un upload (magic bytes) y lo persiste:
+    reserva de cuota contra `owner_id`, subida a MinIO y la fila `File`
+    resultante. Extraído de `upload_file` (Hito 1) para reusarlo tal cual en
+    `upload_file_via_share` (Ronda 3: el destinatario de un share de carpeta
+    con `permission='edit'` sube un archivo nuevo) -- MISMA verificación de
+    tipo real y MISMO patrón de reserva/rollback de cuota en los dos casos.
+
+    El caller ya validó tamaño máximo (`file.size`/`len(content)`) ANTES de
+    llamar acá -- esta función asume que `content` ya está dentro del límite."""
+    original_name = upload.filename or "archivo"
+    if len(original_name) > 255:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="El nombre no puede superar los 255 caracteres",
+        )
+    _, extension = os.path.splitext(original_name)
+    content_type = upload.content_type or "application/octet-stream"
+
+    # Verificación de tipo real por contenido (magic bytes), NUNCA confiar en
+    # el Content-Type que declara el cliente para decidir si un archivo se
+    # puede servir inline más adelante (ver _download_disposition) -- lo
+    # declarado es texto libre controlado por el atacante. Si el contenido
+    # real es una imagen (nunca SVG: es XML, puede llevar <script> embebido
+    # y ejecuta igual que HTML) o un PDF real, se sobreescribe `content_type`
+    # con el verificado.
+    detected_format = detect_image_type(content)
+    if detected_format in _VERIFIED_IMAGE_MIME_BY_FORMAT:
+        content_type = _VERIFIED_IMAGE_MIME_BY_FORMAT[detected_format]
+    elif is_pdf_content(content):
+        content_type = "application/pdf"
+    elif content_type in INLINE_SAFE_MIME_TYPES:
+        # El cliente declaró uno de los tipos "seguros para inline" pero el
+        # contenido real no lo confirma -- degradar a un tipo genérico para
+        # que _download_disposition nunca lo sirva inline solo por el nombre
+        # del Content-Type declarado (ese exacto vector permitía subir un
+        # script disfrazado de imagen, hallazgo crítico de la ronda de
+        # feedback de Hito 2, 2026-09-06).
+        content_type = "application/octet-stream"
+
+    # Cuota de almacenamiento del DUEÑO real (`owner_id`) -- en un upload vía
+    # share (Ronda 3) puede no ser `current_user`, ver `upload_file_via_share`.
+    # Chequeo y reserva son la MISMA operación atómica (UPDATE con guard, ver
+    # app/storage_quota/service.py::reserve_upload_bytes), ANTES de subir a
+    # MinIO -- separar "chequear" de "sumar" en dos pasos dejaba una ventana
+    # donde dos uploads concurrentes del mismo usuario, cada uno por debajo
+    # del remanente, pasaban el chequeo por separado y sumados superaban el
+    # límite (hallazgo de la revisión adversarial, Fase 3, 2026-09-08).
+    reserve_upload_bytes(db, owner_id, len(content))
+
+    try:
+        storage_key = upload_private_file(
+            path=f"files/{owner_id}",
+            content=content,
+            extension=extension,
+            content_type=content_type,
+        )
+    except Exception:
+        # La reserva de arriba ya sumó a bytes_used -- si la subida a MinIO
+        # falla, hay que liberarla o el contador queda inflado por un
+        # archivo que nunca llegó a existir.
+        release_upload_bytes(db, owner_id, len(content))
+        raise
+
+    db_file = FileModel(
+        name=original_name,
+        folder_id=folder_id,
+        owner_id=owner_id,
+        storage_key=storage_key,
+        size_bytes=len(content),
+        mime_type=content_type,
+    )
+    db.add(db_file)
+    db.commit()
+    db.refresh(db_file)
+    return db_file
+
+
 @files_router.post("/upload", response_model=FileOut, status_code=status.HTTP_201_CREATED)
 async def upload_file(
     file: UploadFile = UploadFileParam(...),
@@ -767,71 +972,7 @@ async def upload_file(
             detail=f"El archivo supera el tamaño máximo permitido ({settings.MAX_UPLOAD_SIZE_MB} MB)",
         )
 
-    original_name = file.filename or "archivo"
-    if len(original_name) > 255:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="El nombre no puede superar los 255 caracteres",
-        )
-    _, extension = os.path.splitext(original_name)
-    content_type = file.content_type or "application/octet-stream"
-
-    # Verificación de tipo real por contenido (magic bytes), NUNCA confiar en
-    # el Content-Type que declara el cliente para decidir si un archivo se
-    # puede servir inline más adelante (ver _download_disposition) -- lo
-    # declarado es texto libre controlado por el atacante. Si el contenido
-    # real es una imagen (nunca SVG: es XML, puede llevar <script> embebido
-    # y ejecuta igual que HTML) o un PDF real, se sobreescribe `content_type`
-    # con el verificado.
-    detected_format = detect_image_type(content)
-    if detected_format in _VERIFIED_IMAGE_MIME_BY_FORMAT:
-        content_type = _VERIFIED_IMAGE_MIME_BY_FORMAT[detected_format]
-    elif is_pdf_content(content):
-        content_type = "application/pdf"
-    elif content_type in INLINE_SAFE_MIME_TYPES:
-        # El cliente declaró uno de los tipos "seguros para inline" pero el
-        # contenido real no lo confirma -- degradar a un tipo genérico para
-        # que _download_disposition nunca lo sirva inline solo por el nombre
-        # del Content-Type declarado (ese exacto vector permitía subir un
-        # script disfrazado de imagen, hallazgo crítico de la ronda de
-        # feedback de Hito 2, 2026-09-06).
-        content_type = "application/octet-stream"
-
-    # Cuota de almacenamiento del usuario: chequeo y reserva son la MISMA
-    # operación atómica (UPDATE con guard, ver
-    # app/storage_quota/service.py::reserve_upload_bytes), ANTES de subir a
-    # MinIO -- separar "chequear" de "sumar" en dos pasos dejaba una ventana
-    # donde dos uploads concurrentes del mismo usuario, cada uno por debajo
-    # del remanente, pasaban el chequeo por separado y sumados superaban el
-    # límite (hallazgo de la revisión adversarial, Fase 3, 2026-09-08).
-    reserve_upload_bytes(db, current_user.id, len(content))
-
-    try:
-        storage_key = upload_private_file(
-            path=f"files/{current_user.id}",
-            content=content,
-            extension=extension,
-            content_type=content_type,
-        )
-    except Exception:
-        # La reserva de arriba ya sumó a bytes_used -- si la subida a MinIO
-        # falla, hay que liberarla o el contador queda inflado por un
-        # archivo que nunca llegó a existir.
-        release_upload_bytes(db, current_user.id, len(content))
-        raise
-
-    db_file = FileModel(
-        name=original_name,
-        folder_id=folder_id,
-        owner_id=current_user.id,
-        storage_key=storage_key,
-        size_bytes=len(content),
-        mime_type=content_type,
-    )
-    db.add(db_file)
-    db.commit()
-    db.refresh(db_file)
-    return db_file
+    return _validate_and_store_upload(db, owner_id=current_user.id, folder_id=folder_id, upload=file, content=content)
 
 
 @files_router.get("/{file_id}", response_model=FileOut)
@@ -1002,15 +1143,14 @@ def create_file_share(
     current_user: User = Depends(has_permission(["shares.create"])),
 ):
     file_obj = _get_owned_file(db, file_id, current_user, active_only=True)
-    share = Share(
+    share = _create_share(
+        db,
         file_id=file_obj.id,
-        token=secrets.token_urlsafe(32),
-        created_by_id=current_user.id,
-        expires_at=payload.expires_at,
+        folder_id=None,
+        resource_name=file_obj.name,
+        current_user=current_user,
+        payload=payload,
     )
-    db.add(share)
-    db.commit()
-    db.refresh(share)
     return _share_to_out(share)
 
 
@@ -1039,15 +1179,14 @@ def create_folder_share(
     current_user: User = Depends(has_permission(["shares.create"])),
 ):
     folder = _get_owned_folder(db, folder_id, current_user, active_only=True)
-    share = Share(
+    share = _create_share(
+        db,
+        file_id=None,
         folder_id=folder.id,
-        token=secrets.token_urlsafe(32),
-        created_by_id=current_user.id,
-        expires_at=payload.expires_at,
+        resource_name=folder.name,
+        current_user=current_user,
+        payload=payload,
     )
-    db.add(share)
-    db.commit()
-    db.refresh(share)
     return _share_to_out(share)
 
 
@@ -1087,6 +1226,344 @@ def revoke_share(
         share.revoked_at = datetime.now(timezone.utc)
         db.commit()
     return None
+
+
+# ============================================================
+# SHARES DIRIGIDOS A UN USUARIO -- rutas autenticadas (Ronda 3)
+# ============================================================
+# A diferencia del link público (por token, sin auth), un share con
+# `shared_with_user_id` seteado se accede SIEMPRE autenticado, por su propio
+# `id` -- nunca por /public/shares. Registrar "/with-me" ANTES de "/{share_id}"
+# en este mismo router es obligatorio: FastAPI prueba las rutas en el orden
+# en que se agregan, y "with-me" no es un UUID válido -- si "/{share_id}"
+# quedara primero, "with-me" caería ahí y devolvería 422 en vez de la lista.
+
+@shares_router.get("/with-me", response_model=List[ShareOut])
+def list_shares_with_me(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """Shares dirigidos a mí. Sin gate de permiso RBAC (a diferencia de
+    `list_file_shares`/`list_folder_shares`, que exigen shares.create/revoke/
+    manage sobre un recurso PROPIO) -- esto es la bandeja de entrada de lo
+    que otros me compartieron, no una gestión sobre mis propios recursos.
+
+    `with_resource_info=True` -- a diferencia de crear/listar-por-recurso,
+    esta pantalla necesita mostrar QUÉ le compartieron y QUIÉN se lo
+    compartió, no solo IDs (ver docstring de `_share_to_out`; hallazgo del
+    agente de frontend, Ronda 3: sin esto la UI solo podía mostrar UUIDs
+    pelados)."""
+    shares = share_repo.get_for_recipient(db, current_user.id)
+    return [_share_to_out(s, with_resource_info=True) for s in shares]
+
+
+def _build_share_content_response(
+    db: Session,
+    share: Share,
+    *,
+    path: Optional[UUID],
+    force_download: bool,
+):
+    """Arma la respuesta de contenido de un share (archivo o carpeta) --
+    misma lógica para el endpoint público (`get_public_share`, por token) y
+    el autenticado (`get_share_content`, por id), extraída para no duplicar
+    el chequeo anti-IDOR de `path` contra el subárbol real del share."""
+    if share.file_id is not None:
+        file_obj = file_repo.get_active(db, share.file_id)
+        if not file_obj:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Enlace no encontrado")
+        disposition = _download_disposition(file_obj, force=force_download)
+        url = generate_presigned_url(file_obj.storage_key, response_content_disposition=disposition)
+        return PublicFileShareOut(
+            name=file_obj.name,
+            size_bytes=file_obj.size_bytes,
+            mime_type=file_obj.mime_type,
+            download_url=url,
+        )
+
+    root_folder = folder_repo.get_active(db, share.folder_id)
+    if not root_folder:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Enlace no encontrado")
+
+    if path is None or path == root_folder.id:
+        target_folder = root_folder
+    else:
+        # `path` tiene que ser un descendiente REAL de la carpeta compartida --
+        # nunca confiar en que el cliente mande un folder_id legítimo, un
+        # atacante puede mandar cualquier UUID de carpeta ajena tratando de
+        # usar este share como llave maestra.
+        descendant_ids = set(folder_repo.get_descendant_ids(db, root_folder.id))
+        if path not in descendant_ids:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Enlace no encontrado")
+        target_folder = folder_repo.get_active(db, path)
+        if not target_folder:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Enlace no encontrado")
+
+    folders = folder_repo.get_children(db, root_folder.owner_id, target_folder.id)
+    files = file_repo.get_children(db, root_folder.owner_id, target_folder.id)
+    return PublicFolderShareOut(
+        name=target_folder.name,
+        folder_id=target_folder.id,
+        folders=folders,
+        files=files,
+    )
+
+
+def _resolve_share_download_target(db: Session, share: Share, file_id: UUID) -> FileModel:
+    """Resuelve y valida el `File` a descargar dentro de un share -- MISMO
+    chequeo anti-IDOR para el endpoint público y el autenticado (extraído de
+    `download_public_share_file`, ver docstring de `_build_share_content_response`
+    para el motivo de la extracción)."""
+    if share.file_id is not None:
+        if file_id != share.file_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Enlace no encontrado")
+        file_obj = file_repo.get_active(db, file_id)
+        if not file_obj:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Enlace no encontrado")
+        return file_obj
+
+    file_obj = file_repo.get_active(db, file_id)
+    if not file_obj or file_obj.folder_id is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Enlace no encontrado")
+    # El archivo tiene que pertenecer al subárbol de la carpeta compartida
+    # (la carpeta misma o un descendiente real) -- mismo chequeo anti-IDOR
+    # que en _build_share_content_response, ahora sobre archivos en vez de
+    # carpetas.
+    allowed_folder_ids = {share.folder_id} | set(folder_repo.get_descendant_ids(db, share.folder_id))
+    if file_obj.folder_id not in allowed_folder_ids:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Enlace no encontrado")
+    return file_obj
+
+
+def _get_directed_share_for_viewer(db: Session, share_id: UUID, current_user: User) -> Share:
+    """Share DIRIGIDO (shared_with_user_id NOT NULL) vigente, accesible por
+    el destinatario o por el dueño del recurso (`created_by_id`) -- 404 para
+    cualquier otro caso (share inexistente, público, revocado, expirado, o
+    de un tercero), mismo criterio "no filtrar por qué" que el resto del
+    módulo. Un share revocado no debería seguir siendo consultable ni por su
+    propio destinatario -- misma vigencia que exige `_get_valid_share` para
+    el link público."""
+    share = share_repo.get(db, share_id)
+    now = datetime.now(timezone.utc)
+    if (
+        not share
+        or share.shared_with_user_id is None
+        or share.revoked_at is not None
+        or (share.expires_at is not None and share.expires_at <= now)
+    ):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Enlace no encontrado")
+    if current_user.id not in (share.shared_with_user_id, share.created_by_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Enlace no encontrado")
+    return share
+
+
+@shares_router.get("/{share_id}")
+def get_share_content(
+    share_id: UUID,
+    path: Optional[UUID] = Query(None),
+    force_download: bool = Query(False),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """Contenido de un share dirigido -- mismo shape que el endpoint público
+    (`get_public_share`), pero autenticado y solo para el destinatario o el
+    dueño (ver `_get_directed_share_for_viewer`). Acepta `path` para navegar
+    subcarpetas igual que el público, por paridad con esa UI."""
+    share = _get_directed_share_for_viewer(db, share_id, current_user)
+    return _build_share_content_response(db, share, path=path, force_download=force_download)
+
+
+@shares_router.get("/{share_id}/download/{file_id}", response_model=DownloadUrlResponse)
+def download_share_file(
+    share_id: UUID,
+    file_id: UUID,
+    force_download: bool = Query(False),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    share = _get_directed_share_for_viewer(db, share_id, current_user)
+    file_obj = _resolve_share_download_target(db, share, file_id)
+    disposition = _download_disposition(file_obj, force=force_download)
+    url = generate_presigned_url(file_obj.storage_key, response_content_disposition=disposition)
+    return DownloadUrlResponse(download_url=url)
+
+
+def _get_share_for_write(db: Session, share_id: UUID, current_user: User) -> Share:
+    """Share vigente donde `current_user` es el destinatario o el dueño del
+    recurso -- 404 para cualquier otro (ownership, mismo criterio "no
+    filtrar" del resto del módulo). Deliberadamente SEPARADO de la
+    validación de `permission='edit'` (`_require_edit_permission`, que debe
+    dar 403 -- ver su docstring): esta función no filtra por si el share es
+    público o de solo lectura, solo por si el caller tiene algo que ver con
+    el share en absoluto."""
+    share = share_repo.get(db, share_id)
+    now = datetime.now(timezone.utc)
+    if (
+        not share
+        or share.revoked_at is not None
+        or (share.expires_at is not None and share.expires_at <= now)
+    ):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Enlace no encontrado")
+    if current_user.id not in (share.shared_with_user_id, share.created_by_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Enlace no encontrado")
+    return share
+
+
+def _require_edit_permission(share: Share) -> None:
+    """403 si el share no permite escribir: un link público
+    (shared_with_user_id NULL) es SIEMPRE de solo lectura sin importar
+    `permission` -- el campo no aplica a links públicos (nadie anónimo puede
+    escribir, ver docstring de `ShareCreate`/`Share`). Un share dirigido con
+    `permission='view'` cae en el mismo 403."""
+    if share.shared_with_user_id is None or share.permission != "edit":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Este enlace no permite subir o modificar contenido",
+        )
+
+
+@shares_router.post("/{share_id}/files", response_model=FileOut, status_code=status.HTTP_201_CREATED)
+async def upload_file_via_share(
+    share_id: UUID,
+    file: UploadFile = UploadFileParam(...),
+    db: Session = Depends(get_db),
+    # files.upload -- lo mismo que exige el upload normal (app/files/router.py
+    # ::upload_file). El rol USER por defecto ya lo tiene (uso básico del
+    # Drive); el gate real de "puede escribir EN ESTE share puntual" lo hacen
+    # `_get_share_for_write`/`_require_edit_permission` más abajo, no esto.
+    current_user: User = Depends(has_permission(["files.upload"])),
+):
+    """El destinatario de un share de CARPETA con `permission='edit'` sube un
+    archivo nuevo dentro de ella. La cuota se reserva contra el DUEÑO real de
+    la carpeta (`target_folder.owner_id`), nunca contra `current_user` -- ver
+    diseño de Ronda 3."""
+    share = _get_share_for_write(db, share_id, current_user)
+    _require_edit_permission(share)
+    if share.folder_id is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Este enlace no comparte una carpeta")
+
+    target_folder = folder_repo.get_active(db, share.folder_id)
+    if not target_folder:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Enlace no encontrado")
+
+    max_bytes = settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024
+    if file.size is not None and file.size > max_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"El archivo supera el tamaño máximo permitido ({settings.MAX_UPLOAD_SIZE_MB} MB)",
+        )
+
+    content = await file.read()
+    if len(content) > max_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"El archivo supera el tamaño máximo permitido ({settings.MAX_UPLOAD_SIZE_MB} MB)",
+        )
+
+    return _validate_and_store_upload(
+        db,
+        owner_id=target_folder.owner_id,
+        folder_id=target_folder.id,
+        upload=file,
+        content=content,
+    )
+
+
+@shares_router.put("/{share_id}/content", response_model=FileOut)
+async def replace_file_via_share(
+    share_id: UUID,
+    file: UploadFile = UploadFileParam(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(has_permission(["files.upload"])),
+):
+    """El destinatario de un share de ARCHIVO con `permission='edit'`
+    reemplaza su contenido: mismo `file_id`, `storage_key` nuevo, ajusta
+    `size_bytes` y la cuota del DUEÑO real del archivo (libera el tamaño
+    viejo, reserva el nuevo). El nombre del archivo NO se toca -- se
+    reemplaza el contenido "in place", no se renombra (decisión de diseño,
+    ver reporte final).
+
+    El objeto viejo en MinIO se borra DESPUÉS de confirmar el nuevo -- si ese
+    borrado falla, se loguea un warning y la operación principal (el
+    reemplazo, ya commiteado) NO se revierte ni falla por eso."""
+    share = _get_share_for_write(db, share_id, current_user)
+    _require_edit_permission(share)
+    if share.file_id is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Este enlace no comparte un archivo")
+
+    target_file = file_repo.get_active(db, share.file_id)
+    if not target_file:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Enlace no encontrado")
+
+    max_bytes = settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024
+    if file.size is not None and file.size > max_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"El archivo supera el tamaño máximo permitido ({settings.MAX_UPLOAD_SIZE_MB} MB)",
+        )
+
+    content = await file.read()
+    if len(content) > max_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"El archivo supera el tamaño máximo permitido ({settings.MAX_UPLOAD_SIZE_MB} MB)",
+        )
+
+    owner_id = target_file.owner_id
+    old_storage_key = target_file.storage_key
+    old_size = target_file.size_bytes
+
+    _, extension = os.path.splitext(file.filename or target_file.name)
+    content_type = file.content_type or "application/octet-stream"
+    detected_format = detect_image_type(content)
+    if detected_format in _VERIFIED_IMAGE_MIME_BY_FORMAT:
+        content_type = _VERIFIED_IMAGE_MIME_BY_FORMAT[detected_format]
+    elif is_pdf_content(content):
+        content_type = "application/pdf"
+    elif content_type in INLINE_SAFE_MIME_TYPES:
+        content_type = "application/octet-stream"
+
+    # Libera el tamaño viejo y reserva el nuevo contra el DUEÑO real -- no es
+    # una única operación atómica (reserve_upload_bytes ya es atómica EN SÍ
+    # MISMA contra la carrera de uploads concurrentes del propio dueño, ver
+    # su docstring; encadenar liberar+reservar no necesita más que eso para
+    # este caso de uso, que no es concurrente consigo mismo).
+    release_upload_bytes(db, owner_id, old_size)
+    try:
+        reserve_upload_bytes(db, owner_id, len(content))
+    except HTTPException:
+        # Sin cupo para el contenido nuevo -- revertir la liberación, el
+        # archivo viejo sigue intacto, no se subió nada todavía.
+        reserve_upload_bytes(db, owner_id, old_size)
+        raise
+
+    try:
+        new_storage_key = upload_private_file(
+            path=f"files/{owner_id}",
+            content=content,
+            extension=extension,
+            content_type=content_type,
+        )
+    except Exception:
+        release_upload_bytes(db, owner_id, len(content))
+        reserve_upload_bytes(db, owner_id, old_size)
+        raise
+
+    target_file.storage_key = new_storage_key
+    target_file.size_bytes = len(content)
+    target_file.mime_type = content_type
+    db.commit()
+    db.refresh(target_file)
+
+    try:
+        delete_private_file(old_storage_key)
+    except Exception as exc:
+        logger.warning(
+            f"No se pudo borrar el storage_key viejo ({old_storage_key}) tras reemplazar "
+            f"contenido vía share {share_id}: {exc}"
+        )
+
+    return target_file
 
 
 # ============================================================
@@ -1136,56 +1613,39 @@ def _get_valid_share(db: Session, token: str) -> Share:
     return share
 
 
+def _verify_share_password(share: Share, provided_password: Optional[str]) -> None:
+    """Si el link público tiene `password_hash` (Ronda 3), exige que
+    `provided_password` la matchee -- 401 tanto si falta como si es
+    incorrecta (mismo mensaje en los dos casos, no distingue cuál para no
+    darle a un atacante una señal de "casi" que ayude a fuerza bruta).
+
+    La contraseña viaja por el header `X-Share-Password` (NO por query
+    param): un query param queda en logs de acceso del servidor/proxy, en el
+    historial del navegador y en el header `Referer` de cualquier request
+    saliente desde esa página -- un header custom no viaja a ninguno de los
+    tres. Elegido sobre el query param a propósito por ese motivo (AppSec),
+    documentado acá para que sea el único lugar donde hace falta consultarlo:
+    el frontend tiene que mandar este mismo header en AMBOS endpoints
+    públicos (`GET /public/shares/{token}` y `.../download/{file_id}`)."""
+    if share.password_hash is None:
+        return
+    if not provided_password or not verify_password(provided_password, share.password_hash):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Contraseña requerida o incorrecta")
+
+
 @public_shares_router.get("/{token}")
 def get_public_share(
     request: Request,
     token: str,
     path: Optional[UUID] = Query(None),
     force_download: bool = Query(False),
+    x_share_password: Optional[str] = Header(None, alias="X-Share-Password"),
     db: Session = Depends(get_db),
 ):
     _enforce_public_share_rate_limit(request)
     share = _get_valid_share(db, token)
-
-    if share.file_id is not None:
-        file_obj = file_repo.get_active(db, share.file_id)
-        if not file_obj:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Enlace no encontrado")
-        disposition = _download_disposition(file_obj, force=force_download)
-        url = generate_presigned_url(file_obj.storage_key, response_content_disposition=disposition)
-        return PublicFileShareOut(
-            name=file_obj.name,
-            size_bytes=file_obj.size_bytes,
-            mime_type=file_obj.mime_type,
-            download_url=url,
-        )
-
-    root_folder = folder_repo.get_active(db, share.folder_id)
-    if not root_folder:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Enlace no encontrado")
-
-    if path is None or path == root_folder.id:
-        target_folder = root_folder
-    else:
-        # `path` tiene que ser un descendiente REAL de la carpeta compartida --
-        # nunca confiar en que el cliente mande un folder_id legítimo, un
-        # atacante puede mandar cualquier UUID de carpeta ajena tratando de
-        # usar este share como llave maestra.
-        descendant_ids = set(folder_repo.get_descendant_ids(db, root_folder.id))
-        if path not in descendant_ids:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Enlace no encontrado")
-        target_folder = folder_repo.get_active(db, path)
-        if not target_folder:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Enlace no encontrado")
-
-    folders = folder_repo.get_children(db, root_folder.owner_id, target_folder.id)
-    files = file_repo.get_children(db, root_folder.owner_id, target_folder.id)
-    return PublicFolderShareOut(
-        name=target_folder.name,
-        folder_id=target_folder.id,
-        folders=folders,
-        files=files,
-    )
+    _verify_share_password(share, x_share_password)
+    return _build_share_content_response(db, share, path=path, force_download=force_download)
 
 
 @public_shares_router.get("/{token}/download/{file_id}", response_model=PublicDownloadResponse)
@@ -1194,28 +1654,13 @@ def download_public_share_file(
     token: str,
     file_id: UUID,
     force_download: bool = Query(False),
+    x_share_password: Optional[str] = Header(None, alias="X-Share-Password"),
     db: Session = Depends(get_db),
 ):
     _enforce_public_share_rate_limit(request)
     share = _get_valid_share(db, token)
-
-    if share.file_id is not None:
-        if file_id != share.file_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Enlace no encontrado")
-        file_obj = file_repo.get_active(db, file_id)
-        if not file_obj:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Enlace no encontrado")
-    else:
-        file_obj = file_repo.get_active(db, file_id)
-        if not file_obj or file_obj.folder_id is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Enlace no encontrado")
-        # El archivo tiene que pertenecer al subárbol de la carpeta compartida
-        # (la carpeta misma o un descendiente real) -- mismo chequeo anti-IDOR
-        # que en get_public_share, ahora sobre archivos en vez de carpetas.
-        allowed_folder_ids = {share.folder_id} | set(folder_repo.get_descendant_ids(db, share.folder_id))
-        if file_obj.folder_id not in allowed_folder_ids:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Enlace no encontrado")
-
+    _verify_share_password(share, x_share_password)
+    file_obj = _resolve_share_download_target(db, share, file_id)
     disposition = _download_disposition(file_obj, force=force_download)
     url = generate_presigned_url(file_obj.storage_key, response_content_disposition=disposition)
     return PublicDownloadResponse(download_url=url)

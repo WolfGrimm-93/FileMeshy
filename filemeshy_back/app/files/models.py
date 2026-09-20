@@ -80,7 +80,23 @@ class Share(Base):
 
     Revocar (`revoked_at`) es soft: la fila se conserva como historial, no se
     borra -- a diferencia del soft-delete de archivos/carpetas que sí puede
-    restaurarse, un share revocado es terminal (no hay "des-revocar")."""
+    restaurarse, un share revocado es terminal (no hay "des-revocar").
+
+    Ronda 3 (compartir granular) -- dos modos, no se mezclan:
+    - Link público anónimo (`shared_with_user_id IS NULL`, como en Hito 2):
+      accedido por `token` sin autenticación. Si tiene `password_hash`, el
+      acceso público exige esa contraseña (ver `_verify_share_password` en
+      el router). Siempre de solo lectura -- `permission` no aplica acá,
+      nadie anónimo puede escribir.
+    - Share dirigido a un usuario (`shared_with_user_id IS NOT NULL`):
+      acceso SIEMPRE autenticado (nunca por el endpoint público), y
+      `permission='edit'` habilita subir/reemplazar contenido (ver
+      `/shares/{id}/files` y `/shares/{id}/content` en el router). No
+      necesita `token` -- puede ser NULL.
+
+    El CHECK `ck_share_token_or_recipient` exige que un share sea accesible
+    por AL MENOS una vía (token o destinatario), nunca los dos NULL a la vez.
+    """
 
     __tablename__ = "shares"
     __table_args__ = (
@@ -88,9 +104,14 @@ class Share(Base):
             "(file_id IS NOT NULL)::int + (folder_id IS NOT NULL)::int = 1",
             name="ck_share_exactly_one_target",
         ),
+        CheckConstraint(
+            "(token IS NOT NULL) OR (shared_with_user_id IS NOT NULL)",
+            name="ck_share_token_or_recipient",
+        ),
         Index("ix_share_file_id", "file_id"),
         Index("ix_share_folder_id", "folder_id"),
         Index("ix_share_created_by_id", "created_by_id"),
+        Index("ix_share_shared_with_user_id", "shared_with_user_id"),
     )
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid7)
@@ -98,7 +119,16 @@ class Share(Base):
     file_id = Column(UUID(as_uuid=True), ForeignKey("files.id", ondelete="CASCADE"), nullable=True)
     folder_id = Column(UUID(as_uuid=True), ForeignKey("folders.id", ondelete="CASCADE"), nullable=True)
 
-    token = Column(String(64), nullable=False, unique=True)
+    token = Column(String(64), nullable=True, unique=True)
+
+    # Contraseña opcional del link público -- bcrypt vía
+    # app.core.security.get_password_hash/verify_password (mismo hashing que
+    # el login de usuarios). NUNCA se expone en ShareOut, solo `has_password`.
+    password_hash = Column(String(255), nullable=True)
+    # 'view' (default) o 'edit'. Solo tiene efecto real en un share dirigido
+    # (shared_with_user_id NOT NULL) -- ver docstring de la clase.
+    permission = Column(String(10), nullable=False, server_default="view")
+    shared_with_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=True)
 
     created_by_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     expires_at = Column(DateTime(timezone=True), nullable=True)
@@ -108,3 +138,4 @@ class Share(Base):
     file = relationship("File", foreign_keys=[file_id], lazy="select")
     folder = relationship("Folder", foreign_keys=[folder_id], lazy="select")
     created_by = relationship("User", foreign_keys=[created_by_id], lazy="select")
+    shared_with = relationship("User", foreign_keys=[shared_with_user_id], lazy="select")

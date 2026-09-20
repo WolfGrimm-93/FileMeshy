@@ -46,9 +46,13 @@ export interface DirectoryListing {
   breadcrumb: BreadcrumbItem[]
 }
 
+/** Permiso otorgado por un share -- los links públicos son siempre 'view' (no aplica selector ahí). */
+export type SharePermission = 'view' | 'edit'
+
 export interface ShareOut {
   id: string
-  token: string
+  /** `null` en un share dirigido a un usuario (Ronda 3) -- nunca tiene link público. */
+  token: string | null
   file_id: string | null
   folder_id: string | null
   created_by_id: string
@@ -56,6 +60,40 @@ export interface ShareOut {
   revoked_at: string | null
   created_at: string
   is_active: boolean
+  permission: SharePermission
+  /** Nunca se devuelve la password ni su hash -- solo si el share tiene una seteada. */
+  has_password: boolean
+  /** No nulo cuando el share fue dirigido a un usuario puntual (no es un link público). */
+  shared_with_user_id: string | null
+  shared_with_email: string | null
+  /**
+   * Estos tres SIEMPRE vienen `null` salvo en `GET /shares/with-me` -- ahí el
+   * backend los resuelve (nombre del recurso + email de quien compartió,
+   * ver `_share_to_out(..., with_resource_info=True)` en filemeshy_back)
+   * porque esa pantalla necesita mostrar algo más que UUIDs pelados. El
+   * backend NO tiene un `shared_by_name` -- solo el email.
+   */
+  resource_name: string | null
+  resource_type: 'file' | 'folder' | null
+  shared_by_email: string | null
+}
+
+/**
+ * Ronda 3 -- shape que usa el frontend para listar `GET /shares/with-me` en
+ * `SharedWithMePage`. El backend responde `ShareOut[]` crudo (con `id`, no
+ * `share_id`, y sin garantía de tipos en los campos opcionales de arriba) --
+ * `shares.service.ts::listSharedWithMe()` lo mapea explícitamente a este
+ * tipo, nunca se consume el `ShareOut` crudo directo en la UI.
+ */
+export interface SharedWithMeItem {
+  /** Mapeado desde `ShareOut.id` -- el backend nunca manda un campo `share_id`. */
+  share_id: string
+  resource_type: 'file' | 'folder'
+  resource_name: string
+  permission: SharePermission
+  shared_by_email: string
+  created_at: string
+  expires_at: string | null
 }
 
 export interface PublicShareFile {
