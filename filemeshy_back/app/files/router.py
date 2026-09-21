@@ -56,6 +56,7 @@ from app.files.schemas import (
     FolderDetail,
     FolderOut,
     FolderUpdate,
+    PreviewUrlResponse,
     PublicDownloadResponse,
     PublicFileShareOut,
     PublicFolderShareOut,
@@ -64,11 +65,17 @@ from app.files.schemas import (
     TagIdsUpdate,
 )
 from app.files.service import (
+    convert_office_to_pdf,
     delete_private_file,
+    detect_audio_type,
     detect_image_type,
+    detect_video_type,
     generate_presigned_url,
     is_pdf_content,
+    object_exists_private,
+    office_preview_key,
     upload_private_file,
+    upload_private_file_at_key,
 )
 from app.storage_quota.service import reserve_upload_bytes, release_upload_bytes
 from app.tags.models import Tag
@@ -85,15 +92,24 @@ public_shares_router = APIRouter()
 
 # Tipos MIME verificados por contenido real (magic bytes, ver upload_file) que
 # se sirven SIN forzar `attachment` -- permiten preview inline (imagen en
-# <img>, PDF en <iframe>). Cualquier otro tipo, SVG incluido a propósito
-# (es XML, puede llevar <script> embebido y ejecuta igual que HTML), sigue
-# forzando `attachment` como todo el resto de Hito 1.
+# <img>, PDF en <iframe>, video/audio en <video>/<audio>). Cualquier otro
+# tipo, SVG incluido a propósito (es XML, puede llevar <script> embebido y
+# ejecuta igual que HTML), sigue forzando `attachment` como todo el resto de
+# Hito 1. Video/audio (Ronda 5) agregados con el MISMO criterio: solo se
+# marcan así los formatos que `_resolve_verified_content_type` puede
+# confirmar por contenido real, nunca por el Content-Type declarado.
 INLINE_SAFE_MIME_TYPES = {
     "image/jpeg",
     "image/png",
     "image/gif",
     "image/webp",
     "application/pdf",
+    "video/mp4",
+    "video/webm",
+    "video/ogg",
+    "audio/mpeg",
+    "audio/wav",
+    "audio/ogg",
 }
 
 _VERIFIED_IMAGE_MIME_BY_FORMAT = {
@@ -102,6 +118,110 @@ _VERIFIED_IMAGE_MIME_BY_FORMAT = {
     "gif": "image/gif",
     "webp": "image/webp",
 }
+
+# Documentos Office que requieren conversión a PDF para poder previsualizarse
+# (Ronda 5) -- ver `get_file_preview`. Los legacy (.doc/.xls/.ppt, formato
+# binario OLE2 preinternet) se incluyen porque el mismo conversor los acepta
+# igual que los .docx/.xlsx/.pptx modernos (XML/zip) -- es el conversor el
+# que hace el trabajo pesado, acá solo se decide SI hace falta convertir.
+OFFICE_MIME_TYPES = {
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",  # .docx
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",        # .xlsx
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",  # .pptx
+    "application/msword",             # .doc (legacy)
+    "application/vnd.ms-excel",       # .xls (legacy)
+    "application/vnd.ms-powerpoint",  # .ppt (legacy)
+}
+
+# Mismo límite que `MAX_UPLOAD_BYTES` en `filemeshy_office_converter/server.py`
+# (hardcodeado ahí también -- son dos proyectos/imágenes Docker separados sin
+# config compartida, así que hay que mantenerlos sincronizados a mano si
+# alguno cambia). El backend tiene que rechazar ANTES de leer el objeto
+# completo de MinIO y reenviarlo -- sin este chequeo, un archivo de 63MB
+# viaja completo por la red interna en CADA pedido de preview, el conversor
+# lo rechaza igual (con su propio límite de 50MB), y como nunca se llega a
+# cachear nada el costo se repite en cada intento (hallazgo MEDIO de la
+# revisión adversarial, Ronda 5: confirmado en vivo midiendo `rx_bytes` del
+# contenedor `office_converter`).
+MAX_OFFICE_PREVIEW_SOURCE_BYTES = 50 * 1024 * 1024
+
+# Throttle de conversiones Office por USUARIO autenticado (no por IP -- acá
+# siempre hay un `current_user` real, a diferencia de los shares públicos).
+# `office_converter` es una única instancia compartida por todo el backend
+# con recursos acotados (1 CPU / 1GB / 128 pids, ver docker-compose.yml) --
+# sin este límite, cualquier usuario con `files.download` (el rol USER por
+# defecto ya lo tiene) puede pedir preview de un Office en loop y monopolizar
+# esa única instancia, degradando el preview de todos los demás (segunda
+# mitad del hallazgo MEDIO de la revisión adversarial de Ronda 5). 15
+# conversiones/minuto es generoso para uso real (nadie necesita convertir un
+# documento nuevo cada 4 segundos navegando a mano) pero acota el abuso.
+OFFICE_PREVIEW_RATE_LIMIT_MAX_CONVERSIONS = 15
+OFFICE_PREVIEW_RATE_LIMIT_WINDOW_SECONDS = 60
+
+
+def _enforce_office_preview_rate_limit(current_user: User) -> None:
+    """Throttle por usuario de las conversiones Office->PDF, reusando la
+    misma infraestructura de Redis que ya usa `/auth/login` y los shares
+    públicos (`RateLimiter`, ver `_enforce_public_share_rate_limit` más
+    abajo para el mismo patrón). Deliberadamente NO se aplica a todo
+    `GET /files/{id}/preview` -- un cache hit o un tipo ya inline-safe no le
+    cuesta nada a `office_converter`, solo el camino que realmente dispara
+    una conversión nueva debe contar contra este cupo."""
+    rl_key = f"office_preview:{current_user.id}"
+    is_allowed, rl_message = RateLimiter.check_rate_limit(
+        rl_key,
+        max_attempts=OFFICE_PREVIEW_RATE_LIMIT_MAX_CONVERSIONS,
+        lock_duration=OFFICE_PREVIEW_RATE_LIMIT_WINDOW_SECONDS,
+    )
+    if not is_allowed:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=rl_message)
+    RateLimiter.record_attempt(rl_key, window_seconds=OFFICE_PREVIEW_RATE_LIMIT_WINDOW_SECONDS)
+
+
+def _resolve_verified_content_type(content: bytes, declared_content_type: str) -> str:
+    """Determina el Content-Type REAL a persistir, verificando el contenido
+    por magic bytes -- nunca confiar en el que declaró el cliente para
+    decidir después si se sirve inline (ver `_download_disposition`). Extraído
+    de `_validate_and_store_upload`/`_create_new_file_version` (Ronda 5:
+    mismo criterio, ahora también para video/audio, en los dos puntos donde
+    se sube contenido nuevo -- versión 1 o posteriores).
+
+    El contenedor Ogg es el único caso ambiguo (`detect_video_type`/
+    `detect_audio_type` devuelven 'ogg' los dos para el mismo contenido,
+    ver su docstring en service.py) -- se respeta lo que el propio cliente
+    declaró (`video/ogg` explícito), y se asume `audio/ogg` en cualquier
+    otro caso (uso históricamente más común de ese contenedor)."""
+    detected_image = detect_image_type(content)
+    if detected_image in _VERIFIED_IMAGE_MIME_BY_FORMAT:
+        return _VERIFIED_IMAGE_MIME_BY_FORMAT[detected_image]
+
+    if is_pdf_content(content):
+        return "application/pdf"
+
+    video_fmt = detect_video_type(content)
+    if video_fmt == "mp4":
+        return "video/mp4"
+    if video_fmt == "webm":
+        return "video/webm"
+
+    audio_fmt = detect_audio_type(content)
+    if audio_fmt == "mpeg":
+        return "audio/mpeg"
+    if audio_fmt == "wav":
+        return "audio/wav"
+
+    if video_fmt == "ogg" or audio_fmt == "ogg":
+        return "video/ogg" if declared_content_type == "video/ogg" else "audio/ogg"
+
+    if declared_content_type in INLINE_SAFE_MIME_TYPES:
+        # El cliente declaró uno de los tipos "seguros para inline" pero el
+        # contenido real no lo confirma -- degradar a un tipo genérico para
+        # que _download_disposition nunca lo sirva inline solo por el nombre
+        # del Content-Type declarado (mismo vector que motivó este chequeo
+        # para imágenes, ver hallazgo crítico de Hito 2, 2026-09-06).
+        return "application/octet-stream"
+
+    return declared_content_type
 
 # Límite de profundidad de anidamiento de carpetas (raíz = profundidad 1).
 # Sin este límite, un usuario puede crear decenas de miles de carpetas
@@ -893,21 +1013,10 @@ def _validate_and_store_upload(
     # puede servir inline más adelante (ver _download_disposition) -- lo
     # declarado es texto libre controlado por el atacante. Si el contenido
     # real es una imagen (nunca SVG: es XML, puede llevar <script> embebido
-    # y ejecuta igual que HTML) o un PDF real, se sobreescribe `content_type`
-    # con el verificado.
-    detected_format = detect_image_type(content)
-    if detected_format in _VERIFIED_IMAGE_MIME_BY_FORMAT:
-        content_type = _VERIFIED_IMAGE_MIME_BY_FORMAT[detected_format]
-    elif is_pdf_content(content):
-        content_type = "application/pdf"
-    elif content_type in INLINE_SAFE_MIME_TYPES:
-        # El cliente declaró uno de los tipos "seguros para inline" pero el
-        # contenido real no lo confirma -- degradar a un tipo genérico para
-        # que _download_disposition nunca lo sirva inline solo por el nombre
-        # del Content-Type declarado (ese exacto vector permitía subir un
-        # script disfrazado de imagen, hallazgo crítico de la ronda de
-        # feedback de Hito 2, 2026-09-06).
-        content_type = "application/octet-stream"
+    # y ejecuta igual que HTML), un PDF, o video/audio real (Ronda 5), se
+    # sobreescribe `content_type` con el verificado -- ver
+    # `_resolve_verified_content_type`.
+    content_type = _resolve_verified_content_type(content, content_type)
 
     # Cuota de almacenamiento del DUEÑO real (`owner_id`) -- en un upload vía
     # share (Ronda 3) puede no ser `current_user`, ver `upload_file_via_share`.
@@ -1019,6 +1128,77 @@ def download_file(
     disposition = _download_disposition(file_obj, force=force_download)
     url = generate_presigned_url(file_obj.storage_key, response_content_disposition=disposition)
     return DownloadUrlResponse(download_url=url)
+
+
+@files_router.get("/{file_id}/preview", response_model=PreviewUrlResponse)
+def get_file_preview(
+    file_id: UUID,
+    db: Session = Depends(get_db),
+    # Mismo permiso que descargar -- una preview es, en los hechos, una
+    # forma de acceder al contenido del archivo.
+    current_user: User = Depends(has_permission(["files.download"])),
+):
+    """URL lista para embeber (`<iframe>`/`<video>`/`<img>`) del preview de
+    `file_id` (Ronda 5). Ownership requerido, mismo criterio que el resto
+    del módulo (`_get_owned_file`).
+
+    - Tipos ya servibles inline (imagen/PDF/video/audio verificados por
+      contenido real, ver `INLINE_SAFE_MIME_TYPES`): devuelve la misma URL
+      firmada que `download_file` sin forzar `attachment` -- no hace falta
+      convertir nada.
+    - Documentos Office (`OFFICE_MIME_TYPES`): convierte a PDF vía el
+      servicio aislado `office_converter` la PRIMERA vez que se pide el
+      preview de esa versión exacta del archivo, cachea el resultado en
+      MinIO (`office_preview_key`, por `file_id` + `version_number`
+      ACTUAL -- ver su docstring: una versión nueva o una restauración
+      invalida el cache viejo solo con cambiar ese número) y sirve el
+      cacheado en cualquier pedido posterior sin volver a convertir.
+
+    Si el conversor no está disponible, tarda más de lo esperado, o
+    rechaza el documento, responde 502 con un detalle apto para mostrar
+    directo al usuario -- nunca un 500 crudo (ver `convert_office_to_pdf`).
+
+    Antes de leer/reenviar nada al conversor (Ronda 5, hallazgo MEDIO de la
+    revisión adversarial): rechaza fail-fast (413) un archivo más grande
+    que `MAX_OFFICE_PREVIEW_SOURCE_BYTES`, y aplica un throttle por usuario
+    (`_enforce_office_preview_rate_limit`) -- los dos SOLO en el camino que
+    realmente dispara una conversión nueva (cache miss), nunca en un cache
+    hit ni en un tipo ya inline-safe.
+    """
+    file_obj = _get_owned_file(db, file_id, current_user, active_only=True)
+
+    if file_obj.mime_type not in OFFICE_MIME_TYPES:
+        disposition = _download_disposition(file_obj, force=False)
+        url = generate_presigned_url(file_obj.storage_key, response_content_disposition=disposition)
+        return PreviewUrlResponse(preview_url=url, mime_type=file_obj.mime_type)
+
+    # `get_max_version_number` == número de versión ACTUAL: `File.storage_key`
+    # siempre refleja la última fila de `file_versions` (ver docstring de
+    # `FileVersion`), así que el máximo ya usado ES el número vigente -- no
+    # hace falta una columna aparte en `File` para esto.
+    version_number = file_version_repo.get_max_version_number(db, file_obj.id)
+    cache_key = office_preview_key(file_obj.id, version_number)
+
+    if not object_exists_private(cache_key):
+        # Fail-fast ANTES de leer nada de MinIO ni de hablarle al conversor --
+        # ver el comentario de `MAX_OFFICE_PREVIEW_SOURCE_BYTES` más arriba.
+        if file_obj.size_bytes > MAX_OFFICE_PREVIEW_SOURCE_BYTES:
+            max_mb = MAX_OFFICE_PREVIEW_SOURCE_BYTES // (1024 * 1024)
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"El archivo supera el tamaño máximo permitido para generar una vista previa ({max_mb} MB)",
+            )
+        _enforce_office_preview_rate_limit(current_user)
+
+        content = _read_private_object(file_obj.storage_key)
+        try:
+            pdf_bytes = convert_office_to_pdf(content, file_obj.name)
+        except RuntimeError as e:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e)) from e
+        upload_private_file_at_key(cache_key, pdf_bytes, "application/pdf")
+
+    url = generate_presigned_url(cache_key)
+    return PreviewUrlResponse(preview_url=url, mime_type="application/pdf")
 
 
 @files_router.patch("/{file_id}", response_model=FileOut)
@@ -1192,14 +1372,8 @@ def _create_new_file_version(
     reemplazo) -- MISMO comportamiento de versionado y cuota en los dos
     casos, ver reporte de Ronda 4."""
     _, extension = os.path.splitext(original_filename or file_obj.name)
-    content_type = declared_content_type or "application/octet-stream"
-    detected_format = detect_image_type(content)
-    if detected_format in _VERIFIED_IMAGE_MIME_BY_FORMAT:
-        content_type = _VERIFIED_IMAGE_MIME_BY_FORMAT[detected_format]
-    elif is_pdf_content(content):
-        content_type = "application/pdf"
-    elif content_type in INLINE_SAFE_MIME_TYPES:
-        content_type = "application/octet-stream"
+    declared_content_type = declared_content_type or "application/octet-stream"
+    content_type = _resolve_verified_content_type(content, declared_content_type)
 
     reserve_upload_bytes(db, quota_owner_id, len(content))
 

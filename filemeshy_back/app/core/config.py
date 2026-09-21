@@ -106,6 +106,16 @@ class Settings(BaseSettings):
     # ===== FILES (Almacenamiento) =====
     MAX_UPLOAD_SIZE_MB: int = 100  # Nginx (filemeshy_front/nginx.conf) limita a 100MB -- nunca superar ese valor acá
 
+    # ===== OFFICE CONVERTER (Ronda 5 -- preview extendido) =====
+    # URL interna (red Docker) del servicio aislado que convierte documentos
+    # Office (docx/xlsx/pptx, + legacy doc/xls/ppt) a PDF para preview -- ver
+    # `app/files/service.py::convert_office_to_pdf`. Contrato asumido:
+    # POST {OFFICE_CONVERTER_URL}/convert (multipart, campo "file") -> bytes
+    # de PDF, o 4xx/5xx con JSON {"detail": "..."}. Nunca alcanzable desde
+    # el navegador (no tiene puerto publicado al host, igual que Postgres/
+    # Redis/MinIO internos) -- el backend es el único cliente.
+    OFFICE_CONVERTER_URL: str = "http://office_converter:8080"
+
     # ===== PROXIES DE CONFIANZA (ver app/auth/router.py::_get_real_ip) =====
     # Los headers CF-Connecting-IP/X-Real-IP los puede mandar CUALQUIER cliente
     # con el valor que quiera -- solo son confiables si la conexión TCP real

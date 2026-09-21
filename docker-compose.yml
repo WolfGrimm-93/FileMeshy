@@ -30,6 +30,14 @@ x-backend-env: &backend-env
   MINIO_PRIVATE_BUCKET: filemeshy-media-private
   BACKEND_CORS_ORIGINS: '["http://localhost:58100"]'
   DEPLOYMENT_MODE: local
+  # Servicio aislado de conversión Office->PDF para preview (Ronda 5, ver
+  # app/core/config.py::OFFICE_CONVERTER_URL). Nombre/puerto de servicio
+  # asumidos por contrato -- el servicio en sí (imagen, Dockerfile, definición
+  # dentro de `services:`) lo agrega el agente que construye
+  # `filemeshy_office_converter/` en paralelo, NO este archivo. Si ese
+  # servicio termina llamándose distinto o expone otro puerto, ajustar SOLO
+  # esta variable.
+  OFFICE_CONVERTER_URL: http://office_converter:8080
   # Vacío a propósito -- en este stack de dev nada llega al backend a través
   # de un proxy real (el frontend expone su propio puerto, 58100, pero las
   # pruebas/uso manual le pegan directo al backend en 58101). Ver
@@ -101,6 +109,12 @@ services:
         condition: service_healthy
       minio:
         condition: service_started
+      # Definido por el agente que construye `filemeshy_office_converter/`
+      # en paralelo (Ronda 5) -- ver comentario de OFFICE_CONVERTER_URL más
+      # arriba. `condition: service_started` (no `service_healthy`) porque
+      # todavía no se sabe si ese servicio va a exponer un healthcheck.
+      office_converter:
+        condition: service_started
     ports:
       - "58101:8000"
 
@@ -117,6 +131,42 @@ services:
         condition: service_healthy
       minio:
         condition: service_started
+
+  # Ronda 5: conversion Office -> PDF via LibreOffice headless, en su
+  # propio contenedor aislado (ver filemeshy_office_converter/Dockerfile
+  # para el razonamiento completo: CVE de RCE reales al parsear documentos
+  # con LibreOffice, mitigados con contenedor separado + no-root +
+  # read-only + sin capabilities + sin macros + limites de recursos, en
+  # vez de correrlo embebido como hace ownCloud sin aislar -- practica que
+  # ownCloud mismo marca "unsupported").
+  #
+  # SIN `ports:` a proposito -- solo `backend` le habla, por nombre de
+  # servicio en la red interna de compose (OFFICE_CONVERTER_URL arriba).
+  office_converter:
+    build:
+      context: ./filemeshy_office_converter
+    read_only: true
+    tmpfs:
+      # Unico lugar donde el proceso escribe: archivo de entrada, PDF de
+      # salida y perfil efimero de LibreOffice por conversion (ver
+      # server.py). Se limpia solo al final de cada request, pero igual
+      # queda acotado a tmpfs para que nada sobreviva a un reinicio ni
+      # pueda llenar disco real del host.
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # Limite de recursos -- no hay precedente en este compose (backend/
+    # celery_worker no lo tienen), lo agregamos igual como buena practica
+    # nueva especifica de este servicio: LibreOffice parseando un
+    # documento malicioso/corrupto es exactamente el tipo de proceso que
+    # puede intentar consumir toda la memoria o CPU disponible, y este
+    # contenedor no deberia poder afectar al resto del stack si eso pasa.
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 128
+    restart: unless-stopped
 
   frontend:
     build:

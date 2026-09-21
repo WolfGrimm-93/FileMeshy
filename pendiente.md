@@ -148,6 +148,62 @@ importan (`backend` Y `celery_worker`, al menos), no solo el que se probó manua
 demostrado que es fácil dar una ronda por "desplegada" cuando en realidad un servicio secundario
 sigue corriendo código viejo sin que nada lo avise.
 
+**Hecho (2026-09-20) — Ronda 5 del plan de construcción: preview extendido.** Video
+(mp4/webm/ogg) y audio (mp3/wav/ogg) se sirven inline con reproductor nativo del navegador,
+verificados por magic bytes con el mismo criterio de seguridad que ya se usaba para imágenes
+(contenido que no confirma el tipo declarado se degrada a `application/octet-stream` y fuerza
+descarga). Documentos de Office (docx/xlsx/pptx + legacy) se convierten a PDF mediante un
+**servicio Docker nuevo y aislado** (`filemeshy_office_converter/`, LibreOffice headless) y se
+cachean por `file_id`+`version_number` en MinIO (se invalidan solos al subir una versión nueva
+o restaurar una vieja, aprovechando el versionado de la Ronda 4). Antes de construir, se
+investigó cómo lo resuelven Nextcloud/Seafile/ownCloud (los tres usan LibreOffice headless; el
+enfoque maduro de la industria es aislarlo en un contenedor separado y no privilegiado, no
+embebido en el proceso principal — ownCloud incluso marca el modo embebido como "unsupported").
+
+El servicio nuevo quedó endurecido según las CVEs reales de RCE en LibreOffice
+(CVE-2024-12425/12426, 2025-0514, 2025-1080, todas parcheadas en la versión instalada): corre
+como no-root, filesystem read-only, `cap_drop: [ALL]`, `no-new-privileges`, límites de recursos
+(1 CPU/1GB/128 pids), perfil de LibreOffice con macros deshabilitadas y sin auto-fetch de
+enlaces externos, timeout de 30s con kill del process group completo, **sin puerto expuesto al
+host** — solo alcanzable desde `backend` por la red interna de Docker. Un intento real de
+SSRF/exfiltración vía documento malicioso (campos `INCLUDETEXT`/`INCLUDEPICTURE` de Word y
+`WEBSERVICE()` de Excel apuntando a servicios internos del stack) se probó en vivo contra el
+servicio real y **no se resolvió ningún link externo** — el hardening del perfil de LibreOffice
+funciona en la práctica, no solo en la teoría.
+
+Pasó por implementación (3 agentes: backend, servicio conversor, frontend) → revisión
+adversarial (2 agentes) → dos rondas de feedback por:
+
+1. **[MEDIO]** El backend no validaba el tamaño del archivo antes de reenviarlo al conversor —
+   un Office de 50-100MB viajaba completo por la red interna en cada pedido, siempre fallaba, y
+   como nunca se cacheaba el costo se repetía. Tampoco había rate-limit en el endpoint de
+   preview. Corregido: chequeo fail-fast contra `size_bytes` (confirmado en vivo: rechazo en
+   0.0076s, no el tiempo que tomaría transferir 50MB+) + rate-limit de 15 conversiones/min por
+   usuario.
+2. **[CRÍTICO]** Mismatch de contrato entre backend (`preview_url`) y frontend (leía `.url`,
+   inexistente) dejaba el preview de Office en un modal completamente en blanco, sin spinner ni
+   error — el usuario no tenía forma de saber qué pasó. Corregido y reverificado con evidencia
+   rigurosa (contenido real del PDF extraído con `pdftotext` y comparado byte a byte con el
+   documento original, no solo capturas de pantalla).
+
+Suite: 71 tests.
+
+**Deuda residual nueva, no bloqueante (defensa en profundidad):**
+
+- El servicio `office_converter` comparte la red Docker `filemeshy_default` con TODO el stack
+  (postgres, redis, minio, frontend, celery_worker) y no tiene autenticación de aplicación
+  propia — hoy nada más que `backend` lo llama, pero cualquier contenedor de esa red PODRÍA
+  hacerlo si se comprometiera por otra vía no relacionada, sin pasar por ownership/cuota/límites
+  del backend. Recomendado: red interna dedicada `backend`↔`office_converter`, y/o un secreto
+  compartido validado por el propio servicio.
+- El `<iframe>` de `PreviewModal.tsx` que embebe PDFs (nativos y convertidos) no tiene atributo
+  `sandbox` — hoy no es explotable porque el Content-Type se verifica server-side por magic
+  bytes antes de servir, pero es una capa de defensa en profundidad ausente si esa cadena
+  llegara a regresionar.
+- Rebuild periódico de la imagen de `office_converter` (con `--no-cache`/`--pull`) necesario
+  para seguir recibiendo parches de seguridad de Debian sobre LibreOffice — no alcanza con "no
+  tocar el Dockerfile", si no se reconstruye la versión se cristaliza.
+
 ### 🟠 Seguridad — importante pero no bloqueante
 
 - `SECRET_KEY` con default hardcodeado en `core/config.py:32` — mitigado por una guarda que
@@ -189,14 +245,16 @@ sigue corriendo código viejo sin que nada lo avise.
 
 - Antes de la auditoría del 19: **0% de cobertura**, sin pytest ni vitest configurado en
   ningún lado del repo.
-- Tras las Rondas 1-4: `filemeshy_back/tests/` (51 tests) + `filemeshy_back/requirements-dev.txt`
+- Tras las Rondas 1-5: `filemeshy_back/tests/` (71 tests) + `filemeshy_back/requirements-dev.txt`
   — decidir si se incorporan al repo. Cubre: auth (registro, login, 2FA end-to-end), IDOR de
   archivos, carpetas, shares y versiones (copy, tags, compartir a usuario, escalación vía
   permission=edit, restore/purga de versiones), favoritos/orden con regresión explícita del bug
   de permisos, cuota propia y bajo versionado, CRUD de etiquetas con ownership, contraseña en
-  links públicos, backfill de versiones vía migración, y regresión de los 3 fixes de seguridad
-  más fáciles de reproducir automatizadamente (spoofing de IP, DoS 2FA, flag de registro).
-- Última corrida (contra la imagen final reconstruida, backend Y `celery_worker`): **51
+  links públicos, backfill de versiones vía migración, preview de video/audio por magic bytes,
+  cache/invalidación/tamaño/rate-limit de preview de Office, y regresión de los 3 fixes de
+  seguridad más fáciles de reproducir automatizadamente (spoofing de IP, DoS 2FA, flag de
+  registro).
+- Última corrida (contra la imagen final reconstruida, backend Y `celery_worker`): **71
   passed, 0 failed**, sin flakiness.
 - Falta: tests de frontend (cero — la Ronda 1 se verificó visualmente a mano con Playwright
   ad-hoc, no queda como suite automatizada), tests de aislamiento multi-tenant, y CI que
@@ -217,6 +275,9 @@ específicos (además del link público de siempre); protección por contraseña
 La única pieza de "colaboración" que sigue sin cubrir es comentar sobre un archivo (no
 planificado en ninguna ronda todavía).
 
+**Resuelto en Ronda 5 (2026-09-20):** vista previa de video y audio (reproducción nativa) y de
+documentos de Office (conversión a PDF vía servicio aislado) — antes solo imagen/PDF.
+
 Gaps que siguen abiertos, ver roadmap de rondas al final del archivo:
 
 1. Sin backups automáticos de Postgres/MinIO — cero rastro en todo el repo, ni siquiera un
@@ -231,11 +292,9 @@ Gaps que siguen abiertos, ver roadmap de rondas al final del archivo:
 4. Búsqueda solo por nombre, no por contenido de archivo. Sin filtros avanzados (tipo, fecha,
    tamaño) en la página de Archivos, aunque el componente ya existe y se usa en otros módulos.
    Búsqueda por contenido + OCR planificados: Ronda 6 (confirmado en alcance con el usuario).
-5. Vista previa solo de imagen/PDF — video, audio y documentos de Office fuerzan descarga.
-   Planificado: Ronda 5.
-6. Formato de error inconsistente entre excepciones tipadas (`{status,message,data}`) y
+5. Formato de error inconsistente entre excepciones tipadas (`{status,message,data}`) y
    errores de validación Pydantic (`{"detail":[...]}`) — dos formatos conviven en la API.
-7. Sin escaneo de virus/malware. Planificado: Ronda 7.
+6. Sin escaneo de virus/malware. Planificado: Ronda 7.
 
 ### 🏗️ Estándares técnicos — gaps priorizados (vs. `docs/estandares-cliente-servidor-2026/`)
 
@@ -275,12 +334,12 @@ Gaps que siguen abiertos, ver roadmap de rondas al final del archivo:
   `audit-test@wolfgrimm.local` — este último permanentemente bloqueado para login, ver bug
   puntual más abajo) — no es producción. Se puede tirar abajo con `docker compose down -v`
   cuando se quiera.
-- Rondas 1 (`d91a47f`), 2 (`61ca9f1`) y 3 (`9b08c35`) commiteadas, 2026-09-20. Todo el código
-  de la Ronda 4 (backend: `FileVersion` + endpoints nuevos + backfill; frontend:
-  `FileVersionsModal`) está en el working tree, sin commitear todavía — pendiente confirmación
-  explícita del usuario antes de commitear.
+- Rondas 1 (`d91a47f`), 2 (`61ca9f1`), 3 (`9b08c35`) y 4 (`7e9feba`) commiteadas, 2026-09-20.
+  Todo el código de la Ronda 5 (backend: preview de video/audio/Office; servicio nuevo
+  `filemeshy_office_converter/`; frontend: `PreviewModal` extendido) está en el working tree,
+  sin commitear todavía — pendiente confirmación explícita del usuario antes de commitear.
 - El stack de prueba se cayó por reinicios del host varias veces durante el trabajo de las
-  Rondas 2 a 4 — siempre se recuperó sin pérdida de código (todo en disco) ni de datos de
+  Rondas 2 a 5 — siempre se recuperó sin pérdida de código (todo en disco) ni de datos de
   prueba (volumen de Postgres persistente); solo hizo falta recrear el contenedor backend con
   `--force-recreate` (un error transitorio de permisos en el primer arranque en bloque tras
   cada reinicio, no un bug real).
@@ -295,7 +354,7 @@ Aprobado con el usuario el 2026-09-20. Cada ronda se diseña en detalle recién 
 | 2 (hecho) | Etiquetas (tags many-to-many) — **completa** |
 | 3 (hecho) | Compartir granular (contraseña, permisos lectura/escritura, compartir a usuario específico) + notificaciones de "te compartieron algo" — **completa** |
 | 4 (hecho) | Versionado de archivos (historial, restaurar versión anterior) — **completa** |
-| 5 | Preview extendido (video, audio, documentos de Office) |
+| 5 (hecho) | Preview extendido (video, audio, documentos de Office) — **completa** |
 | 6 | Búsqueda por contenido + OCR |
 | 7 | Antivirus (ClamAV) en upload + backups automáticos de Postgres/MinIO |
 | 8 | UI de administración de tenants |
@@ -306,17 +365,20 @@ en tiempo real.
 
 ### Semáforo
 
-**Rondas 1 a 4 completas y verificadas en vivo** (incluida verificación visual en navegador
-real, y en Rondas 3-4, reproducción de escenarios de punta a punta por el propio Auditor
-Final). Listo para uso interno de un solo usuario/equipo pequeño en red cerrada — los 6
-bloqueadores de seguridad de la auditoría del 19 están resueltos, y el Drive ganó favoritos,
-orden real, copiar, cuota visible, etiquetas, compartir granular (contraseña, permisos,
-usuarios específicos) con notificaciones reales, y versionado de archivos con historial
-completo. **Todavía no listo para exposición pública a Internet sin decisión** sobre 3 deudas
-residuales de seguridad (todas confirmadas no explotables hoy, pero dependen de configuración
-de producción que este repo de trabajo no controla directamente o de defensa en profundidad
-pendiente): `TRUSTED_PROXY_IPS` vacío en producción real, el balde compartido de rate-limit en
-shares públicos, y la falta de rate-limit en los endpoints autenticados de shares dirigidos.
+**Rondas 1 a 5 completas y verificadas en vivo** (incluida verificación visual en navegador
+real, y en Rondas 3, 4 y 5, reproducción de escenarios de punta a punta por el propio Auditor
+Final, incluida verificación de contenido real —no solo capturas— en la Ronda 5). Listo para
+uso interno de un solo usuario/equipo pequeño en red cerrada — los 6 bloqueadores de seguridad
+de la auditoría del 19 están resueltos, y el Drive ganó favoritos, orden real, copiar, cuota
+visible, etiquetas, compartir granular (contraseña, permisos, usuarios específicos) con
+notificaciones reales, versionado de archivos con historial completo, y preview de
+video/audio/Office. **Todavía no listo para exposición pública a Internet sin decisión** sobre
+las deudas residuales de seguridad marcadas arriba en cada ronda (todas confirmadas no
+explotables hoy, pero dependen de configuración de producción que este repo de trabajo no
+controla directamente o de defensa en profundidad pendiente): `TRUSTED_PROXY_IPS` vacío en
+producción real, el balde compartido de rate-limit en shares públicos, la falta de rate-limit
+en los endpoints autenticados de shares dirigidos, y la red no dedicada del nuevo servicio
+`office_converter`.
 
 **Lección de proceso confirmada en Ronda 4** (ya aplicada, dejar como recordatorio para
 rondas futuras y para cualquier deploy real): reconstruir solo `backend` no alcanza cuando el

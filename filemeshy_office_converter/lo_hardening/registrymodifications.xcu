@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Perfil de usuario "semilla" de LibreOffice para conversiones headless.
+
+  Este archivo se copia (Dockerfile) a /opt/lo_profile_seed/user/ y, en
+  runtime, server.py copia ese directorio completo a un perfil efimero
+  distinto (/tmp/lo_profile_<uuid>) para CADA conversion -- nunca se
+  reutiliza el mismo perfil entre requests, asi que no hay estado que
+  persista ni se filtre entre documentos de distintos usuarios.
+
+  Valores tomados del mismo patron de hardening documentado publicamente
+  para conversion headless de LibreOffice en servicios de terceros (ver
+  docling-project/docling PR #4228, "harden the LibreOffice profile"):
+
+  - MacroSecurityLevel=3 (Very High) + DisableMacrosExecution=true:
+    bloquea la ejecucion de macros de Basic embebidas en el documento,
+    incluyendo macros "Auto" que se disparan solo con abrir el archivo
+    (el vector clasico de un .docx/.xlsm malicioso). Con nivel 3 y sin
+    ubicaciones de confianza configuradas, NINGUNA macro sin firmar corre,
+    firmada o no (no hay certificados de confianza cargados en este
+    perfil).
+
+  - Writer/Calc Content/Update/Link=0: desactiva la actualizacion
+    automatica de enlaces externos/DDE al abrir el documento -- sin esto,
+    un documento malicioso con un campo de enlace externo podria disparar
+    una peticion de red saliente (SSRF) o exfiltrar datos via URL
+    construida con valores de entorno/INI (la clase de bug de
+    CVE-2024-12426).
+
+  IMPORTANTE -- lo que esto NO cubre: los CVE citados en el pedido
+  (2024-12425/12426, 2025-0514, 2025-1080) son bugs de parseo/logica en el
+  propio LibreOffice, no (solo) de macros -- esta config es defensa en
+  profundidad contra la clase "macro" y "auto-fetch de enlaces", pero la
+  mitigacion real contra un 0-day de parseo es la que ya provee el
+  Dockerfile/compose: contenedor separado, no privilegiado, sin red de
+  entrada, cap_drop ALL, no-new-privileges, limites de recursos, y
+  mantener el paquete `libreoffice-*` de Debian actualizado en cada build
+  (Debian backportea fixes de seguridad a la misma linea de version --
+  confirmado en el security tracker de Debian para estos 4 CVE).
+-->
+<oor:items
+ xmlns:oor="http://openoffice.org/2001/registry"
+ xmlns:xs="http://www.w3.org/2001/XMLSchema"
+ xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+ <item oor:path="/org.openoffice.Office.Common/Security/Scripting">
+  <prop oor:name="MacroSecurityLevel" oor:op="fuse">
+   <value>3</value>
+  </prop>
+ </item>
+ <item oor:path="/org.openoffice.Office.Common/Security/Scripting">
+  <prop oor:name="DisableMacrosExecution" oor:op="fuse">
+   <value>true</value>
+  </prop>
+ </item>
+ <item oor:path="/org.openoffice.Office.Writer/Content/Update">
+  <prop oor:name="Link" oor:op="fuse">
+   <value>0</value>
+  </prop>
+ </item>
+ <item oor:path="/org.openoffice.Office.Calc/Content/Update">
+  <prop oor:name="Link" oor:op="fuse">
+   <value>0</value>
+  </prop>
+ </item>
+</oor:items>

@@ -616,3 +616,192 @@ def is_pdf_content(content: bytes) -> bool:
     if not content:
         return False
     return b"%PDF-" in content[:1024]
+
+
+# ---------------------------------------------------------------------------
+# Validación de video/audio por magic bytes (Ronda 5: preview extendido)
+# ---------------------------------------------------------------------------
+# Mismo criterio que la validación de imágenes de arriba: nunca confiar en el
+# nombre/Content-Type declarado por el cliente para decidir si un archivo se
+# sirve inline -- se verifica el contenido real.
+#
+# El contenedor Ogg (magic bytes "OggS") es compartido por video/ogg y
+# audio/ogg -- distinguirlos de verdad requeriría parsear los streams
+# internos del contenedor (qué códec llevan los packets), fuera de alcance
+# acá. `detect_video_type`/`detect_audio_type` devuelven ambos 'ogg' en ese
+# caso -- el caller (ver `_resolve_verified_content_type` en el router)
+# decide cuál de los dos mime types final usar según lo que el propio
+# usuario declaró al subir.
+
+def detect_video_type(content: bytes) -> str | None:
+    """Detecta contenedor de video por magic bytes.
+
+    Returns:
+        'mp4' (caja "ftyp" en offset 4), 'webm' (magic bytes EBML
+        1A 45 DF A3), 'ogg' (magic bytes "OggS", ambiguo con audio/ogg,
+        ver docstring del módulo), o None si no se reconoce.
+    """
+    if not content or len(content) < 12:
+        return None
+    if content[4:8] == b'ftyp':
+        return 'mp4'
+    if content[:4] == b'\x1a\x45\xdf\xa3':
+        return 'webm'
+    if content[:4] == b'OggS':
+        return 'ogg'
+    return None
+
+
+def detect_audio_type(content: bytes) -> str | None:
+    """Detecta formato/contenedor de audio por magic bytes.
+
+    Returns:
+        'mpeg' (mp3 -- header ID3 o frame sync FF FB/FF F3/FF F2), 'wav'
+        (RIFF + "WAVE" en offset 8), 'ogg' (magic bytes "OggS", ambiguo con
+        video/ogg, ver docstring del módulo), o None si no se reconoce.
+    """
+    if not content or len(content) < 12:
+        return None
+    if content[:3] == b'ID3':
+        return 'mpeg'
+    if content[:2] in (b'\xff\xfb', b'\xff\xf3', b'\xff\xf2'):
+        return 'mpeg'
+    if content[:4] == b'RIFF' and content[8:12] == b'WAVE':
+        return 'wav'
+    if content[:4] == b'OggS':
+        return 'ogg'
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Conversión de documentos Office a PDF (Ronda 5: preview extendido)
+# ---------------------------------------------------------------------------
+# El backend NUNCA convierte Office a PDF en proceso -- delega a un servicio
+# Docker aislado (`filemeshy_office_converter/`, construido en paralelo por
+# otro agente de esta misma ronda) vía HTTP interno. Aislar la conversión en
+# su propio contenedor evita correr LibreOffice (o lo que sea que use ese
+# servicio) con los mismos privilegios que el backend -- un documento Office
+# malicioso que explote el conversor queda contenido ahí, no en el proceso
+# que tiene las credenciales de MinIO/Postgres.
+#
+# Contrato asumido con ese servicio (ver `settings.OFFICE_CONVERTER_URL`):
+#   POST {OFFICE_CONVERTER_URL}/convert   (multipart, campo "file")
+#   200  -> body = bytes del PDF convertido (Content-Type: application/pdf)
+#   4xx/5xx -> body = JSON {"detail": "..."} con el motivo del rechazo
+#              (documento corrupto, formato no soportado, timeout interno)
+# Si el contrato real termina siendo distinto, ajustar SOLO esta función.
+
+OFFICE_CONVERTER_TIMEOUT_SECONDS = 35  # el conversor timeoutea a ~30s, más margen
+
+
+def convert_office_to_pdf(content: bytes, filename: str) -> bytes:
+    """Convierte un documento Office a PDF llamando al servicio aislado
+    `office_converter`. Nunca deja pasar una excepción cruda de red/timeout
+    al caller -- siempre `RuntimeError` con un mensaje apto para mostrar tal
+    cual al usuario final (ver Ronda 5, contrato pedido: "No se pudo generar
+    la vista previa", nunca un 500 crudo).
+    """
+    import httpx
+
+    from app.core.config import settings
+
+    url = f"{settings.OFFICE_CONVERTER_URL.rstrip('/')}/convert"
+
+    try:
+        response = httpx.post(
+            url,
+            files={"file": (filename, content)},
+            timeout=OFFICE_CONVERTER_TIMEOUT_SECONDS,
+        )
+    except httpx.TimeoutException as e:
+        logger.error(f"[OfficeConverter] Timeout convirtiendo '{filename}': {e}")
+        raise RuntimeError("No se pudo generar la vista previa") from e
+    except httpx.HTTPError as e:
+        logger.error(f"[OfficeConverter] Error de conexión convirtiendo '{filename}': {e}")
+        raise RuntimeError("No se pudo generar la vista previa") from e
+
+    if response.status_code >= 400:
+        detail = None
+        try:
+            detail = response.json().get("detail")
+        except Exception:
+            pass
+        logger.error(
+            f"[OfficeConverter] Conversión rechazada para '{filename}' "
+            f"({response.status_code}): {detail}"
+        )
+        raise RuntimeError("No se pudo generar la vista previa")
+
+    return response.content
+
+
+# ---------------------------------------------------------------------------
+# Cache de previews (Office -> PDF) en el bucket privado (Ronda 5)
+# ---------------------------------------------------------------------------
+# A diferencia de `upload_private_file` (key con uuid aleatorio, pensada para
+# blobs de archivo), el cache de preview necesita una key DETERMINISTA
+# (file_id + version_number) para poder chequear "¿ya existe?" antes de
+# volver a convertir.
+
+def office_preview_key(file_id, version_number: int) -> str:
+    """Key determinista del PDF cacheado de la preview de `file_id` en su
+    `version_number` ACTUAL -- si se sube una versión nueva o se restaura
+    una vieja (Ronda 4, `File.storage_key` cambia pero el número de versión
+    avanza igual, ver `_create_new_file_version`/`restore_file_version`),
+    el número cambia y esta key deja de coincidir con ninguna cacheada
+    antes -- el cache de la versión vieja queda huérfano (nunca se sirve por
+    error) sin necesidad de invalidarlo a mano."""
+    return f"previews/{file_id}/{version_number}.pdf"
+
+
+def object_exists_private(key: str) -> bool:
+    """True si `key` ya existe en el bucket privado (HEAD, sin traer el
+    contenido) -- usado para decidir si hace falta convertir de nuevo o si
+    ya hay un PDF cacheado servible tal cual."""
+    from app.core.config import settings
+
+    client = _get_client()
+    if not client:
+        return False
+    try:
+        client.head_object(Bucket=settings.MINIO_PRIVATE_BUCKET, Key=key.lstrip("/"))
+        return True
+    except Exception:
+        return False
+
+
+def upload_private_file_at_key(key: str, content: bytes, content_type: str) -> str:
+    """Sube contenido al bucket PRIVADO en una key EXACTA (a diferencia de
+    `upload_private_file`, que siempre genera una key nueva con uuid) --
+    necesario para el cache de previews, donde la key tiene que ser
+    predecible (`office_preview_key`) para poder chequear existencia antes
+    de reconvertir. Sobreescribe silenciosamente si ya existía (no debería
+    pasar en la práctica: el caller ya chequeó `object_exists_private`
+    antes de convertir, ver `get_file_preview`).
+
+    Raises:
+        RuntimeError si MinIO no está disponible o la subida falla.
+    """
+    from app.core.config import settings
+
+    client = _get_client()
+    if not client:
+        raise RuntimeError("El servicio de almacenamiento (MinIO) no está configurado")
+
+    bucket = settings.MINIO_PRIVATE_BUCKET
+    _ensure_private_bucket(bucket)
+    clean_key = key.lstrip("/")
+
+    try:
+        client.upload_fileobj(
+            io.BytesIO(content),
+            bucket,
+            clean_key,
+            ExtraArgs={"ContentType": content_type},
+        )
+    except Exception as e:
+        logger.error(f"[Storage] Error subiendo preview cacheada a {bucket}/{clean_key}: {e}")
+        raise RuntimeError(f"Error al subir archivo: {e}")
+
+    logger.info(f"[Storage] Subido (preview cacheada): {bucket}/{clean_key}")
+    return clean_key

@@ -30,8 +30,21 @@ import { sharesService } from '../services/shares.service'
 import PreviewModal, { type PreviewTarget } from '../components/PreviewModal'
 import type { FileOut, PublicShareResponse } from '../types'
 
+// Ronda 5: video y audio se agregan acá porque solo dependen de la URL de
+// descarga presignada que ya devuelve el backend (sin auth extra, igual que
+// imagen/PDF) -- Office queda afuera porque su preview requiere el endpoint
+// autenticado `GET /files/{id}/preview` (`getOfficePreviewUrl`), que no
+// existe en el flujo público sin sesión.
+const PREVIEWABLE_VIDEO_MIME_TYPES = new Set(['video/mp4', 'video/webm', 'video/ogg'])
+const PREVIEWABLE_AUDIO_MIME_TYPES = new Set(['audio/mpeg', 'audio/wav', 'audio/ogg'])
+
 function isPreviewable(mimeType: string): boolean {
-  return mimeType.startsWith('image/') || mimeType === 'application/pdf'
+  return (
+    mimeType.startsWith('image/') ||
+    mimeType === 'application/pdf' ||
+    PREVIEWABLE_VIDEO_MIME_TYPES.has(mimeType) ||
+    PREVIEWABLE_AUDIO_MIME_TYPES.has(mimeType)
+  )
 }
 
 type FetchOutcome = 'ok' | 'unauthorized' | 'error'

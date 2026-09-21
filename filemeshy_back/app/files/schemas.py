@@ -89,6 +89,19 @@ class DownloadUrlResponse(BaseModel):
     download_url: str
 
 
+class PreviewUrlResponse(BaseModel):
+    """Respuesta de `GET /files/{id}/preview` (Ronda 5: preview extendido).
+
+    Para tipos ya servibles inline (imagen, PDF, video, audio -- ver
+    `INLINE_SAFE_MIME_TYPES`), `preview_url` es la misma URL firmada de
+    descarga normal y `mime_type` es el real del archivo. Para documentos
+    Office, `preview_url` apunta al PDF convertido/cacheado y `mime_type`
+    es siempre `application/pdf` -- el frontend puede embeber la URL igual
+    en los dos casos sin ramificar por tipo."""
+    preview_url: str
+    mime_type: str
+
+
 class CopyRequest(BaseModel):
     """Body opcional de `POST /files/{id}/copy` y `POST /folders/{id}/copy`.
 

@@ -325,7 +325,7 @@ export default function FilesPage() {
     try {
       const url = await filesService.getDownloadUrl(row.id)
       const file = row.raw as FileOut
-      setPreviewTarget({ name: row.name, mimeType: file.mime_type, downloadUrl: url })
+      setPreviewTarget({ name: row.name, mimeType: file.mime_type, downloadUrl: url, fileId: row.id })
     } catch (error: unknown) {
       toast.error(extractErrorMessage(error, 'Error al abrir la vista previa'))
     }

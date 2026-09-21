@@ -157,6 +157,29 @@ class FilesService {
     )
     return response.data
   }
+
+  /**
+   * Ronda 5 -- pide la URL de preview (PDF ya convertido) de un documento de
+   * Office (docx/xlsx/pptx). La conversión no está cacheada la primera vez,
+   * así que el request puede tardar unos segundos: se usa un timeout generoso
+   * del lado del cliente (bastante mayor a un GET normal) en vez del default
+   * de `axiosInstance`, para no cortar la espera mientras el backend todavía
+   * está convirtiendo.
+   *
+   * Contrato real confirmado por red contra el backend (revisión adversarial,
+   * 2026-09-20): `GET /files/{id}/preview` devuelve `PreviewUrlResponse` =
+   * `{ preview_url: string, mime_type: string }` -- OJO, es `preview_url`,
+   * no `url` (bug detectado en la ronda de feedback: leer el campo
+   * equivocado deja `undefined` pasar silenciosamente como si fuera una URL
+   * válida más adelante en `PreviewModal`).
+   */
+  async getOfficePreviewUrl(fileId: string): Promise<string> {
+    const response = await axiosInstance.get<{ preview_url: string; mime_type: string }>(
+      `${this.basePath}/${fileId}/preview`,
+      { timeout: 40_000 }
+    )
+    return response.data.preview_url
+  }
 }
 
 export const filesService = new FilesService()
