@@ -262,24 +262,18 @@ def purge_deleted_files_and_folders(days: int = 30):
         clave = schema or "public"
         try:
             with get_worker_db(schema_name=schema) as db:
-                # Import de todos los modelos referenciados por relationship()
-                # STRING desde la cadena File/Folder -> User -> Role (y lo que
-                # Role/User encadenen), por su efecto de lado de registrarlos en
-                # el registry de SQLAlchemy antes de la primera query. A
-                # diferencia del proceso backend (que importa esto transitivamente
-                # vía app.main -> api_router), este worker Celery solo importa los
-                # módulos de app/worker/tasks/ -- sin esto, configure_mappers()
-                # revienta con "expression 'User' failed to locate a name" (y
-                # luego 'Role', encadenado) apenas se hace la primera query a
-                # File/Folder en este proceso. Mismo listado de imports que usa
-                # migrations/env.py para el mismo propósito ("Import all models
-                # to register them with Base.metadata") -- reproducido y
-                # confirmado durante la verificación de esta tarea (2026-09-06).
-                from app.auth.models import Session, PasswordResetSession  # noqa: F401
-                from app.users.models import User  # noqa: F401
-                from app.access_control.models import (  # noqa: F401
-                    Role, Permission, RolePermission, UserPermissionOverride,
-                )
+                # El import defensivo de "todos los modelos" que vivía acá
+                # (para que configure_mappers() no reviente con las
+                # relaciones ORM que resuelven "User"/"Role"/etc. como
+                # string) quedó CENTRALIZADO en
+                # `app.worker.celery_app._register_all_orm_models()` (corre
+                # solo, a nivel de módulo y vía la señal
+                # `worker_process_init`, antes de que cualquier tarea
+                # corra) -- ver su docstring para el bug real de producción
+                # (Ronda 6, 2026-09-21) que motivó centralizarlo: tenerlo
+                # duplicado ad-hoc en cada tarea no alcanzaba, porque si
+                # OTRA tarea sin el workaround corría primero en el mismo
+                # proceso, el registry quedaba roto para siempre igual.
                 from app.files.models import File, FileVersion, Folder
                 from app.files.repository import file_version_repo
                 from app.files.service import delete_private_file

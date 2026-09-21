@@ -43,12 +43,19 @@ from app.core.config import settings
 from app.core.database import SessionLocal, get_db
 from app.core.security import get_password_hash, verify_password
 from app.files.models import File as FileModel, FileVersion, Folder, Share
-from app.files.repository import file_repo, file_version_repo, folder_repo, share_repo
+from app.files.repository import (
+    file_content_index_repo,
+    file_repo,
+    file_version_repo,
+    folder_repo,
+    share_repo,
+)
 from app.files.schemas import (
     BreadcrumbItem,
     CopyRequest,
     DirectoryListing,
     DownloadUrlResponse,
+    FileIndexStatusOut,
     FileOut,
     FileUpdate,
     FileVersionOut,
@@ -567,6 +574,31 @@ def _read_private_object(storage_key: str) -> bytes:
         ) from e
 
 
+def _enqueue_content_indexing(file_id: UUID) -> None:
+    """Encola la extracción de texto/OCR del contenido ACTUAL de `file_id`
+    (Ronda 6: búsqueda por contenido) -- best-effort y asíncrono, nunca
+    bloquea la respuesta del endpoint que la dispara ni la revienta si
+    Celery/Redis no están disponibles en este momento (mismo criterio que
+    `_notify_share_recipient`: encolar una tarea no es parte del contrato
+    síncrono de estos endpoints). Import diferido -- mismo motivo que el
+    resto del módulo evita imports de `app.worker.tasks.*` a nivel de
+    archivo (ciclo de import entre `files` y `worker.tasks`).
+
+    Se llama en los CUATRO puntos donde el contenido de un archivo puede
+    cambiar: subida inicial (`_validate_and_store_upload`, cubre tanto
+    `upload_file` como `upload_file_via_share`), versión nueva
+    (`_create_new_file_version`, cubre tanto `upload_file_version` como
+    `replace_file_via_share`), y restauración de una versión vieja
+    (`restore_file_version`)."""
+    try:
+        from app.core.database import tenant_schema_ctx
+        from app.worker.tasks.indexing import index_file_content
+
+        index_file_content.delay(tenant_schema_ctx.get(), str(file_id))
+    except Exception:
+        logger.warning(f"No se pudo encolar la indexación de contenido de {file_id}", exc_info=True)
+
+
 def _copy_with_suffix(name: str, *, same_location: bool) -> str:
     """Nombre de una copia: si el destino es el mismo lugar que el original
     lleva el sufijo " (copia)" (para no chocar con el nombre existente); si
@@ -1065,6 +1097,9 @@ def _validate_and_store_upload(
     )
     db.commit()
     db.refresh(db_file)
+    # Ronda 6: encolar indexación de contenido/OCR -- asíncrono, no bloquea
+    # esta respuesta (ver docstring de `_enqueue_content_indexing`).
+    _enqueue_content_indexing(db_file.id)
     return db_file
 
 
@@ -1405,6 +1440,9 @@ def _create_new_file_version(
     file_obj.mime_type = content_type
     db.commit()
     db.refresh(file_obj)
+    # Ronda 6: el contenido cambió (versión nueva) -- re-encolar indexación,
+    # reemplaza cualquier extracción vieja (ver `file_content_index_repo.upsert`).
+    _enqueue_content_indexing(file_obj.id)
     return file_obj
 
 
@@ -1488,6 +1526,24 @@ def list_file_versions(
     return [_file_version_to_out(v) for v in versions]
 
 
+@files_router.get("/{file_id}/index-status", response_model=FileIndexStatusOut)
+def get_file_index_status(
+    file_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(has_permission(["files.view"])),
+):
+    """Estado de la extracción de texto/OCR de `file_id` (Ronda 6) -- para
+    que el frontend pueda mostrar "todavía no indexado" mientras la tarea
+    async corre. Sin fila en `file_content_index` todavía (tarea recién
+    encolada, o nunca se disparó) se responde 'pending' igual que si la fila
+    existiera con ese status -- ver docstring de `FileIndexStatusOut`."""
+    file_obj = _get_owned_file(db, file_id, current_user, active_only=True)
+    record = file_content_index_repo.get_by_file_id(db, file_obj.id)
+    if record is None:
+        return FileIndexStatusOut(status="pending", indexed_at=None)
+    return FileIndexStatusOut(status=record.extraction_status, indexed_at=record.indexed_at)
+
+
 @files_router.post("/{file_id}/versions/{version_id}/restore", response_model=FileOut)
 def restore_file_version(
     file_id: UUID,
@@ -1530,6 +1586,9 @@ def restore_file_version(
     file_obj.mime_type = version.mime_type
     db.commit()
     db.refresh(file_obj)
+    # Ronda 6: el contenido "actual" cambió (aunque el blob ya existía) --
+    # re-encolar indexación por el mismo criterio que una versión nueva.
+    _enqueue_content_indexing(file_obj.id)
     return file_obj
 
 

@@ -27,7 +27,7 @@ from app.configuration.models import (
     SystemConfiguration, UserPreferences, SecurityPolicies,
 )
 from app.notifications.models import Notification
-from app.files.models import Folder, File, Share, FileVersion
+from app.files.models import Folder, File, Share, FileVersion, FileContentIndex
 from app.storage_quota.models import UserStorageQuota
 from app.tags.models import Tag, file_tags, folder_tags
 

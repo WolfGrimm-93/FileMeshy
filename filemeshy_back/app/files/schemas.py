@@ -72,6 +72,12 @@ class FileOut(BaseModel):
     deleted_at: Optional[datetime] = None
     is_favorite: bool = False
     tags: List[TagOut] = Field(default_factory=list)
+    # Solo se setea en resultados de `GET /files?q=...` (Ronda 6: búsqueda
+    # por contenido + OCR) -- `None` en cualquier otra respuesta que reuse
+    # este mismo schema (subida, listado normal, detalle, etc.). Ver
+    # `CRUDFile.search` en repository.py, que anota este valor en memoria
+    # sobre cada `File` ORM antes de serializar.
+    matched_by: Optional[Literal["name", "content", "both"]] = None
 
     class Config:
         from_attributes = True
@@ -148,6 +154,19 @@ class FileVersionOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+# ==================== Índice de contenido (Ronda 6) ====================
+
+class FileIndexStatusOut(BaseModel):
+    """Respuesta de `GET /files/{id}/index-status` -- estado de la
+    extracción de texto/OCR de un archivo (Ronda 6: búsqueda por contenido).
+    `'pending'` cubre TANTO "la tarea está encolada/corriendo" COMO "todavía
+    no existe ninguna fila de índice para este archivo" -- desde la
+    perspectiva del cliente son el mismo estado ("todavía no puedo buscar
+    por contenido en este archivo"), no hace falta distinguirlos."""
+    status: Literal["pending", "done", "failed", "unsupported"] = "pending"
+    indexed_at: Optional[datetime] = None
 
 
 # ==================== Listado de directorio ====================

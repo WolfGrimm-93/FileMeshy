@@ -58,6 +58,7 @@ import PreviewModal, { type PreviewTarget } from '../components/PreviewModal'
 import TagsModal, { type TagsTarget } from '../components/TagsModal'
 import FileVersionsModal, { type FileVersionsTarget } from '../components/FileVersionsModal'
 import TagChips from '../components/TagChips'
+import ContentMatchBadge from '../components/ContentMatchBadge'
 import FileGridView from '../components/FileGridView'
 import type { DirectoryListing, FileOut, FolderOut } from '../types'
 
@@ -539,6 +540,12 @@ export default function FilesPage() {
             {Boolean(row.raw?.is_favorite) && (
               <Star className="size-3.5 shrink-0 fill-current text-yellow-500" aria-label="Favorito" />
             )}
+            {row.type === 'file' && (
+              <ContentMatchBadge
+                matchedBy={(row.raw as FileOut).matched_by}
+                hasActiveSearch={Boolean(debouncedSearch)}
+              />
+            )}
           </div>
           <TagChips tags={row.raw.tags ?? []} className="pl-6" />
         </div>
@@ -658,7 +665,7 @@ export default function FilesPage() {
         enableSearch
         searchValue={searchTerm}
         onSearchChange={setSearchTerm}
-        searchPlaceholder="Buscar archivos y carpetas por nombre..."
+        searchPlaceholder="Buscar archivos y carpetas por nombre o contenido..."
         extraFilters={
           <div className="flex items-center gap-2 flex-wrap">
             {/* Orden: campo + dirección. Se persiste igual que el modo de vista. */}
@@ -763,6 +770,7 @@ export default function FilesPage() {
               rows={rows}
               size={viewMode === 'grid-lg' ? 'lg' : 'md'}
               showTrash={showTrash}
+              hasActiveSearch={Boolean(debouncedSearch)}
               onNavigate={handleNavigate}
               onPreview={handlePreview}
               buildActions={buildActions}

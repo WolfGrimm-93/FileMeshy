@@ -33,6 +33,15 @@ export interface FileOut {
   deleted_at: string | null
   is_favorite: boolean
   tags: TagOut[]
+  /**
+   * Ronda 6 -- solo viene con `GET /files?q=...` y una búsqueda activa, para
+   * distinguir un resultado que matcheó por CONTENIDO del archivo (no solo
+   * por nombre) y así no confundir al usuario con un nombre que no tiene
+   * relación aparente con lo buscado. `undefined`/`null` cuando no hay
+   * búsqueda activa o el backend todavía no lo soporta -- la UI debe
+   * degradar bien en ese caso (sin mostrar ningún indicador).
+   */
+  matched_by?: 'name' | 'content' | 'both'
 }
 
 /**

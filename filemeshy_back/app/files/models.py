@@ -9,6 +9,7 @@ esquema de columnas/relaciones.
 from sqlalchemy import (
     Column,
     String,
+    Text,
     DateTime,
     BigInteger,
     Integer,
@@ -151,6 +152,50 @@ class FileVersion(Base):
 
     file = relationship("File", back_populates="versions", foreign_keys=[file_id], lazy="select")
     created_by = relationship("User", foreign_keys=[created_by_id], lazy="select")
+
+
+class FileContentIndex(Base):
+    """Índice de contenido extraído de un archivo (Ronda 6: búsqueda por
+    contenido + OCR). Relación 1:1 con `File` (`file_id` es PK propia, no
+    hay historial por versión -- SIEMPRE refleja el contenido de la versión
+    ACTUAL, ver `app/worker/tasks/indexing.py::index_file_content`, que
+    hace upsert por `file_id` cada vez que el contenido cambia).
+
+    `content_text` viaja truncado a un límite razonable (ver
+    `MAX_CONTENT_CHARS` en la tarea de indexación) -- el propósito de esta
+    tabla es habilitar búsqueda full-text, no archivar el documento
+    completo.
+
+    NO se mapea acá `search_vector` (la columna generada por Postgres que
+    realmente indexa el texto, `GENERATED ALWAYS AS
+    to_tsvector('spanish', coalesce(content_text, '')) STORED`, ver la
+    migración de esta ronda) -- Postgres rechaza cualquier INSERT/UPDATE
+    que intente escribirla explícitamente, y SQLAlchemy no tiene una forma
+    limpia de marcar una columna ORM como "generada, nunca la toques al
+    persistir" sin recurrir a workarounds frágiles entre versiones. Más
+    simple resolverla con SQL crudo (`text()`) donde hace falta consultarla
+    -- ver `app/files/repository.py::_content_match_file_ids`, mismo
+    criterio que ya usa este módulo para `WITH RECURSIVE` en
+    `CRUDFolder.get_descendant_ids`.
+
+    Mientras `extraction_status` sigue en 'pending' (tarea todavía no
+    corrió) o directamente no existe fila para un `file_id`, ese archivo
+    simplemente no aparece en resultados de búsqueda por CONTENIDO -- sigue
+    apareciendo por nombre como siempre. La indexación es asíncrona y best
+    effort, nunca bloquea la respuesta de un upload/versión nueva/restore
+    (ver `_enqueue_content_indexing` en el router)."""
+
+    __tablename__ = "file_content_index"
+
+    file_id = Column(UUID(as_uuid=True), ForeignKey("files.id", ondelete="CASCADE"), primary_key=True)
+
+    content_text = Column(Text, nullable=True)
+    # 'pending' | 'done' | 'failed' | 'unsupported'
+    extraction_status = Column(String(20), nullable=False, server_default="pending")
+    error_message = Column(Text, nullable=True)
+    indexed_at = Column(DateTime(timezone=True), nullable=True)
+
+    file = relationship("File", foreign_keys=[file_id], lazy="select")
 
 
 class Share(Base):

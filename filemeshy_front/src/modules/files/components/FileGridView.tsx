@@ -12,6 +12,7 @@ import { Folder, MoreVertical, Star } from 'lucide-react'
 import { Dropdown, type DropdownItem } from '@/ui/dropdown/Dropdown'
 import { getFileTypeIcon } from '@/shared/utils/fileTypeIcon'
 import TagChips from './TagChips'
+import ContentMatchBadge from './ContentMatchBadge'
 import type { Row } from '../pages/FilesPage'
 import type { FileOut } from '../types'
 
@@ -19,6 +20,8 @@ interface FileGridViewProps {
   rows: Row[]
   size: 'md' | 'lg'
   showTrash: boolean
+  /** Ronda 6 -- hay una búsqueda activa (`debouncedSearch` no vacío en FilesPage). */
+  hasActiveSearch: boolean
   onNavigate: (folderId: string | null) => void
   onPreview: (row: Row) => void
   buildActions: (row: Row) => DropdownItem[]
@@ -34,7 +37,15 @@ const ICON_SIZE_CLASSES: Record<'md' | 'lg', string> = {
   lg: 'size-16',
 }
 
-export default function FileGridView({ rows, size, showTrash, onNavigate, onPreview, buildActions }: FileGridViewProps) {
+export default function FileGridView({
+  rows,
+  size,
+  showTrash,
+  hasActiveSearch,
+  onNavigate,
+  onPreview,
+  buildActions,
+}: FileGridViewProps) {
   // Mismo mensaje que emptyMessage de la vista Lista (DataTable), para consistencia entre
   // los 3 modos -- sin esto la grilla queda en blanco (ej. mientras loading===true recién
   // entrando a una carpeta, FilesPage todavía no reemplaza este componente por EmptyState).
@@ -78,6 +89,12 @@ export default function FileGridView({ rows, size, showTrash, onNavigate, onPrev
             )}
             <Icon className={`${ICON_SIZE_CLASSES[size]} ${iconColorClass} flex-shrink-0`} />
             <span className="w-full truncate text-sm font-medium text-gray-900 dark:text-white">{row.name}</span>
+            {row.type === 'file' && (
+              <ContentMatchBadge
+                matchedBy={(row.raw as FileOut).matched_by}
+                hasActiveSearch={hasActiveSearch}
+              />
+            )}
             <TagChips tags={row.raw.tags ?? []} className="justify-center" />
           </div>
         )

@@ -204,6 +204,47 @@ Suite: 71 tests.
   para seguir recibiendo parches de seguridad de Debian sobre LibreOffice — no alcanza con "no
   tocar el Dockerfile", si no se reconstruye la versión se cristaliza.
 
+**Hecho (2026-09-21) — Ronda 6 del plan de construcción: búsqueda por contenido + OCR.**
+Tabla `file_content_index` (1:1 con `File`, `search_vector` tsvector generado por Postgres +
+índice GIN). Extracción de texto **asíncrona** vía Celery (cola `indexing` dedicada, para no
+competir con notificaciones/emails): texto plano directo, PDF con `pypdf` + fallback a OCR si
+el texto embebido es casi vacío (PDF escaneado, tope 20 páginas), Office moderno
+(docx/xlsx/pptx) con librerías directas sin pasar por LibreOffice, imágenes con OCR directo
+(Tesseract, agregado a la misma imagen que ya comparten `backend`/`celery_worker` — mismo
+perfil de riesgo que pyvips, ya aceptado). Se dispara al subir un archivo, subir/restaurar una
+versión, o reemplazar contenido vía share con `permission=edit`. `CRUDFile.search` ahora
+matchea nombre O contenido, con `matched_by: 'name'|'content'|'both'` en la respuesta y un
+badge visible en el frontend (Lista y Grilla) solo cuando hay búsqueda activa.
+
+Pasó por implementación (2 agentes) → revisión adversarial (2 agentes, cada uno encontró de
+forma **independiente** el mismo bug crítico desde ángulos distintos):
+
+1. **[CRÍTICO]** El workaround de "importar todos los modelos antes de usar el ORM en una
+   tarea Celery" (ya necesario desde antes para `maintenance.py`) solo se agregó a
+   `indexing.py`, no a `email.py`/`security.py`. Si cualquiera de esas otras tareas corría
+   PRIMERO en el proceso del worker, envenenaba el registro de mappers de SQLAlchemy **para
+   todo el proceso**, y la indexación quedaba muerta hasta reiniciar el worker — reproducido
+   en vivo dos veces por agentes distintos. Corregido centralizando el import en una señal
+   `worker_process_init` de Celery (`celery_app.py`), que corre una sola vez por proceso antes
+   de cualquier tarea — ya no importa el orden ni depende de que cada tarea nueva copie el
+   workaround. Reverificado de forma independiente por 3 agentes distintos tras el fix
+   (incluido un escenario real de OCR sobre una imagen con texto, de punta a punta).
+
+Suite: 80 tests.
+
+**Deuda residual nueva, no bloqueante:**
+
+- `_extract_pdf_text` (texto embebido real, no el fallback OCR) no tiene tope de páginas —
+  a diferencia de `_ocr_pdf` que sí limita a 20. Un PDF de texto con miles de páginas simples
+  cabría en el límite de subida (100MB) y consumiría CPU del worker hasta el `time_limit`
+  global de la tarea (180s). No explotable de forma crítica (el hard kill corta la tarea), pero
+  conviene un tope simétrico al de OCR.
+- Combinación `task_acks_late=True` + `task_reject_on_worker_lost=True` + `time_limit` duro en
+  `index_file_content`: si el `SIGKILL` del límite duro llega antes de que la tarea alcance a
+  marcar `extraction_status='failed'`, el mensaje puede no ackearse y Celery lo redelivera sin
+  tope de reintentos a nivel de broker — un archivo que confiablemente exceda el límite podría
+  generar redelivery indefinida sobre la cola `indexing`.
+
 ### 🟠 Seguridad — importante pero no bloqueante
 
 - `SECRET_KEY` con default hardcodeado en `core/config.py:32` — mitigado por una guarda que
@@ -245,16 +286,16 @@ Suite: 71 tests.
 
 - Antes de la auditoría del 19: **0% de cobertura**, sin pytest ni vitest configurado en
   ningún lado del repo.
-- Tras las Rondas 1-5: `filemeshy_back/tests/` (71 tests) + `filemeshy_back/requirements-dev.txt`
+- Tras las Rondas 1-6: `filemeshy_back/tests/` (80 tests) + `filemeshy_back/requirements-dev.txt`
   — decidir si se incorporan al repo. Cubre: auth (registro, login, 2FA end-to-end), IDOR de
   archivos, carpetas, shares y versiones (copy, tags, compartir a usuario, escalación vía
   permission=edit, restore/purga de versiones), favoritos/orden con regresión explícita del bug
   de permisos, cuota propia y bajo versionado, CRUD de etiquetas con ownership, contraseña en
   links públicos, backfill de versiones vía migración, preview de video/audio por magic bytes,
-  cache/invalidación/tamaño/rate-limit de preview de Office, y regresión de los 3 fixes de
-  seguridad más fáciles de reproducir automatizadamente (spoofing de IP, DoS 2FA, flag de
-  registro).
-- Última corrida (contra la imagen final reconstruida, backend Y `celery_worker`): **71
+  cache/invalidación/tamaño/rate-limit de preview de Office, indexación de contenido/OCR con
+  regresión del bug de mappers del worker, y regresión de los 3 fixes de seguridad más fáciles
+  de reproducir automatizadamente (spoofing de IP, DoS 2FA, flag de registro).
+- Última corrida (contra la imagen final reconstruida, backend Y `celery_worker`): **80
   passed, 0 failed**, sin flakiness.
 - Falta: tests de frontend (cero — la Ronda 1 se verificó visualmente a mano con Playwright
   ad-hoc, no queda como suite automatizada), tests de aislamiento multi-tenant, y CI que
@@ -278,6 +319,11 @@ planificado en ninguna ronda todavía).
 **Resuelto en Ronda 5 (2026-09-20):** vista previa de video y audio (reproducción nativa) y de
 documentos de Office (conversión a PDF vía servicio aislado) — antes solo imagen/PDF.
 
+**Resuelto en Ronda 6 (2026-09-21):** búsqueda por contenido de archivo (no solo nombre) y OCR
+sobre imágenes y PDFs escaneados. Sin filtros avanzados (tipo, fecha, tamaño) en la página de
+Archivos todavía, aunque el componente ya existe y se usa en otros módulos — queda como gap
+menor, no planificado en ninguna ronda por ahora.
+
 Gaps que siguen abiertos, ver roadmap de rondas al final del archivo:
 
 1. Sin backups automáticos de Postgres/MinIO — cero rastro en todo el repo, ni siquiera un
@@ -289,12 +335,9 @@ Gaps que siguen abiertos, ver roadmap de rondas al final del archivo:
 3. Multi-tenant real a nivel de datos (schema-per-tenant, bien implementado, activo solo si
    `DEPLOYMENT_MODE=cloud`) pero sin ninguna UI de gestión — solo utilizable vía CLI/API
    interna, no es autoservicio hoy. Planificado: Ronda 8.
-4. Búsqueda solo por nombre, no por contenido de archivo. Sin filtros avanzados (tipo, fecha,
-   tamaño) en la página de Archivos, aunque el componente ya existe y se usa en otros módulos.
-   Búsqueda por contenido + OCR planificados: Ronda 6 (confirmado en alcance con el usuario).
-5. Formato de error inconsistente entre excepciones tipadas (`{status,message,data}`) y
+4. Formato de error inconsistente entre excepciones tipadas (`{status,message,data}`) y
    errores de validación Pydantic (`{"detail":[...]}`) — dos formatos conviven en la API.
-6. Sin escaneo de virus/malware. Planificado: Ronda 7.
+5. Sin escaneo de virus/malware. Planificado: Ronda 7.
 
 ### 🏗️ Estándares técnicos — gaps priorizados (vs. `docs/estandares-cliente-servidor-2026/`)
 
@@ -334,12 +377,13 @@ Gaps que siguen abiertos, ver roadmap de rondas al final del archivo:
   `audit-test@wolfgrimm.local` — este último permanentemente bloqueado para login, ver bug
   puntual más abajo) — no es producción. Se puede tirar abajo con `docker compose down -v`
   cuando se quiera.
-- Rondas 1 (`d91a47f`), 2 (`61ca9f1`), 3 (`9b08c35`) y 4 (`7e9feba`) commiteadas, 2026-09-20.
-  Todo el código de la Ronda 5 (backend: preview de video/audio/Office; servicio nuevo
-  `filemeshy_office_converter/`; frontend: `PreviewModal` extendido) está en el working tree,
-  sin commitear todavía — pendiente confirmación explícita del usuario antes de commitear.
+- Rondas 1 (`d91a47f`), 2 (`61ca9f1`), 3 (`9b08c35`), 4 (`7e9feba`) y 5 (`a1c2680`)
+  commiteadas, 2026-09-20/21. Todo el código de la Ronda 6 (backend: `file_content_index` +
+  tarea de indexación Celery + búsqueda extendida; frontend: badge de coincidencia por
+  contenido) está en el working tree, sin commitear todavía — pendiente confirmación explícita
+  del usuario antes de commitear.
 - El stack de prueba se cayó por reinicios del host varias veces durante el trabajo de las
-  Rondas 2 a 5 — siempre se recuperó sin pérdida de código (todo en disco) ni de datos de
+  Rondas 2 a 6 — siempre se recuperó sin pérdida de código (todo en disco) ni de datos de
   prueba (volumen de Postgres persistente); solo hizo falta recrear el contenedor backend con
   `--force-recreate` (un error transitorio de permisos en el primer arranque en bloque tras
   cada reinicio, no un bug real).
@@ -355,7 +399,7 @@ Aprobado con el usuario el 2026-09-20. Cada ronda se diseña en detalle recién 
 | 3 (hecho) | Compartir granular (contraseña, permisos lectura/escritura, compartir a usuario específico) + notificaciones de "te compartieron algo" — **completa** |
 | 4 (hecho) | Versionado de archivos (historial, restaurar versión anterior) — **completa** |
 | 5 (hecho) | Preview extendido (video, audio, documentos de Office) — **completa** |
-| 6 | Búsqueda por contenido + OCR |
+| 6 (hecho) | Búsqueda por contenido + OCR — **completa** |
 | 7 | Antivirus (ClamAV) en upload + backups automáticos de Postgres/MinIO |
 | 8 | UI de administración de tenants |
 
@@ -365,20 +409,30 @@ en tiempo real.
 
 ### Semáforo
 
-**Rondas 1 a 5 completas y verificadas en vivo** (incluida verificación visual en navegador
-real, y en Rondas 3, 4 y 5, reproducción de escenarios de punta a punta por el propio Auditor
-Final, incluida verificación de contenido real —no solo capturas— en la Ronda 5). Listo para
-uso interno de un solo usuario/equipo pequeño en red cerrada — los 6 bloqueadores de seguridad
-de la auditoría del 19 están resueltos, y el Drive ganó favoritos, orden real, copiar, cuota
-visible, etiquetas, compartir granular (contraseña, permisos, usuarios específicos) con
-notificaciones reales, versionado de archivos con historial completo, y preview de
-video/audio/Office. **Todavía no listo para exposición pública a Internet sin decisión** sobre
-las deudas residuales de seguridad marcadas arriba en cada ronda (todas confirmadas no
-explotables hoy, pero dependen de configuración de producción que este repo de trabajo no
-controla directamente o de defensa en profundidad pendiente): `TRUSTED_PROXY_IPS` vacío en
-producción real, el balde compartido de rate-limit en shares públicos, la falta de rate-limit
-en los endpoints autenticados de shares dirigidos, y la red no dedicada del nuevo servicio
-`office_converter`.
+**Rondas 1 a 6 completas y verificadas en vivo** (incluida verificación visual en navegador
+real, y en Rondas 3 a 6, reproducción de escenarios de punta a punta por el propio Auditor
+Final, incluida verificación de contenido real —no solo capturas— en las Rondas 5 y 6). Listo
+para uso interno de un solo usuario/equipo pequeño en red cerrada — los 6 bloqueadores de
+seguridad de la auditoría del 19 están resueltos, y el Drive ganó favoritos, orden real,
+copiar, cuota visible, etiquetas, compartir granular (contraseña, permisos, usuarios
+específicos) con notificaciones reales, versionado de archivos con historial completo, preview
+de video/audio/Office, y búsqueda por contenido + OCR. **Todavía no listo para exposición
+pública a Internet sin decisión** sobre las deudas residuales de seguridad marcadas arriba en
+cada ronda (todas confirmadas no explotables hoy, pero dependen de configuración de producción
+que este repo de trabajo no controla directamente o de defensa en profundidad pendiente):
+`TRUSTED_PROXY_IPS` vacío en producción real, el balde compartido de rate-limit en shares
+públicos, la falta de rate-limit en los endpoints autenticados de shares dirigidos, la red no
+dedicada del servicio `office_converter`, y la falta de tope de páginas/reintentos en la
+indexación de PDFs de texto embebido.
+
+**Patrón recurrente en las últimas 3 rondas, ya reconocido y siempre atrapado por el propio
+proceso antes de cerrar la ronda:** un bug de "código que funciona en el proceso de tests pero
+se rompe en el proceso real del worker/servicio compartido" (Ronda 4: `celery_worker` con
+imagen vieja; Ronda 5: contrato roto solo visible contra el backend real; Ronda 6: registro de
+mappers de SQLAlchemy envenenado según el orden de tareas en el worker real). Ninguno lo detectó
+la suite de pytest sola — todos aparecieron recién al probar contra el stack Docker completo
+levantado. Confirma que la verificación en vivo (no solo tests unitarios/aislados) sigue siendo
+imprescindible antes de cerrar cualquier ronda futura.
 
 **Lección de proceso confirmada en Ronda 4** (ya aplicada, dejar como recordatorio para
 rondas futuras y para cualquier deploy real): reconstruir solo `backend` no alcanza cuando el

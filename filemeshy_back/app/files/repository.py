@@ -5,13 +5,14 @@ esta capa solo hace queries, la lógica de negocio (permisos duales,
 detección de ciclos, recursión de papelera) vive en router.py.
 """
 
+from datetime import datetime, timezone
 from typing import List, Optional
 from uuid import UUID
 
-from sqlalchemy import func, text
+from sqlalchemy import func, or_, text
 from sqlalchemy.orm import Session, selectinload
 
-from app.files.models import File, FileVersion, Folder, Share
+from app.files.models import File, FileContentIndex, FileVersion, Folder, Share
 from app.shared.repository_base import CRUDBase
 from app.tags.models import file_tags, folder_tags
 
@@ -42,6 +43,38 @@ def _resolve_sort_column(columns: dict, sort_by: str, sort_dir: str):
     Cualquier `sort_dir` distinto de "desc" cae a ascendente."""
     column = columns.get(sort_by, columns["name"])
     return column.desc() if sort_dir == "desc" else column.asc()
+
+
+def _content_match_file_ids(db: Session, owner_id: UUID, q: str) -> List[UUID]:
+    """`file_id`s de `owner_id` cuyo CONTENIDO indexado (Ronda 6, ver
+    `FileContentIndex`) matchea `q` -- SQL crudo (`text()`) contra
+    `search_vector`, la columna generada de Postgres que no se mapea en el
+    ORM (ver docstring de `FileContentIndex` para el motivo). `plainto_tsquery`
+    con bind param (`:q`), nunca interpolado en el string -- mismo criterio
+    anti-injection que el resto del módulo con SQL crudo (`get_descendant_ids`).
+
+    Archivos sin fila en `file_content_index` (todavía no indexados, o
+    indexación en 'pending'/'failed'/'unsupported') simplemente no aparecen
+    acá -- el `INNER JOIN` los excluye sin necesidad de filtrar por
+    `extraction_status` explícitamente (una fila con `content_text` NULL o
+    vacío tiene un `search_vector` vacío, que no matchea ningún `tsquery`
+    no vacío de todos modos)."""
+    if not q or not q.strip():
+        return []
+    rows = db.execute(
+        text(
+            """
+            SELECT f.id
+            FROM files f
+            INNER JOIN file_content_index fci ON fci.file_id = f.id
+            WHERE f.owner_id = :owner_id
+              AND f.deleted_at IS NULL
+              AND fci.search_vector @@ plainto_tsquery('spanish', :q)
+            """
+        ),
+        {"owner_id": owner_id, "q": q},
+    )
+    return [row[0] for row in rows]
 
 
 class CRUDFolder(CRUDBase[Folder, None, None]):
@@ -235,18 +268,44 @@ class CRUDFile(CRUDBase[File, None, None]):
         favorites_only: bool = False,
         tag_id: Optional[UUID] = None,
     ) -> List[File]:
+        """Búsqueda por NOMBRE (ilike, comportamiento original) O por
+        CONTENIDO indexado (Ronda 6, ver `_content_match_file_ids`) -- un
+        archivo aparece si matchea cualquiera de los dos. Cada resultado
+        queda anotado con un atributo `matched_by` en memoria ('name',
+        'content' o 'both', ver más abajo) -- NO es una columna del modelo
+        `File`, es un atributo plano seteado acá para que `FileOut`
+        (`from_attributes=True`) lo recoja sin tener que cambiar el shape de
+        ningún otro endpoint que reusa `FileOut`."""
+        content_ids = _content_match_file_ids(db, owner_id, q)
+
         query = db.query(File).options(selectinload(File.tags)).filter(
             File.owner_id == owner_id,
             File.deleted_at.is_(None),
-            File.name.ilike(f"%{q}%"),
         )
+        if content_ids:
+            query = query.filter(or_(File.name.ilike(f"%{q}%"), File.id.in_(content_ids)))
+        else:
+            query = query.filter(File.name.ilike(f"%{q}%"))
         if favorites_only:
             query = query.filter(File.is_favorite.is_(True))
         if tag_id is not None:
             query = query.join(file_tags, file_tags.c.file_id == File.id).filter(
                 file_tags.c.tag_id == tag_id
             )
-        return query.order_by(_resolve_sort_column(_FILE_SORT_COLUMNS, sort_by, sort_dir)).all()
+        results = query.order_by(_resolve_sort_column(_FILE_SORT_COLUMNS, sort_by, sort_dir)).all()
+
+        content_id_set = set(content_ids)
+        q_lower = q.lower()
+        for f in results:
+            name_matched = q_lower in f.name.lower()
+            content_matched = f.id in content_id_set
+            if name_matched and content_matched:
+                f.matched_by = "both"
+            elif content_matched:
+                f.matched_by = "content"
+            else:
+                f.matched_by = "name"
+        return results
 
     def get_by_folder_ids(self, db: Session, folder_ids: List[UUID]) -> List[File]:
         if not folder_ids:
@@ -354,7 +413,43 @@ class CRUDShare(CRUDBase[Share, None, None]):
         )
 
 
+class CRUDFileContentIndex(CRUDBase[FileContentIndex, None, None]):
+    """No hereda el `get(db, id)` genérico de `CRUDBase` tal cual -- asume
+    una columna `id`, y la PK real de este modelo es `file_id` (relación 1:1
+    con `File`, ver docstring de `FileContentIndex`)."""
+
+    def get_by_file_id(self, db: Session, file_id: UUID) -> Optional[FileContentIndex]:
+        return db.query(FileContentIndex).filter(FileContentIndex.file_id == file_id).first()
+
+    def upsert(
+        self,
+        db: Session,
+        file_id: UUID,
+        *,
+        content_text: Optional[str],
+        extraction_status: str,
+        error_message: Optional[str] = None,
+    ) -> FileContentIndex:
+        """Reemplaza (o crea) la fila de índice de `file_id` -- relación 1:1,
+        SIEMPRE refleja la extracción MÁS RECIENTE. Usado por
+        `app.worker.tasks.indexing.index_file_content` -- nunca conserva el
+        `content_text` de una extracción vieja cuando el contenido del
+        archivo cambió (versión nueva, restore, reemplazo vía share)."""
+        record = self.get_by_file_id(db, file_id)
+        if record is None:
+            record = FileContentIndex(file_id=file_id)
+            db.add(record)
+        record.content_text = content_text
+        record.extraction_status = extraction_status
+        record.error_message = error_message
+        record.indexed_at = datetime.now(timezone.utc)
+        db.commit()
+        db.refresh(record)
+        return record
+
+
 folder_repo = CRUDFolder(Folder)
 file_repo = CRUDFile(File)
 file_version_repo = CRUDFileVersion(FileVersion)
 share_repo = CRUDShare(Share)
+file_content_index_repo = CRUDFileContentIndex(FileContentIndex)
