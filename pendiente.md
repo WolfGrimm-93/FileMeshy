@@ -232,6 +232,114 @@ forma **independiente** el mismo bug crítico desde ángulos distintos):
 
 Suite: 80 tests.
 
+**Hecho (2026-09-21) — Ronda 7 (parte backups del plan de construcción).** Backup automático
+de Postgres CON verificación real: tabla `backup_runs` nueva (`app/backups/`) registra CADA
+corrida (`'running'`/`'success'`/`'failed'`, tamaño, dónde quedó guardada) — un backup que
+nadie verifica no es un backup real, así que el diseño no es "correr un cron y esperar que
+funcione". `backup_postgres` (Celery, diaria 2:00 AM, cola `maintenance`) corre `pg_dump` real
+contra la Postgres del stack, comprimido con gzip, subido a un bucket privado nuevo de MinIO
+(`filemeshy-backups`, sin política de lectura pública). Retención configurable
+(`BACKUP_RETENTION_DAYS`, default 14 días): después de cada backup exitoso se borra el OBJETO
+de los backups viejos en MinIO, pero la FILA `BackupRun` se conserva como registro histórico
+auditable. Endpoints admin nuevos (`GET/POST /admin/backups`, permiso `backups.view`) para
+listar corridas y disparar un backup manual sin esperar al horario. Test real (no mockeado):
+corre `pg_dump` de verdad, confirma que el objeto EXISTE en MinIO con el tamaño correcto, y que
+la retención borra un backup viejo simulado de verdad (objeto + limpieza de `storage_location`).
+
+**Limitación conocida, documentada a propósito (no un olvido):** el backup de MinIO
+(`backup_minio_objects`) es **CONDICIONAL** — un backup de TODO el contenido de MinIO
+(`filemeshy-media` + `filemeshy-media-private`) sería caro (duplica el storage completo) y, si
+el destino fuera el MISMO disco/servidor donde ya vive MinIO, **no protegería contra una falla
+de disco real** (daría una falsa sensación de seguridad, peor que no tener backup y saberlo).
+Por diseño, esta tarea SOLO copia objetos si están configuradas las 4 variables de un destino
+S3-compatible **EXTERNO** (`BACKUP_S3_ENDPOINT`/`BACKUP_S3_BUCKET`/`BACKUP_S3_ACCESS_KEY`/
+`BACKUP_S3_SECRET_KEY`) — ninguna tiene default, y **este stack (dev/test y producción tal cual
+está hoy) no las tiene configuradas**. Sin esa config: `backup_minio_objects` se registra en
+`backup_runs` como `status='failed'` con el motivo explícito ("falta destino S3 externo"),
+visible en `GET /admin/backups` — nunca finge que hay backup de archivos cuando no lo hay.
+**Acción pendiente real, no solo teórica:** para tener backup de archivos de verdad, hay que
+contratar/aprovisionar un S3-compatible externo (otro proveedor, otra región, otro servidor
+físico) y setear esas 4 variables — hasta entonces, **los archivos de usuario en MinIO NO
+tienen backup**, solo la base de datos (metadatos, no el contenido de los archivos en sí).
+
+Módulo backend nuevo: `app/backups/` (`models.py`, `schemas.py`, `repository.py`, `router.py`),
+`app/worker/tasks/backups.py`, migración `d4e8a1f2b9c6`. Página nueva de frontend "Copias de
+Seguridad" (tabla con estado/tamaño/duración de cada corrida, botón "Ejecutar backup ahora",
+badge gris/informativo — no rojo de alarma — cuando MinIO da `failed` por falta de config,
+distinto de un fallo real).
+
+**Hallazgo CRÍTICO real, encontrado por la revisión adversarial y ya corregido (2026-09-21):**
+`backups.view` se agregó a `CANONICAL_PERMISSIONS`/`ROLE_PERMISSIONS_CANONICAL['ADMIN']` en
+`app/core/permissions.py`, pero nadie corrió `scripts/seed_permissions.py` contra la BD real —
+`has_permission()` en runtime lee `User.permissions`, una columna CACHEADA que se calcula desde
+las tablas reales `permissions`/`role_permissions`, nunca desde el dict de código directo. Sin
+el seed, esas tablas seguían sin la fila nueva y un ADMIN real (no `SUPER_ADMIN`, que bypasea el
+chequeo por completo) recibía 403 real en `GET/POST /admin/backups` — confirmado en vivo con
+`SELECT ... FROM permissions WHERE permission_code='backups.view'` devolviendo 0 filas.
+
+Los 6 tests originales de esta ronda no lo agarraron porque usaban `grant_permission()`
+(`tests/conftest.py`) — bypass directo de la columna JSON del usuario, sin tocar `role_id` ni
+`role_permissions` — nunca ejercitaban el camino real de un ADMIN. Corregido con un helper nuevo,
+`make_real_admin()` (mismo archivo): asigna `role_id`=ADMIN de verdad, corre
+`scripts/seed_permissions.py` (idempotente) y recalcula `User.permissions` desde la tabla real —
+el mismo mecanismo que dispara `PUT /users/{id}` con un `role_id` nuevo. Test de regresión nuevo,
+`test_real_admin_role_can_list_and_trigger` (`tests/test_backups_endpoints.py`), y advertencia
+agregada al inicio de `app/core/permissions.py` para que el próximo permiso nuevo no repita el
+mismo bug. Reproducido y reverificado en vivo dos veces: se borró a mano la fila real de
+`permissions`/`role_permissions` en la BD del stack, se confirmó que el test nuevo la detecta (y
+la repuebla vía el seed idempotente que corre como parte del propio helper), y se re-confirmó
+limpio. En el camino se encontró y corrigió un segundo bug menor: `make_real_admin()` era el
+primer código de test que hacía una query ORM directa sobre `User` sin pasar por HTTP, y en un
+proceso de pytest completamente fresco (aislado) disparaba el mismo bug de mapper de SQLAlchemy
+de la Ronda 6 (`User.sessions = relationship("Session", ...)` sin resolver) — corregido
+importando `app.worker.celery_app` antes de la query (dispara el fix centralizado de esa Ronda).
+Además, la revisión adversarial encontró **2 bugs más en el frontend de Backups** (mismo
+agente de implementación, corregidos en la misma vuelta de feedback): el backend devuelve
+`{items, total}` en `GET /admin/backups`, pero el service del frontend esperaba un array plano
+— la tabla mostraba "No se encontraron backups" **siempre**, aunque hubiera corridas reales
+(confirmado en vivo: 18+ filas reales en la BD, tabla vacía en pantalla). Y el gate de permiso
+de la ruta/botón usaba `settings.edit_system` en vez de `backups.view` — rompía la granularidad
+que el propio backend define (un permiso, `backups.view`, para todo lo de backups). Ambos
+corregidos y reverificados visualmente en navegador real tras el rebuild, incluido un usuario
+sin el permiso confirmando que no ve el ítem de nav y es bloqueado por URL directa.
+
+Suite completa reverificada tras todos los fixes: **94 passed, 0 failed**.
+
+**Hecho (2026-09-21) — Ronda 7 (parte antivirus).** Escaneo de malware en TODO contenido nuevo
+que entra al sistema, antes de subirlo a MinIO: subida directa, subida a carpeta compartida
+(`permission=edit`), nueva versión de archivo, y reemplazo de contenido vía share. Servicio
+Docker nuevo y aislado con la imagen OFICIAL `clamav/clamav:stable` (sin build custom, a
+diferencia del conversor de Office de Ronda 5 — ClamAV ya trae `freshclam` integrado), sin
+puerto expuesto al host, volumen nombrado persistente para la base de firmas,
+`cap_drop:[ALL]` + `cap_add` mínimo justificado (`CHOWN,FOWNER,DAC_OVERRIDE,SETUID,SETGID`,
+necesarios para que el entrypoint oficial baje privilegios de root a `clamav`) — confirmado en
+vivo que `clamd`/`freshclam` corren como no-root, solo el proceso supervisor (`tini`) queda
+root. Escaneo vía protocolo TCP INSTREAM implementado a mano (sockets crudos, sin librería de
+terceros, para máximo control del manejo de errores en un componente de seguridad crítico).
+Política **fail-closed real**: contenido infectado → 422 sin subir nada; `clamd` inalcanzable o
+con timeout → 503, nunca se acepta sin escanear.
+
+La revisión adversarial encontró **2 hallazgos MEDIUM de disponibilidad, ambos reproducidos en
+vivo (no teóricos) y corregidos**:
+
+1. El escaneo bloqueaba el event loop async COMPLETO, no solo la request de quien subía —
+   durante un escaneo real de ~2s, otro usuario haciendo `GET /files` en simultáneo vio su
+   latencia subir de 0.02s a 1.83s. Corregido moviendo el escaneo a threadpool
+   (`starlette.concurrency.run_in_threadpool`).
+2. El timeout configurado (`CLAMAV_SCAN_TIMEOUT_SECONDS`) no era un deadline TOTAL — se
+   reseteaba en cada operación de socket individual. Con un `clamd` degradado devolviendo la
+   respuesta a los tumbos, el escaneo tardó 15s con un timeout de 2s configurado (7.5x).
+   Corregido con un deadline real basado en `time.monotonic()`, calculado una vez y verificado
+   antes de cada operación de red.
+
+Ambos fixes reverificados en vivo por el Auditor Final de forma independiente: 10 escaneos
+EICAR en paralelo + 1 upload limpio simultáneo no afectaron la latencia del upload limpio
+(0.148s, igual al baseline sin concurrencia). EICAR real probado con éxito en los 4 puntos de
+entrada — 422 en todos, cero rastro en BD/MinIO. Un usuario real de rol USER subiendo archivos
+normales no percibe fricción (23-42ms por subida).
+
+Suite: 7 tests nuevos de antivirus, incluidos 2 de regresión para los hallazgos de arriba.
+
 **Deuda residual nueva, no bloqueante:**
 
 - `_extract_pdf_text` (texto embebido real, no el fallback OCR) no tiene tope de páginas —
@@ -266,8 +374,6 @@ Suite: 80 tests.
   rastro; un acceso indebido de solo lectura no es detectable vía auditoría.
 - `/health/detailed` (bien gateado a rol admin) expone versión detallada de Postgres/Python y
   el flag `debug:true` — innecesario para un healthcheck, reducir el payload.
-- Sin escaneo de virus/malware en archivos subidos — solo se valida tipo por magic bytes, no
-  contenido malicioso.
 - Consola de MinIO de dev expuesta en `0.0.0.0:58103` con credenciales de desarrollo en texto
   plano en el compose — aceptable solo si la máquina no es alcanzable desde LAN/internet.
 - Rate-limit de shares públicos (`files/router.py:719-732`) usa `request.client.host` directo
@@ -286,16 +392,19 @@ Suite: 80 tests.
 
 - Antes de la auditoría del 19: **0% de cobertura**, sin pytest ni vitest configurado en
   ningún lado del repo.
-- Tras las Rondas 1-6: `filemeshy_back/tests/` (80 tests) + `filemeshy_back/requirements-dev.txt`
+- Tras las Rondas 1-7: `filemeshy_back/tests/` (94 tests) + `filemeshy_back/requirements-dev.txt`
   — decidir si se incorporan al repo. Cubre: auth (registro, login, 2FA end-to-end), IDOR de
   archivos, carpetas, shares y versiones (copy, tags, compartir a usuario, escalación vía
   permission=edit, restore/purga de versiones), favoritos/orden con regresión explícita del bug
   de permisos, cuota propia y bajo versionado, CRUD de etiquetas con ownership, contraseña en
   links públicos, backfill de versiones vía migración, preview de video/audio por magic bytes,
   cache/invalidación/tamaño/rate-limit de preview de Office, indexación de contenido/OCR con
-  regresión del bug de mappers del worker, y regresión de los 3 fixes de seguridad más fáciles
-  de reproducir automatizadamente (spoofing de IP, DoS 2FA, flag de registro).
-- Última corrida (contra la imagen final reconstruida, backend Y `celery_worker`): **80
+  regresión del bug de mappers del worker, escaneo de malware (EICAR) en los 4 puntos de
+  entrada con regresión del bloqueo de event loop y del timeout no-total, backups de Postgres
+  con verificación real en MinIO y RBAC por el camino real de asignación de rol (no bypass), y
+  regresión de los 3 fixes de seguridad más fáciles de reproducir automatizadamente (spoofing
+  de IP, DoS 2FA, flag de registro).
+- Última corrida (contra la imagen final reconstruida, backend Y `celery_worker`): **94
   passed, 0 failed**, sin flakiness.
 - Falta: tests de frontend (cero — la Ronda 1 se verificó visualmente a mano con Playwright
   ad-hoc, no queda como suite automatizada), tests de aislamiento multi-tenant, y CI que
@@ -324,10 +433,15 @@ sobre imágenes y PDFs escaneados. Sin filtros avanzados (tipo, fecha, tamaño) 
 Archivos todavía, aunque el componente ya existe y se usa en otros módulos — queda como gap
 menor, no planificado en ninguna ronda por ahora.
 
+**Resuelto en Ronda 7 (2026-09-21):** escaneo de virus/malware en todo contenido nuevo subido
+(ClamAV, fail-closed). Backup automático de Postgres, con verificación real y retención.
+
 Gaps que siguen abiertos, ver roadmap de rondas al final del archivo:
 
-1. Sin backups automáticos de Postgres/MinIO — cero rastro en todo el repo, ni siquiera un
-   cron de `pg_dump`. Planificado: Ronda 7.
+1. **Parcialmente resuelto en Ronda 7:** el backup de MinIO (contenido de archivos) sigue sin
+   cobertura real — la tarea existe pero requiere un destino S3 externo que hoy no está
+   configurado en ningún entorno; hasta que se configure, los archivos de usuario NO tienen
+   backup, solo sus metadatos en Postgres.
 2. **Decisión de producto explícita, diferida sin fecha** (confirmado con el usuario
    2026-09-20): cliente de escritorio, app móvil, sincronización selectiva, acceso offline
    real y edición colaborativa en tiempo real quedan fuera del alcance actual del roadmap de
@@ -337,7 +451,6 @@ Gaps que siguen abiertos, ver roadmap de rondas al final del archivo:
    interna, no es autoservicio hoy. Planificado: Ronda 8.
 4. Formato de error inconsistente entre excepciones tipadas (`{status,message,data}`) y
    errores de validación Pydantic (`{"detail":[...]}`) — dos formatos conviven en la API.
-5. Sin escaneo de virus/malware. Planificado: Ronda 7.
 
 ### 🏗️ Estándares técnicos — gaps priorizados (vs. `docs/estandares-cliente-servidor-2026/`)
 
@@ -377,13 +490,16 @@ Gaps que siguen abiertos, ver roadmap de rondas al final del archivo:
   `audit-test@wolfgrimm.local` — este último permanentemente bloqueado para login, ver bug
   puntual más abajo) — no es producción. Se puede tirar abajo con `docker compose down -v`
   cuando se quiera.
-- Rondas 1 (`d91a47f`), 2 (`61ca9f1`), 3 (`9b08c35`), 4 (`7e9feba`) y 5 (`a1c2680`)
-  commiteadas, 2026-09-20/21. Todo el código de la Ronda 6 (backend: `file_content_index` +
-  tarea de indexación Celery + búsqueda extendida; frontend: badge de coincidencia por
-  contenido) está en el working tree, sin commitear todavía — pendiente confirmación explícita
-  del usuario antes de commitear.
+- Rondas 1 (`d91a47f`), 2 (`61ca9f1`), 3 (`9b08c35`), 4 (`7e9feba`), 5 (`a1c2680`) y 6
+  (`d833b83`) commiteadas, 2026-09-20/21. Todo el código de la Ronda 7 (backend: antivirus
+  ClamAV + `app/backups/`; servicio Docker nuevo `clamav`; frontend: página "Copias de
+  Seguridad") está en el working tree, sin commitear todavía — pendiente confirmación
+  explícita del usuario antes de commitear. Recordatorio operativo real (no solo de código):
+  antes de considerar el permiso `backups.view` activo en cualquier entorno nuevo, hay que
+  correr `scripts/seed_permissions.py` — agregar un permiso al dict de `permissions.py` no lo
+  propaga solo a las tablas reales (bug real de esta ronda, ya corregido en este stack).
 - El stack de prueba se cayó por reinicios del host varias veces durante el trabajo de las
-  Rondas 2 a 6 — siempre se recuperó sin pérdida de código (todo en disco) ni de datos de
+  Rondas 2 a 7 — siempre se recuperó sin pérdida de código (todo en disco) ni de datos de
   prueba (volumen de Postgres persistente); solo hizo falta recrear el contenedor backend con
   `--force-recreate` (un error transitorio de permisos en el primer arranque en bloque tras
   cada reinicio, no un bug real).
@@ -400,7 +516,7 @@ Aprobado con el usuario el 2026-09-20. Cada ronda se diseña en detalle recién 
 | 4 (hecho) | Versionado de archivos (historial, restaurar versión anterior) — **completa** |
 | 5 (hecho) | Preview extendido (video, audio, documentos de Office) — **completa** |
 | 6 (hecho) | Búsqueda por contenido + OCR — **completa** |
-| 7 | Antivirus (ClamAV) en upload + backups automáticos de Postgres/MinIO |
+| 7 (hecho) | Antivirus (ClamAV) en upload + backups automáticos de Postgres/MinIO — **completa** (MinIO condicional a config externa, ver Ronda 7 arriba) |
 | 8 | UI de administración de tenants |
 
 Fuera de alcance por decisión de producto (no construir sin pedido explícito nuevo): cliente
@@ -409,30 +525,36 @@ en tiempo real.
 
 ### Semáforo
 
-**Rondas 1 a 6 completas y verificadas en vivo** (incluida verificación visual en navegador
-real, y en Rondas 3 a 6, reproducción de escenarios de punta a punta por el propio Auditor
-Final, incluida verificación de contenido real —no solo capturas— en las Rondas 5 y 6). Listo
-para uso interno de un solo usuario/equipo pequeño en red cerrada — los 6 bloqueadores de
-seguridad de la auditoría del 19 están resueltos, y el Drive ganó favoritos, orden real,
-copiar, cuota visible, etiquetas, compartir granular (contraseña, permisos, usuarios
-específicos) con notificaciones reales, versionado de archivos con historial completo, preview
-de video/audio/Office, y búsqueda por contenido + OCR. **Todavía no listo para exposición
-pública a Internet sin decisión** sobre las deudas residuales de seguridad marcadas arriba en
-cada ronda (todas confirmadas no explotables hoy, pero dependen de configuración de producción
-que este repo de trabajo no controla directamente o de defensa en profundidad pendiente):
-`TRUSTED_PROXY_IPS` vacío en producción real, el balde compartido de rate-limit en shares
-públicos, la falta de rate-limit en los endpoints autenticados de shares dirigidos, la red no
-dedicada del servicio `office_converter`, y la falta de tope de páginas/reintentos en la
-indexación de PDFs de texto embebido.
+**Rondas 1 a 7 completas y verificadas en vivo** (incluida verificación visual en navegador
+real, y desde Ronda 3 en adelante, reproducción de escenarios de punta a punta por el propio
+Auditor Final, incluida verificación de contenido real —no solo capturas— en las Rondas 5, 6 y
+7). Listo para uso interno de un solo usuario/equipo pequeño en red cerrada — los 6
+bloqueadores de seguridad de la auditoría del 19 están resueltos, y el Drive ganó favoritos,
+orden real, copiar, cuota visible, etiquetas, compartir granular (contraseña, permisos,
+usuarios específicos) con notificaciones reales, versionado de archivos con historial
+completo, preview de video/audio/Office, búsqueda por contenido + OCR, escaneo de malware en
+toda subida, y backups automáticos de Postgres con verificación real. **Todavía no listo para
+exposición pública a Internet sin decisión** sobre las deudas residuales de seguridad marcadas
+arriba en cada ronda (todas confirmadas no explotables hoy, pero dependen de configuración de
+producción que este repo de trabajo no controla directamente, de defensa en profundidad
+pendiente, o de contratar un destino externo): `TRUSTED_PROXY_IPS` vacío en producción real, el
+balde compartido de rate-limit en shares públicos, la falta de rate-limit en los endpoints
+autenticados de shares dirigidos, la red no dedicada de los servicios `office_converter` y
+`clamav`, la falta de tope de páginas/reintentos en la indexación de PDFs de texto embebido, y
+la ausencia de backup real de los archivos de usuario en MinIO (solo sus metadatos) hasta que
+se configure un destino S3 externo.
 
-**Patrón recurrente en las últimas 3 rondas, ya reconocido y siempre atrapado por el propio
-proceso antes de cerrar la ronda:** un bug de "código que funciona en el proceso de tests pero
-se rompe en el proceso real del worker/servicio compartido" (Ronda 4: `celery_worker` con
-imagen vieja; Ronda 5: contrato roto solo visible contra el backend real; Ronda 6: registro de
-mappers de SQLAlchemy envenenado según el orden de tareas en el worker real). Ninguno lo detectó
-la suite de pytest sola — todos aparecieron recién al probar contra el stack Docker completo
-levantado. Confirma que la verificación en vivo (no solo tests unitarios/aislados) sigue siendo
-imprescindible antes de cerrar cualquier ronda futura.
+**Patrón recurrente confirmado en 4 de las últimas 5 rondas, siempre atrapado por el propio
+proceso antes de cerrar la ronda, nunca por pytest solo:** un bug de "código que funciona en el
+proceso de tests pero se rompe en el proceso/entorno real" (Ronda 4: `celery_worker` con imagen
+vieja; Ronda 5: contrato roto solo visible contra el backend real; Ronda 6: registro de mappers
+de SQLAlchemy envenenado según el orden de tareas en el worker real; Ronda 7: un permiso nuevo
+en el código que nunca se sembró en la tabla real, invisible para tests que usan un bypass
+directo de BD en vez del camino real de asignación de rol). Todos aparecieron recién al probar
+contra el stack Docker completo levantado, con datos y flujos reales. Confirma que la
+verificación en vivo (no solo tests unitarios/aislados, y no solo tests que "pasan" sin
+ejercitar el camino real que usa un usuario de verdad) sigue siendo imprescindible antes de
+cerrar cualquier ronda futura.
 
 **Lección de proceso confirmada en Ronda 4** (ya aplicada, dejar como recordatorio para
 rondas futuras y para cualquier deploy real): reconstruir solo `backend` no alcanza cuando el

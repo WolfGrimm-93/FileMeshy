@@ -206,6 +206,12 @@ def grant_permission(db_session, email: str, permission_code: str) -> None:
     quién es el archivo, y el test no estaría verificando la protección de
     ownership (`_get_owned_file`) que es el hallazgo real de la auditoría,
     solo una restricción de rol que ya existía por otro motivo.
+
+    NUNCA usar esto para confirmar que un permiso nuevo quedó bien
+    conectado de punta a punta (código -> seed -> BD real) -- bypassea por
+    completo `role_permissions`, así que un permiso agregado al dict de
+    `app/core/permissions.py` pero nunca sembrado en la tabla real igual
+    pasaría el test. Para eso, usar `make_real_admin()` (ver más abajo).
     """
     from sqlalchemy import text
 
@@ -221,3 +227,72 @@ def grant_permission(db_session, email: str, permission_code: str) -> None:
         {"perms": json.dumps(current), "email": email},
     )
     db_session.commit()
+
+
+def make_real_admin(client: httpx.Client, db_session) -> tuple[dict, str]:
+    """Crea un usuario y lo convierte en ADMIN por el camino REAL que recorre
+    un admin de producción: `role_id` -> tabla `role_permissions` (poblada
+    por `scripts/seed_permissions.py`, idempotente -- se corre acá mismo
+    para no depender de que alguien lo haya corrido contra este stack de
+    test) -> `User.permissions` recalculado desde esa tabla (mismo mecanismo
+    que dispara `PUT /users/{id}` con `role_id` nuevo, ver
+    `app/users/service.py::recalculate_permissions_for_user`).
+
+    A diferencia de `grant_permission()` (bypass directo de la columna JSON
+    `users.permissions`, sin tocar `role_id` ni `role_permissions`), este
+    helper SÍ ejercita el pipeline completo -- es el único de los dos que
+    hubiera atrapado el hallazgo CRÍTICO de la revisión adversarial de
+    Ronda 7 (backups): `backups.view` se agregó a
+    `ROLE_PERMISSIONS_CANONICAL['ADMIN']` en `app/core/permissions.py`, pero
+    nadie había corrido el seed contra la tabla real -- un ADMIN de verdad
+    recibía 403. Los tests que usaban `grant_permission()` para ese mismo
+    endpoint pasaban igual, porque nunca pasan por `role_permissions`.
+
+    Usar `make_real_admin()` (no `grant_permission()`) para cualquier test
+    que exista específicamente para confirmar que un permiso nuevo quedó
+    bien conectado de punta a punta (dict en código -> seed -> BD ->
+    resolución en runtime); seguir usando `grant_permission()` para el caso
+    de uso original (forzar un permiso puntual sobre un usuario para aislar
+    otra lógica de negocio, ej. ownership, sin que importe cómo llegó ese
+    permiso).
+
+    Import de `app.worker.celery_app` (nunca usado directo acá) a propósito
+    ANTES de la primera query ORM sobre `User` -- ese módulo dispara, a
+    nivel de import, `_register_all_orm_models()` (ver su docstring: el
+    fix centralizado del bug real de Ronda 6) que importa TODOS los modelos
+    con relaciones ORM basadas en string (`User.sessions =
+    relationship("Session", ...)`, ver app/users/models.py) antes de que
+    `configure_mappers()` se dispare. Sin esto, correr ESTE helper solo
+    (ej. `pytest tests/test_backups_endpoints.py::test_real_admin_role...`
+    en un proceso de pytest fresco, sin que ningún otro test haya importado
+    ya medio backend) revienta con `InvalidRequestError: ... failed to
+    locate a name ('Session')` -- confirmado en vivo al aislar este test."""
+    import app.worker.celery_app  # noqa: F401
+
+    from scripts.seed_permissions import seed
+
+    seed()
+
+    creds = register_user(client)
+
+    from sqlalchemy import text
+
+    role_row = db_session.execute(text("SELECT id FROM roles WHERE name = 'ADMIN'")).first()
+    assert role_row is not None, "scripts/seed_permissions.py debería haber creado el rol ADMIN"
+    admin_role_id = role_row[0]
+
+    db_session.execute(
+        text("UPDATE users SET role_id = :role_id WHERE email = :email"),
+        {"role_id": admin_role_id, "email": creds["email"]},
+    )
+    db_session.commit()
+
+    from app.users.repository import user as crud_user
+    from app.users.service import user_service
+
+    user = crud_user.get_by_email(db_session, creds["email"])
+    user_service.recalculate_permissions_for_user(db_session, user.id)
+    db_session.commit()
+
+    token = login_user(client, creds["email"], creds["password"]).json()["data"]["access_token"]
+    return creds, token

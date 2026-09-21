@@ -6,7 +6,11 @@ Colas:
   default    → notificaciones normales, seguridad
   emails     → envío de emails (con rate limiting)
   reports    → generación de snapshots y vistas materializadas
-  maintenance → limpieza y mantenimiento periódico
+  maintenance → limpieza y mantenimiento periódico, y (Ronda 7) backups
+               automáticos de Postgres/MinIO -- reusa esta cola en vez de
+               una propia: son tareas de infraestructura de la misma
+               naturaleza (corren de madrugada, no son sensibles a latencia)
+               que ya conviven acá (cleanup-temp-files, purge-deleted-...).
   indexing   → extracción de texto/OCR de archivos (Ronda 6), cola propia
                separada de 'default' -- OCR puede tardar bastante (ver
                TASK_TIME_LIMIT_SECONDS en app/worker/tasks/indexing.py), no
@@ -70,6 +74,7 @@ def _register_all_orm_models() -> None:
     from app.files.models import Folder, File, Share, FileVersion, FileContentIndex  # noqa: F401
     from app.storage_quota.models import UserStorageQuota  # noqa: F401
     from app.tags.models import Tag, file_tags, folder_tags  # noqa: F401
+    from app.backups.models import BackupRun  # noqa: F401
 
     configure_mappers()
 
@@ -119,6 +124,9 @@ def create_celery_app() -> Celery:
             # Mantenimiento
             "app.worker.tasks.maintenance.*":                         {"queue": "maintenance"},
             "app.worker.tasks.security.*":                            {"queue": "maintenance"},
+            # Backups automáticos (Ronda 7) -- misma cola que mantenimiento,
+            # ver comentario de "Colas" más arriba.
+            "app.worker.tasks.backups.*":                             {"queue": "maintenance"},
             # Indexación de contenido/OCR (Ronda 6) -- cola propia, ver
             # comentario de "Colas" más arriba.
             "app.worker.tasks.indexing.*":                            {"queue": "indexing"},
@@ -171,6 +179,29 @@ def create_celery_app() -> Celery:
                 "schedule": crontab(minute=5),  # :05 de cada hora
                 "options": {"queue": "maintenance"},
             },
+            # Backup completo de Postgres (Ronda 7) — 2 AM diario, ANTES de
+            # las tareas de limpieza (3-4 AM): un backup no debería competir
+            # por recursos/turno con la purga de papelera ni la limpieza de
+            # temporales del mismo worker. Verificación real en
+            # `GET /admin/backups` (app/backups/router.py) -- no es "correr
+            # un cron y esperar que funcione", ver docstring del módulo de
+            # la tarea.
+            "backup-postgres-daily": {
+                "task": "app.worker.tasks.backups.backup_postgres",
+                "schedule": crontab(hour=2, minute=0),
+                "options": {"queue": "maintenance"},
+            },
+            # Backup de objetos de MinIO a destino S3 externo (Ronda 7,
+            # condicional) — 2:15 AM diario, staggered del de Postgres de
+            # arriba. Si no hay destino externo configurado
+            # (settings.BACKUP_S3_*), la tarea se registra como 'failed' con
+            # el motivo y no hace nada más -- ver
+            # app/worker/tasks/backups.py::backup_minio_objects.
+            "backup-minio-daily": {
+                "task": "app.worker.tasks.backups.backup_minio_objects",
+                "schedule": crontab(hour=2, minute=15),
+                "options": {"queue": "maintenance"},
+            },
             # Limpieza archivos temporales MinIO — 3 AM diario
             "cleanup-temp-files": {
                 "task": "app.worker.tasks.maintenance.cleanup_temp_files",
@@ -193,6 +224,7 @@ def create_celery_app() -> Celery:
         "app.worker.tasks.maintenance",
         "app.worker.tasks.security",
         "app.worker.tasks.indexing",
+        "app.worker.tasks.backups",
     ])
 
     return app

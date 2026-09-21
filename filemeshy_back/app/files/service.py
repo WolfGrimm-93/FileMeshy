@@ -21,6 +21,9 @@ Ej:
 import io
 import json
 import logging
+import socket
+import struct
+import time
 import uuid
 from typing import Optional
 
@@ -768,6 +771,148 @@ def object_exists_private(key: str) -> bool:
         return True
     except Exception:
         return False
+
+
+# ---------------------------------------------------------------------------
+# Antivirus (Ronda 7): escaneo de malware vía ClamAV antes de subir a MinIO
+# ---------------------------------------------------------------------------
+# El backend NUNCA sube contenido nuevo a MinIO sin escanearlo primero (ver
+# `_scan_for_malware_or_raise` en router.py, enganchado en los dos únicos
+# lugares donde entra contenido nuevo al sistema: `_validate_and_store_upload`
+# y `_create_new_file_version`). `clamd` corre en su propio contenedor
+# aislado (`clamav/clamav:stable`, ver docker-compose.yml) -- mismo criterio
+# de aislamiento que `office_converter` en Ronda 5, aunque acá no hace falta
+# construir nada custom: la imagen oficial ya trae `freshclam` para mantener
+# las firmas actualizadas.
+#
+# Protocolo TCP INSTREAM implementado a mano con sockets crudos, sin
+# dependencia de terceros -- es simple (chunks con longitud prefijada de 4
+# bytes + comando "zINSTREAM\0") y esto es justamente el tipo de componente
+# de seguridad donde vale más tener control total del manejo de errores
+# (política fail-closed, ver docstring de `scan_for_malware`) que ahorrarse
+# unas líneas con una librería cliente de la que no se audita el código.
+# Referencia del protocolo: https://docs.clamav.net/manual/Usage/Scanning.html
+
+_CLAMAV_CHUNK_SIZE = 8192  # tamaño de chunk arbitrario, cualquier valor razonable sirve
+
+
+class _ScanDeadlineExceeded(Exception):
+    """Señal interna (nunca se propaga fuera de `scan_for_malware`): se
+    agotó el presupuesto TOTAL de `CLAMAV_SCAN_TIMEOUT_SECONDS`, ver
+    `scan_for_malware` -- hallazgo de la revisión adversarial (Ronda 7):
+    `sock.settimeout()` por sí solo es un timeout de INACTIVIDAD por
+    syscall, se resetea en cada `send`/`recv` individual, así que un peer
+    que responde a los tumbos (unos bytes cada tanto, cada intervalo por
+    debajo del timeout configurado) puede estirar la conexión mucho más
+    allá del tiempo "documentado" sin disparar nunca un `socket.timeout`.
+    Reproducido en vivo por la revisión: timeout=2s, servidor fake devolviendo
+    1 byte cada 1.5s -> el escaneo tardó 15s (7.5x lo configurado)."""
+
+
+def scan_for_malware(content: bytes) -> tuple[bool, Optional[str]]:
+    """Escanea `content` contra `clamd` real (nunca simulado) vía TCP
+    INSTREAM, con un deadline TOTAL real (no solo timeout de inactividad
+    por syscall, ver `_ScanDeadlineExceeded`): antes de cada `send`/`recv`
+    se recalcula el tiempo remanente contra `CLAMAV_SCAN_TIMEOUT_SECONDS` y
+    se usa ESE remanente como timeout de la próxima syscall -- así ninguna
+    combinación de operaciones lentas puede hacer que la función completa
+    tarde más que el timeout configurado (con margen chico de overhead
+    real de red, no varios múltiplos).
+
+    Función SÍNCRONA y bloqueante a propósito (sockets crudos, sin
+    async) -- el caller (`_scan_for_malware_or_raise` en router.py) la
+    corre en threadpool (`run_in_threadpool`), nunca directo en el loop de
+    asyncio (hallazgo de la revisión adversarial, Ronda 7: sin eso, un
+    escaneo de ~2s con un archivo grande congelaba el backend ENTERO para
+    todos los usuarios, no solo para quien subía).
+
+    Returns:
+        (es_limpio, nombre_de_amenaza) -- `nombre_de_amenaza` es `None`
+        cuando `es_limpio` es `True`.
+
+    Raises:
+        ConnectionError si `clamd` no responde, se corta la conexión, se
+        agota el deadline total, o devuelve una respuesta que no se puede
+        interpretar. A propósito NO se atrapa acá ni se traduce a "está
+        limpio" -- el caller es quien decide la política fail-closed: sin
+        una confirmación real de `clamd`, el archivo se rechaza (503),
+        nunca se sube en silencio sin escanear.
+    """
+    from app.core.config import settings
+
+    host = settings.CLAMAV_HOST
+    port = settings.CLAMAV_PORT
+    timeout = settings.CLAMAV_SCAN_TIMEOUT_SECONDS
+
+    deadline = time.monotonic() + timeout
+
+    def _remaining_seconds() -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _ScanDeadlineExceeded()
+        return remaining
+
+    sock: Optional[socket.socket] = None
+    try:
+        sock = socket.create_connection((host, port), timeout=_remaining_seconds())
+        sock.settimeout(_remaining_seconds())
+        sock.sendall(b"zINSTREAM\0")
+
+        for offset in range(0, len(content), _CLAMAV_CHUNK_SIZE):
+            chunk = content[offset:offset + _CLAMAV_CHUNK_SIZE]
+            sock.settimeout(_remaining_seconds())
+            sock.sendall(struct.pack("!L", len(chunk)) + chunk)
+        # Chunk de longitud 0 -- le indica a clamd que el stream terminó
+        # (necesario incluso para contenido vacío: sin esto clamd espera
+        # para siempre más datos y la conexión termina en timeout).
+        sock.settimeout(_remaining_seconds())
+        sock.sendall(struct.pack("!L", 0))
+
+        response = b""
+        while True:
+            sock.settimeout(_remaining_seconds())
+            data = sock.recv(4096)
+            if not data:
+                break
+            response += data
+            if response.endswith(b"\0"):
+                break
+    except _ScanDeadlineExceeded:
+        logger.error(
+            f"[Antivirus] clamd ({host}:{port}) superó el tiempo máximo TOTAL "
+            f"configurado ({timeout}s) sin completar el escaneo"
+        )
+        raise ConnectionError(
+            f"El servicio de antivirus no respondió dentro del tiempo máximo permitido ({timeout}s)"
+        )
+    except (OSError, socket.timeout) as e:
+        logger.error(f"[Antivirus] Error de conexión con clamd ({host}:{port}): {e}")
+        raise ConnectionError(
+            f"No se pudo conectar con el servicio de antivirus: {e}"
+        ) from e
+    finally:
+        if sock is not None:
+            sock.close()
+
+    if not response:
+        logger.error(f"[Antivirus] clamd ({host}:{port}) cerró la conexión sin responder")
+        raise ConnectionError("El servicio de antivirus no devolvió respuesta")
+
+    # Formato de respuesta de clamd para INSTREAM (terminada en NUL):
+    #   "stream: OK\0"                      -- limpio
+    #   "stream: <NOMBRE_AMENAZA> FOUND\0"  -- infectado
+    #   "stream: <mensaje de error>\0"      -- ej. tamaño máximo superado
+    reply = response.rstrip(b"\0").decode("utf-8", errors="replace").strip()
+
+    if reply.endswith("OK"):
+        return True, None
+
+    if "FOUND" in reply:
+        threat_name = reply.split(":", 1)[-1].replace("FOUND", "").strip()
+        return False, threat_name or "amenaza desconocida"
+
+    logger.error(f"[Antivirus] Respuesta inesperada de clamd: {reply!r}")
+    raise ConnectionError(f"Respuesta inesperada del servicio de antivirus: {reply}")
 
 
 def upload_private_file_at_key(key: str, content: bytes, content_type: str) -> str:

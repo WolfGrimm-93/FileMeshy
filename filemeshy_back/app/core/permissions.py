@@ -9,6 +9,32 @@ Ejemplo: files.view, files.upload, files.delete, folders.create
 Esto es la ÚNICA FUENTE DE VERDAD para permisos.
 Backend interno puede mapear desde formatos legacy,
 pero siempre normaliza a este formato antes de devolver al cliente.
+
+ADVERTENCIA -- agregar un permiso nuevo a este archivo (CANONICAL_PERMISSIONS
+y/o ROLE_PERMISSIONS_CANONICAL) NO ALCANZA por sí solo. En runtime,
+has_permission() (app/access_control/service.py) NUNCA lee este dict
+directo -- lee `User.permissions`, una columna cacheada que se calcula a
+partir de las tablas REALES `permissions`/`role_permissions`
+(app/access_control/repository.py). Ese cache se recalcula solo cuando cambia
+el rol/las excepciones de un usuario puntual -- nunca automáticamente cuando
+este archivo cambia. Hace falta correr `scripts/seed_permissions.py` (es
+idempotente, seguro de correr las veces que haga falta) para que el permiso
+nuevo llegue de verdad a `permissions`/`role_permissions`; hasta entonces,
+un ADMIN real recibe 403 aunque el permiso ya esté en este dict y el código
+que lo exige ya esté desplegado.
+
+Bug real que motivó esta nota (revisión adversarial, Ronda 7 -- backups,
+2026-09-21): se agregó 'backups.view' acá y a ROLE_PERMISSIONS_CANONICAL['ADMIN'],
+se desplegó el endpoint que lo exige, y los tests pasaron -- pero nadie corrió
+el seed contra la BD real. `SELECT ... FROM permissions WHERE
+permission_code='backups.view'` devolvía 0 filas, y un ADMIN real (no
+SUPER_ADMIN, que bypasea el chequeo de permisos por completo) recibía 403 en
+producción. Los tests no lo agarraron porque usaban `grant_permission()`
+(tests/conftest.py) -- bypass directo de la columna JSON, sin pasar por
+`role_permissions` -- en vez de `make_real_admin()` (mismo archivo), que sí
+ejercita el pipeline completo. Cualquier test que exista específicamente
+para confirmar que un permiso nuevo quedó bien conectado de punta a punta
+debe usar `make_real_admin()`, no `grant_permission()`.
 """
 
 # ================== PERMISOS CANÓNICOS ==================
@@ -68,6 +94,13 @@ CANONICAL_PERMISSIONS = {
     # Cuotas de almacenamiento (pantalla admin de límites por usuario)
     'storage_quotas.view': 'Ver cuotas de almacenamiento',
     'storage_quotas.manage': 'Gestionar cuotas de almacenamiento',
+
+    # Backups (Ronda 7) -- pantalla admin de corridas de backup (Postgres/
+    # MinIO) + disparo manual (GET/POST /admin/backups, ver
+    # app/backups/router.py). Un solo permiso para ambos endpoints -- ver
+    # ese router para el porqué (verificar que el mecanismo funciona es
+    # parte de "verlo", no una acción de gestión aparte).
+    'backups.view': 'Ver y disparar backups del sistema',
 
     # Permisos especiales
     'admin.manage': 'Acceso administrativo completo',
@@ -233,6 +266,9 @@ ROLE_PERMISSIONS_CANONICAL = {
         # Cuotas de almacenamiento
         'storage_quotas.view',
         'storage_quotas.manage',
+
+        # Backups (Ronda 7)
+        'backups.view',
     ],
 
     'USER': [

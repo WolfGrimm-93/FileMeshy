@@ -115,6 +115,16 @@ services:
       # todavía no se sabe si ese servicio va a exponer un healthcheck.
       office_converter:
         condition: service_started
+      # Ronda 7: antivirus -- ver comentario completo del servicio `clamav`
+      # más abajo. A diferencia de `office_converter`, acá SÍ usamos
+      # `service_healthy`: la imagen oficial trae un healthcheck real
+      # (`clamdcheck.sh`) y la base de firmas puede tardar varios minutos en
+      # descargarse la primera vez -- sin esperar a que esté sana de verdad,
+      # el backend arrancaría y cualquier upload fallaría con 503 (fail
+      # closed, ver app/files/router.py::_scan_for_malware_or_raise) hasta
+      # que clamd termine de inicializar.
+      clamav:
+        condition: service_healthy
     ports:
       - "58101:8000"
 
@@ -131,6 +141,9 @@ services:
         condition: service_healthy
       minio:
         condition: service_started
+      # NO depende de `clamav` a propósito -- el worker de Celery (Ronda 6:
+      # indexación/OCR) solo procesa contenido que YA pasó el escaneo de
+      # `backend` al subirse, nunca escanea nada él mismo.
 
   # Ronda 5: conversion Office -> PDF via LibreOffice headless, en su
   # propio contenedor aislado (ver filemeshy_office_converter/Dockerfile
@@ -168,6 +181,86 @@ services:
     pids_limit: 128
     restart: unless-stopped
 
+  # Ronda 7: antivirus -- escaneo de malware (ClamAV) de todo contenido
+  # nuevo ANTES de subirlo a MinIO (ver app/files/service.py::scan_for_malware
+  # y app/files/router.py::_scan_for_malware_or_raise, política fail-closed:
+  # infectado o clamd caído -> se rechaza, nunca se sube sin escanear).
+  #
+  # Imagen OFICIAL `clamav/clamav:stable` -- a diferencia de
+  # `office_converter` (Ronda 5), acá NO se construye nada custom: ya trae
+  # `freshclam` integrado para mantener las firmas actualizadas, no hay nada
+  # que reinventar.
+  #
+  # SIN `ports:` a propósito -- mismo criterio que `office_converter`: solo
+  # `backend` le habla (`CLAMAV_HOST`/`CLAMAV_PORT`, ver
+  # app/core/config.py), por nombre de servicio en la red interna de
+  # compose, nunca alcanzable desde el host.
+  #
+  # `read_only: true` NO es viable acá (a diferencia de `office_converter`):
+  # clamd/freshclam necesitan escribir la base de firmas en
+  # `/var/lib/clamav` en runtime -- se deja ese único directorio como volumen
+  # NOMBRADO (`clamav_data`) en vez de read-only total, importante que sea
+  # persistente entre reinicios o cada arranque tendría que re-descargar
+  # cientos de MB de firmas desde cero.
+  #
+  # No-root: confirmado en vivo (`docker inspect` + `cat /init` +
+  # `id clamav` + `ps aux` dentro del contenedor corriendo) -- los procesos
+  # `clamd`/`freshclam`, los que efectivamente procesan contenido no
+  # confiable, corren como `clamav` (uid=100/gid=101): `clamd` por la
+  # directiva `User clamav` que ya trae `/etc/clamav/clamd.conf` de fábrica,
+  # `freshclam` porque el entrypoint lo lanza con `--user=clamav` explícito.
+  # Solo el proceso 1 (`tini`/`/init`) queda como root durante toda la vida
+  # del contenedor -- ESE root nunca toca red ni contenido de archivos, solo
+  # hace de supervisor (arranca los daemons y hace `tail -f /dev/null`).
+  #
+  # cap_drop CASI total, no ALL: se probó primero `cap_drop: [ALL]` (mismo
+  # criterio que `office_converter`) y el entrypoint oficial falla en
+  # arrancar -- `chown -R clamav:clamav /var/lib/clamav` (necesario para que
+  # el volumen nombrado, creado por Docker con dueño root, quede escribible
+  # por `clamav`) sale con "Operation not permitted" en loop y el contenedor
+  # nunca llega a levantar clamd (confirmado en vivo, reproducido y
+  # solucionado antes de este commit). Se le vuelven a dar solo las 5
+  # capabilities mínimas que ese arranque necesita (CHOWN/FOWNER/
+  # DAC_OVERRIDE para el chown, SETUID/SETGID para que clamd/freshclam
+  # puedan bajar privilegios a `clamav`) -- probado en vivo con este set
+  # exacto: arranca limpio y clamd corre como no-root igual. Diferencia con
+  # `office_converter`: ese servicio nunca necesita ser root ni un instante,
+  # este sí lo necesita brevemente al arrancar para preparar un volumen
+  # persistente.
+  clamav:
+    image: clamav/clamav:stable
+    volumes:
+      - clamav_data:/var/lib/clamav
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - FOWNER
+      - DAC_OVERRIDE
+      - SETUID
+      - SETGID
+    security_opt:
+      - no-new-privileges:true
+    # ClamAV recomienda 2-3GB libres para cargar la base de firmas completa
+    # en memoria -- 2g de tope, generoso pero acotado (sin límite, un
+    # contenido adversarial via INSTREAM no debería poder tumbar el resto
+    # del stack).
+    mem_limit: 2g
+    cpus: 1.0
+    pids_limit: 256
+    # La imagen ya trae su propio HEALTHCHECK (`clamdcheck.sh`, ver
+    # `docker inspect clamav/clamav:stable`) -- se pisa acá solo para subir
+    # `start_period`: el default de la imagen (360s) puede no alcanzar si la
+    # descarga inicial de firmas es lenta (cientos de MB la primera vez),
+    # y `retries`/`interval` quedan más generosos por el mismo motivo.
+    healthcheck:
+      test: ["CMD", "clamdcheck.sh"]
+      interval: 30s
+      timeout: 15s
+      retries: 10
+      start_period: 900s
+    restart: unless-stopped
+
   frontend:
     build:
       context: ./filemeshy_front
@@ -179,3 +272,4 @@ services:
 volumes:
   filemeshy_postgres_data:
   filemeshy_minio_data:
+  clamav_data:

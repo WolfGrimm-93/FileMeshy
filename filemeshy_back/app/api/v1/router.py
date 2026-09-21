@@ -14,6 +14,7 @@ from app.notifications.router import router as notifications_router
 from app.files.router import folders_router, files_router, shares_router, public_shares_router
 from app.storage_quota.router import router as storage_quota_router
 from app.tags.router import router as tags_router
+from app.backups.router import router as backups_router
 from app.shared.feature_flags import router as feature_flags_router
 
 # Router principal V1 - prefijo /api/v1 se define aquí
@@ -77,3 +78,7 @@ api_router.include_router(tags_router, prefix="/tags", tags=["tags"])
 api_router.include_router(storage_quota_router)
 
 api_router.include_router(permissions_router)  # Catálogo permisos canónicos
+
+# Backups automáticos + verificación (Ronda 7) -- prefijo /admin/backups ya
+# fijado en el propio router (mismo criterio que admin_configuration_router).
+api_router.include_router(backups_router)

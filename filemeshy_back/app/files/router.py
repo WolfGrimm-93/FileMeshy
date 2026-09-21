@@ -36,6 +36,7 @@ from fastapi import (
     status,
 )
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from app.access_control.service import has_permission
 from app.auth.service import RateLimiter, get_current_active_user
@@ -81,6 +82,7 @@ from app.files.service import (
     is_pdf_content,
     object_exists_private,
     office_preview_key,
+    scan_for_malware,
     upload_private_file,
     upload_private_file_at_key,
 )
@@ -1006,7 +1008,56 @@ def list_directory(
     return DirectoryListing(folders=folders, files=files, breadcrumb=breadcrumb)
 
 
-def _validate_and_store_upload(
+async def _scan_for_malware_or_raise(content: bytes, *, original_name: str) -> None:
+    """Escanea `content` contra ClamAV real y aborta la request si
+    corresponde -- política fail-closed (Ronda 7): NUNCA se sube nada a
+    MinIO sin una confirmación real de `clamd` (ver `scan_for_malware` en
+    service.py).
+
+    - Infectado -> 422, mensaje con el nombre de la amenaza detectada.
+    - `clamd` no responde/falla la conexión -> 503. Deliberadamente NO se
+      interpreta como "está limpio" -- lo contrario dejaría pasar CUALQUIER
+      archivo sin escanear con solo tirar abajo (o saturar) el contenedor
+      `clamav`, exactamente el escenario que este chequeo existe para
+      prevenir.
+
+    `scan_for_malware` es bloqueante de verdad (sockets crudos sin async,
+    ver service.py) y puede tardar segundos con un archivo grande -- se
+    corre en el threadpool de Starlette (`run_in_threadpool`), NUNCA
+    directo en el loop de asyncio. Confirmado en vivo por la revisión
+    adversarial (Ronda 7): sin esto, un upload de 90MB con ~2.15s de
+    escaneo real hacía que un `GET /files` CONCURRENTE de otro usuario
+    pasara de 0.02s a 1.83s -- con uvicorn sin `--workers`, el escaneo de
+    UN usuario congelaba el backend para TODOS.
+
+    Compartido por `_validate_and_store_upload`/`_create_new_file_version`
+    -- los DOS únicos lugares donde content nuevo entra al sistema, que en
+    conjunto cubren los CUATRO endpoints de subida (`upload_file`,
+    `upload_file_via_share`, `upload_file_version`, `replace_file_via_share`).
+    Se llama ANTES de reservar cuota y ANTES de subir a MinIO en los dos
+    casos."""
+    try:
+        is_clean, threat_name = await run_in_threadpool(scan_for_malware, content)
+    except ConnectionError as e:
+        logger.error(
+            f"[Antivirus] Servicio de antivirus no disponible escaneando '{original_name}': {e}"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Servicio de antivirus no disponible, intentá más tarde",
+        )
+
+    if not is_clean:
+        logger.warning(
+            f"[Antivirus] Archivo '{original_name}' rechazado -- amenaza detectada: {threat_name}"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Archivo rechazado: se detectó contenido malicioso ({threat_name})",
+        )
+
+
+async def _validate_and_store_upload(
     db: Session,
     *,
     owner_id: UUID,
@@ -1049,6 +1100,12 @@ def _validate_and_store_upload(
     # sobreescribe `content_type` con el verificado -- ver
     # `_resolve_verified_content_type`.
     content_type = _resolve_verified_content_type(content, content_type)
+
+    # Ronda 7: escaneo de malware (ClamAV) -- ANTES de reservar cuota y de
+    # subir nada a MinIO. Ver `_scan_for_malware_or_raise` para la política
+    # fail-closed completa (y por qué esta función pasó a ser `async` --
+    # el escaneo corre en threadpool, nunca bloqueante en el loop).
+    await _scan_for_malware_or_raise(content, original_name=original_name)
 
     # Cuota de almacenamiento del DUEÑO real (`owner_id`) -- en un upload vía
     # share (Ronda 3) puede no ser `current_user`, ver `upload_file_via_share`.
@@ -1137,7 +1194,7 @@ async def upload_file(
             detail=f"El archivo supera el tamaño máximo permitido ({settings.MAX_UPLOAD_SIZE_MB} MB)",
         )
 
-    return _validate_and_store_upload(
+    return await _validate_and_store_upload(
         db, owner_id=current_user.id, folder_id=folder_id, upload=file, content=content,
         created_by_id=current_user.id,
     )
@@ -1374,7 +1431,7 @@ def copy_file(
 # VERSIONES -- historial de versiones de un archivo (Ronda 4)
 # ============================================================
 
-def _create_new_file_version(
+async def _create_new_file_version(
     db: Session,
     file_obj: FileModel,
     *,
@@ -1409,6 +1466,12 @@ def _create_new_file_version(
     _, extension = os.path.splitext(original_filename or file_obj.name)
     declared_content_type = declared_content_type or "application/octet-stream"
     content_type = _resolve_verified_content_type(content, declared_content_type)
+
+    # Ronda 7: escaneo de malware (ClamAV) -- ANTES de reservar cuota y de
+    # subir nada a MinIO. Ver `_scan_for_malware_or_raise` para la política
+    # fail-closed completa (y por qué esta función pasó a ser `async` --
+    # el escaneo corre en threadpool, nunca bloqueante en el loop).
+    await _scan_for_malware_or_raise(content, original_name=original_filename or file_obj.name)
 
     reserve_upload_bytes(db, quota_owner_id, len(content))
 
@@ -1501,7 +1564,7 @@ async def upload_file_version(
             detail=f"El archivo supera el tamaño máximo permitido ({settings.MAX_UPLOAD_SIZE_MB} MB)",
         )
 
-    return _create_new_file_version(
+    return await _create_new_file_version(
         db,
         file_obj,
         content=content,
@@ -1921,7 +1984,7 @@ async def upload_file_via_share(
             detail=f"El archivo supera el tamaño máximo permitido ({settings.MAX_UPLOAD_SIZE_MB} MB)",
         )
 
-    return _validate_and_store_upload(
+    return await _validate_and_store_upload(
         db,
         owner_id=target_folder.owner_id,
         folder_id=target_folder.id,
@@ -1975,7 +2038,7 @@ async def replace_file_via_share(
             detail=f"El archivo supera el tamaño máximo permitido ({settings.MAX_UPLOAD_SIZE_MB} MB)",
         )
 
-    return _create_new_file_version(
+    return await _create_new_file_version(
         db,
         target_file,
         content=content,

@@ -106,6 +106,37 @@ class Settings(BaseSettings):
     # ===== FILES (Almacenamiento) =====
     MAX_UPLOAD_SIZE_MB: int = 100  # Nginx (filemeshy_front/nginx.conf) limita a 100MB -- nunca superar ese valor acá
 
+    # ===== BACKUPS (Ronda 7 -- backups automáticos + verificación) =====
+    # Backup de Postgres: pg_dump completo (toda la base física -- en modo
+    # cloud eso incluye TODOS los schemas de tenant de una sola pasada,
+    # porque son schemas de la MISMA base, no bases separadas), comprimido y
+    # subido a MinIO (ver app/worker/tasks/backups.py::backup_postgres).
+    # Bucket dedicado y PRIVADO (mismo criterio que MINIO_PRIVATE_BUCKET --
+    # nunca política de lectura pública, ver
+    # app/files/service.py::_ensure_private_bucket).
+    BACKUP_POSTGRES_BUCKET: str = "filemeshy-backups"
+    # Retención: después de cada backup exitoso, se borran (el objeto real
+    # en MinIO -- la fila BackupRun se conserva como registro histórico) los
+    # backups de Postgres con más de N días.
+    BACKUP_RETENTION_DAYS: int = 14
+
+    # ===== BACKUP DE MINIO A DESTINO S3 EXTERNO (Ronda 7, opcional) =====
+    # Un backup de TODO el contenido de MinIO (filemeshy-media +
+    # filemeshy-media-private) es caro (duplica el storage completo) y, si
+    # se guarda en el MISMO disco/servidor, NO protege contra una falla de
+    # disco real -- daría una falsa sensación de seguridad. Por eso el
+    # backup de MinIO SOLO se intenta si estas 4 variables están TODAS
+    # configuradas, apuntando a un S3-compatible EXTERNO real (otro
+    # proveedor, otra región, otro servidor físico). Si falta cualquiera,
+    # `backup_minio_objects` (app/worker/tasks/backups.py) se registra como
+    # 'failed' con el motivo explícito, sin intentar nada -- limitación
+    # conocida documentada en PENDIENTES.md, nunca una falsa sensación de
+    # "ya hay backup de archivos".
+    BACKUP_S3_ENDPOINT: Optional[str] = None
+    BACKUP_S3_BUCKET: Optional[str] = None
+    BACKUP_S3_ACCESS_KEY: Optional[str] = None
+    BACKUP_S3_SECRET_KEY: Optional[str] = None
+
     # ===== OFFICE CONVERTER (Ronda 5 -- preview extendido) =====
     # URL interna (red Docker) del servicio aislado que convierte documentos
     # Office (docx/xlsx/pptx, + legacy doc/xls/ppt) a PDF para preview -- ver
@@ -115,6 +146,16 @@ class Settings(BaseSettings):
     # el navegador (no tiene puerto publicado al host, igual que Postgres/
     # Redis/MinIO internos) -- el backend es el único cliente.
     OFFICE_CONVERTER_URL: str = "http://office_converter:8080"
+
+    # ===== ANTIVIRUS (Ronda 7 -- escaneo de malware) =====
+    # Host/puerto internos (red Docker) del servicio `clamd` -- ver
+    # `app/files/service.py::scan_for_malware`. Mismo criterio que
+    # OFFICE_CONVERTER_URL: nunca alcanzable desde el navegador (sin puerto
+    # publicado al host, ver docker-compose.yml), solo el backend le habla
+    # por nombre de servicio en la red interna de Docker.
+    CLAMAV_HOST: str = "clamav"
+    CLAMAV_PORT: int = 3310
+    CLAMAV_SCAN_TIMEOUT_SECONDS: int = 30
 
     # ===== PROXIES DE CONFIANZA (ver app/auth/router.py::_get_real_ip) =====
     # Los headers CF-Connecting-IP/X-Real-IP los puede mandar CUALQUIER cliente

@@ -68,6 +68,10 @@ export const Permission = {
   // Cuotas de almacenamiento por usuario
   VIEW_STORAGE_QUOTAS: 'storage_quotas.view',
   MANAGE_STORAGE_QUOTAS: 'storage_quotas.manage',
+
+  // Backups (Postgres + MinIO) -- backups.view es el único permiso del
+  // backend, cubre tanto ver el historial como disparar un backup manual.
+  VIEW_BACKUPS: 'backups.view',
 } as const
 
 export type PermissionType = (typeof Permission)[keyof typeof Permission]
@@ -219,6 +223,19 @@ export const routeConfig: RouteConfig[] = [
       title: 'Configuración - FileMeshy',
       description: 'Configuración y ajustes del sistema',
       keywords: ['configuración', 'settings', 'ajustes', 'preferencias'],
+    },
+  },
+  {
+    path: '/copias-seguridad',
+    title: 'Copias de Seguridad',
+    icon: 'DatabaseBackup',
+    component: 'BackupsPage',
+    showInNav: true,
+    requiredPermissions: [Permission.VIEW_BACKUPS],
+    meta: {
+      title: 'Copias de Seguridad - FileMeshy',
+      description: 'Historial y ejecución manual de backups de Postgres y MinIO',
+      keywords: ['backups', 'copias de seguridad', 'postgres', 'minio', 'respaldo'],
     },
   },
 ]

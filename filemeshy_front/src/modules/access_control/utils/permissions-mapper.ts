@@ -87,6 +87,9 @@ const VALID_PERMISSIONS = new Set<string>([
   // Cuotas de almacenamiento por usuario
   'storage_quotas.view',
   'storage_quotas.manage',
+
+  // Backups (Postgres + MinIO)
+  'backups.view',
 ])
 
 /**

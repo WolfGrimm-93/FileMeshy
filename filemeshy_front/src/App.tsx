@@ -46,6 +46,8 @@ const StorageQuotasPage = lazy(() => import('./modules/storage_quota/pages/Stora
 
 // Configuración
 const ConfiguracionPage = lazy(() => import('./modules/configuration/pages/ConfiguracionPage'))
+// Copias de seguridad (Ronda 7)
+const BackupsPage = lazy(() => import('./modules/configuration/pages/BackupsPage'))
 
 // Sistema
 const LogsPage = lazy(() => import('./modules/audit/pages/LogsPage'))
@@ -227,6 +229,13 @@ const router = createBrowserRouter([
             path: 'configuracion',
             element: <ConfiguracionPage />,
             loader: requirePermissions([Permission.VIEW_SETTINGS]),
+          },
+          // Copias de seguridad (Ronda 7) -- backups.view es el único
+          // permiso del backend para este módulo (ver + disparar).
+          {
+            path: 'copias-seguridad',
+            element: <BackupsPage />,
+            loader: requirePermissions([Permission.VIEW_BACKUPS]),
           },
 
           // 404 - Debe estar al final

@@ -6,6 +6,7 @@ import {
   Folder,
   HardDrive,
   Share2,
+  DatabaseBackup,
 } from 'lucide-react'
 import { useAuthStore } from '@/modules/auth/store/authStore'
 import { useSidebarStore } from '@/app/store/sidebarStore'
@@ -136,6 +137,16 @@ export default function Sidebar() {
       to: '/cuotas-almacenamiento',
       tooltip: 'Cuotas de Almacenamiento',
       permission: 'storage_quotas.view',
+    },
+    // Copias de seguridad (Ronda 7) -- backups.view es el único permiso
+    // del backend para este módulo (ver + disparar backup manual).
+    {
+      id: 'copias-seguridad',
+      label: 'Copias de Seguridad',
+      icon: <DatabaseBackup className="w-5 h-5" />,
+      to: '/copias-seguridad',
+      tooltip: 'Copias de Seguridad',
+      permission: 'backups.view',
     },
   ]
 
