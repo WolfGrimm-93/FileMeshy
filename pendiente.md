@@ -353,6 +353,78 @@ Suite: 7 tests nuevos de antivirus, incluidos 2 de regresión para los hallazgos
   tope de reintentos a nivel de broker — un archivo que confiablemente exceda el límite podría
   generar redelivery indefinida sobre la cola `indexing`.
 
+**Hecho (2026-09-22) — Ronda 8 del plan de construcción: UI de administración de tenants — cierra el roadmap completo.**
+Panel de administración de tenants SEPARADO del panel admin normal de la app, en rutas
+propias `/plataforma/login` y `/plataforma/tenants` — decisión de arquitectura confirmada con
+el usuario antes de construir: el provisioning de tenants ya estaba protegido por un header
+`X-Platform-Key` (secreto de plataforma, no JWT/RBAC normal), a propósito, para que ningún
+admin de una empresa cliente pueda ver/crear otros tenants (aislamiento cross-tenant ya
+documentado en el propio código desde antes de esta ronda). Integrarlo al RBAC normal habría
+requerido inventar un concepto de "super-admin de plataforma" inexistente en el modelo de
+usuarios (cada usuario vive en un solo tenant/schema) y habría debilitado ese aislamiento a
+propósito — se descartó esa opción.
+
+Backend: nuevo `PATCH /platform/tenants/{tenant_id}` (activar/desactivar, cambiar plan) + rate
+limiting real sobre `get_platform_admin` (10 intentos fallidos/15min por IP, reusa
+`RateLimiter` y `_get_real_ip` ya existentes de la Ronda 1, el 429 dispara ANTES de comparar la
+key). Frontend: módulo nuevo `src/modules/platform_admin/` con su propio cliente HTTP
+standalone (key en `sessionStorage`, no `localStorage`; sin JWT/CSRF/cookies), fuera de
+`Sidebar`/RBAC — solo alcanzable tipeando la URL directamente.
+
+Pasó por implementación (2 agentes, backend/frontend en paralelo) → revisión adversarial (2
+agentes: seguridad + producto/correctitud) → feedback → auditor final → pruebas (2 agentes de
+confirmación independiente), con gating estricto entre fases. Hallazgos, todos corregidos y
+reverificados en vivo:
+
+1. **[MEDIO]** `TenantCreateResponse` no declaraba el campo `admin_email` — Pydantic lo
+   descartaba en silencio al armar la respuesta de creación, aunque el servicio ya lo calculaba
+   internamente; el panel de credenciales del tenant recién creado quedaba con el email vacío.
+   Corregido, con test de regresión.
+2. **[MEDIO]** `tenant_id` sin tipar como `UUID` en el GET-por-id y en el PATCH nuevo — un
+   valor malformado en la URL explotaba con `DataError` de Postgres → 500 genérico, en vez de
+   un 422 limpio antes de tocar la base. Corregido tipando `UUID` (mismo patrón ya usado en el
+   resto del codebase), con test de regresión.
+3. **[CRÍTICO, de proceso]** `docker-compose.override.yml` (creado puntualmente para poder
+   probar el modo `cloud` en el stack de dev/test) forzaba `DEPLOYMENT_MODE=cloud` +
+   `PLATFORM_API_KEY` de prueba, y quedó sin trackear en git y **sin gitignorear**. Mientras
+   estuvo puesto rompió las 94 tests preexistentes (en modo cloud, `TenantMiddleware` exige
+   `X-Tenant-Slug` en toda request y ningún test viejo lo manda) y, más grave, habría roto la
+   APP NORMAL completa (login, archivos, todo) para cualquiera que clonara el repo y corriera
+   `docker compose up` sin saberlo — Compose lo mergea automáticamente, sin necesitar `-f`.
+   Resuelto: agregado a `.gitignore` con el motivo documentado; el archivo se sacó del checkout
+   activo al cerrar la ronda y el stack quedó de nuevo en modo `local` por defecto, confirmado
+   con la suite completa en verde.
+4. **Frontend — 6 hallazgos de UX/correctitud** de la revisión adversarial, corregidos y
+   reverificados con Playwright: estado de error indistinguible de "lista vacía"; un guard
+   (`isToggling`) que aparentaba proteger contra el cierre prematuro del diálogo de confirmación
+   y en realidad no lo hacía (reemplazado por un estado real por fila); las 2 rutas nuevas sin
+   `errorElement` (único caso en toda la app); flicker breve mostrando "no hay datos" durante la
+   carga inicial; mensaje de login engañoso ante un fallo de red real (mostraba "clave
+   incorrecta" en vez de "no se pudo conectar al servidor"); y un comentario de código
+   desactualizado.
+
+Suite: 94 + 8 = 102 tests. Los 8 nuevos de `test_platform_tenants.py` quedan **SKIPPED** en modo
+`local` por defecto (`pytestmark` condicionado a `DEPLOYMENT_MODE=cloud`) y pasan 8/8 cuando se
+activa el modo cloud puntualmente para probarlos. Suite completa reverificada de forma
+independiente por 2 agentes tras cerrar la ronda: **94 passed, 8 skipped, 0 failed** en modo
+local (el modo real de este stack y de producción hoy).
+
+**Deuda residual nueva, no bloqueante:**
+
+- No hay ningún mecanismo de sesión del lado servidor para el panel de plataforma — la key se
+  pega directo en un form y viaja como header en cada request; es consistente con el nivel de
+  confianza que `X-Platform-Key` ya exigía desde antes de esta ronda, pero no hay expiración más
+  allá de cerrar la pestaña (`sessionStorage`) ni ningún registro de auditoría de quién usó la
+  key y cuándo.
+- La contraseña inicial del super admin generado al crear un tenant sigue sin viajar por la API
+  (decisión de diseño preexistente, respetada a propósito en esta ronda) — el operador tiene que
+  copiarla de los logs del contenedor `backend` y entregarla por un canal seguro; el panel nuevo
+  lo explica en pantalla pero no lo resuelve.
+- Para volver a probar el panel de plataforma en el futuro hace falta recrear un
+  `docker-compose.override.yml` puntual (2 líneas: `DEPLOYMENT_MODE=cloud` +
+  `PLATFORM_API_KEY`) — ya documentado en el comentario del `.gitignore`, pero no hay ninguna
+  guía paso a paso en el repo.
+
 ### 🟠 Seguridad — importante pero no bloqueante
 
 - `SECRET_KEY` con default hardcodeado en `core/config.py:32` — mitigado por una guarda que
@@ -392,7 +464,7 @@ Suite: 7 tests nuevos de antivirus, incluidos 2 de regresión para los hallazgos
 
 - Antes de la auditoría del 19: **0% de cobertura**, sin pytest ni vitest configurado en
   ningún lado del repo.
-- Tras las Rondas 1-7: `filemeshy_back/tests/` (94 tests) + `filemeshy_back/requirements-dev.txt`
+- Tras las Rondas 1-8: `filemeshy_back/tests/` (102 tests) + `filemeshy_back/requirements-dev.txt`
   — decidir si se incorporan al repo. Cubre: auth (registro, login, 2FA end-to-end), IDOR de
   archivos, carpetas, shares y versiones (copy, tags, compartir a usuario, escalación vía
   permission=edit, restore/purga de versiones), favoritos/orden con regresión explícita del bug
@@ -401,14 +473,17 @@ Suite: 7 tests nuevos de antivirus, incluidos 2 de regresión para los hallazgos
   cache/invalidación/tamaño/rate-limit de preview de Office, indexación de contenido/OCR con
   regresión del bug de mappers del worker, escaneo de malware (EICAR) en los 4 puntos de
   entrada con regresión del bloqueo de event loop y del timeout no-total, backups de Postgres
-  con verificación real en MinIO y RBAC por el camino real de asignación de rol (no bypass), y
-  regresión de los 3 fixes de seguridad más fáciles de reproducir automatizadamente (spoofing
-  de IP, DoS 2FA, flag de registro).
-- Última corrida (contra la imagen final reconstruida, backend Y `celery_worker`): **94
-  passed, 0 failed**, sin flakiness.
-- Falta: tests de frontend (cero — la Ronda 1 se verificó visualmente a mano con Playwright
-  ad-hoc, no queda como suite automatizada), tests de aislamiento multi-tenant, y CI que
-  corra esto automáticamente (no hay ningún pipeline en el repo).
+  con verificación real en MinIO y RBAC por el camino real de asignación de rol (no bypass),
+  administración de tenants (rate-limit, PATCH activar/desactivar con efecto real vía
+  `TenantMiddleware`, validación de UUID), y regresión de los 3 fixes de seguridad más fáciles
+  de reproducir automatizadamente (spoofing de IP, DoS 2FA, flag de registro).
+- Última corrida (contra la imagen final reconstruida, backend Y `celery_worker`, modo `local`
+  por defecto): **94 passed, 8 skipped, 0 failed**, sin flakiness. Los 8 skipped son
+  `test_platform_tenants.py` completo (solo corren con `DEPLOYMENT_MODE=cloud` activo, ver
+  Ronda 8) — pasan 8/8 cuando se activa puntualmente.
+- Falta: tests de frontend (cero — cada ronda se verificó visualmente a mano con Playwright
+  ad-hoc, no queda como suite automatizada), tests de aislamiento multi-tenant más allá de los
+  de la Ronda 8, y CI que corra esto automáticamente (no hay ningún pipeline en el repo).
 
 ### 📋 Funcionalidades de producto — gaps priorizados (vs. `docs/checklist-funcionalidades.md`)
 
@@ -436,7 +511,11 @@ menor, no planificado en ninguna ronda por ahora.
 **Resuelto en Ronda 7 (2026-09-21):** escaneo de virus/malware en todo contenido nuevo subido
 (ClamAV, fail-closed). Backup automático de Postgres, con verificación real y retención.
 
-Gaps que siguen abiertos, ver roadmap de rondas al final del archivo:
+**Resuelto en Ronda 8 (2026-09-22):** UI de administración de tenants (multi-tenant), como
+panel separado del admin normal — crear/listar/activar/desactivar/cambiar plan, protegido por
+`X-Platform-Key`. Cierra el roadmap de construcción completo (rondas 1 a 8).
+
+Gaps que siguen abiertos:
 
 1. **Parcialmente resuelto en Ronda 7:** el backup de MinIO (contenido de archivos) sigue sin
    cobertura real — la tarea existe pero requiere un destino S3 externo que hoy no está
@@ -446,11 +525,10 @@ Gaps que siguen abiertos, ver roadmap de rondas al final del archivo:
    2026-09-20): cliente de escritorio, app móvil, sincronización selectiva, acceso offline
    real y edición colaborativa en tiempo real quedan fuera del alcance actual del roadmap de
    construcción — no son un olvido, es una decisión tomada.
-3. Multi-tenant real a nivel de datos (schema-per-tenant, bien implementado, activo solo si
-   `DEPLOYMENT_MODE=cloud`) pero sin ninguna UI de gestión — solo utilizable vía CLI/API
-   interna, no es autoservicio hoy. Planificado: Ronda 8.
-4. Formato de error inconsistente entre excepciones tipadas (`{status,message,data}`) y
-   errores de validación Pydantic (`{"detail":[...]}`) — dos formatos conviven en la API.
+3. Formato de error inconsistente entre excepciones tipadas (`{status,message,data}`) y
+   errores de validación Pydantic (`{"detail":[...]}`) — dos formatos conviven en la API
+   (confirmado que el panel de plataforma de la Ronda 8 también usa el formato
+   `{status,message,data}`, no es un caso aislado).
 
 ### 🏗️ Estándares técnicos — gaps priorizados (vs. `docs/estandares-cliente-servidor-2026/`)
 
@@ -473,6 +551,10 @@ Gaps que siguen abiertos, ver roadmap de rondas al final del archivo:
    `docker-compose.prod.yml` (sí los tienen postgres/redis/minio).
 10. Swagger/Redoc/OpenAPI solo se exponen si `DEBUG=True` — en producción no hay contrato
     de API consultable ni por el propio equipo.
+11. ESLint del frontend no está limpio en baseline (confirmado en Ronda 8: 58 errores/8
+    warnings preexistentes en todo `filemeshy_front/`, ninguno introducido por rondas de
+    construcción) — mismo problema de fondo que el punto 5 (Ruff sin config forzada en
+    backend), del lado frontend: sin gate en CI, la deuda de lint solo crece.
 
 ### 🐛 Bugs puntuales confirmados en vivo
 
@@ -490,19 +572,24 @@ Gaps que siguen abiertos, ver roadmap de rondas al final del archivo:
   `audit-test@wolfgrimm.local` — este último permanentemente bloqueado para login, ver bug
   puntual más abajo) — no es producción. Se puede tirar abajo con `docker compose down -v`
   cuando se quiera.
-- Rondas 1 (`d91a47f`), 2 (`61ca9f1`), 3 (`9b08c35`), 4 (`7e9feba`), 5 (`a1c2680`) y 6
-  (`d833b83`) commiteadas, 2026-09-20/21. Todo el código de la Ronda 7 (backend: antivirus
-  ClamAV + `app/backups/`; servicio Docker nuevo `clamav`; frontend: página "Copias de
-  Seguridad") está en el working tree, sin commitear todavía — pendiente confirmación
-  explícita del usuario antes de commitear. Recordatorio operativo real (no solo de código):
-  antes de considerar el permiso `backups.view` activo en cualquier entorno nuevo, hay que
-  correr `scripts/seed_permissions.py` — agregar un permiso al dict de `permissions.py` no lo
-  propaga solo a las tablas reales (bug real de esta ronda, ya corregido en este stack).
+- Rondas 1 (`d91a47f`), 2 (`61ca9f1`), 3 (`9b08c35`), 4 (`7e9feba`), 5 (`a1c2680`), 6
+  (`d833b83`) y 7 (`05bd75f`) commiteadas, 2026-09-20/21. Ronda 8 (panel de administración de
+  tenants) en working tree al momento de escribir esto, commit pendiente inmediato. Recordatorio
+  operativo real (no solo de código): antes de considerar el permiso `backups.view` activo en
+  cualquier entorno nuevo, hay que correr `scripts/seed_permissions.py` — agregar un permiso al
+  dict de `permissions.py` no lo propaga solo a las tablas reales (bug real de la Ronda 7, ya
+  corregido en este stack).
 - El stack de prueba se cayó por reinicios del host varias veces durante el trabajo de las
   Rondas 2 a 7 — siempre se recuperó sin pérdida de código (todo en disco) ni de datos de
   prueba (volumen de Postgres persistente); solo hizo falta recrear el contenedor backend con
   `--force-recreate` (un error transitorio de permisos en el primer arranque en bloque tras
   cada reinicio, no un bug real).
+- Para probar el panel de plataforma (Ronda 8) hace falta modo `DEPLOYMENT_MODE=cloud`, que
+  este stack de dev/test NO usa por defecto (el resto de la app asume modo `local`). Se prueba
+  con un `docker-compose.override.yml` puntual (gitignoreado, NUNCA comitear — ver el propio
+  `.gitignore` para el motivo completo) con `DEPLOYMENT_MODE=cloud` + `PLATFORM_API_KEY`, y se
+  saca del checkout al terminar de probar — dejarlo puesto rompe la suite completa y la app
+  normal, porque en modo cloud `TenantMiddleware` exige `X-Tenant-Slug` en toda request.
 
 ### Roadmap de construcción (rondas siguientes, backlog completo)
 
@@ -517,7 +604,7 @@ Aprobado con el usuario el 2026-09-20. Cada ronda se diseña en detalle recién 
 | 5 (hecho) | Preview extendido (video, audio, documentos de Office) — **completa** |
 | 6 (hecho) | Búsqueda por contenido + OCR — **completa** |
 | 7 (hecho) | Antivirus (ClamAV) en upload + backups automáticos de Postgres/MinIO — **completa** (MinIO condicional a config externa, ver Ronda 7 arriba) |
-| 8 | UI de administración de tenants |
+| 8 (hecho) | UI de administración de tenants — **completa**, roadmap cerrado |
 
 Fuera de alcance por decisión de producto (no construir sin pedido explícito nuevo): cliente
 de escritorio, app móvil, sincronización selectiva, acceso offline real, edición colaborativa
@@ -525,36 +612,40 @@ en tiempo real.
 
 ### Semáforo
 
-**Rondas 1 a 7 completas y verificadas en vivo** (incluida verificación visual en navegador
-real, y desde Ronda 3 en adelante, reproducción de escenarios de punta a punta por el propio
-Auditor Final, incluida verificación de contenido real —no solo capturas— en las Rondas 5, 6 y
-7). Listo para uso interno de un solo usuario/equipo pequeño en red cerrada — los 6
-bloqueadores de seguridad de la auditoría del 19 están resueltos, y el Drive ganó favoritos,
-orden real, copiar, cuota visible, etiquetas, compartir granular (contraseña, permisos,
-usuarios específicos) con notificaciones reales, versionado de archivos con historial
-completo, preview de video/audio/Office, búsqueda por contenido + OCR, escaneo de malware en
-toda subida, y backups automáticos de Postgres con verificación real. **Todavía no listo para
-exposición pública a Internet sin decisión** sobre las deudas residuales de seguridad marcadas
-arriba en cada ronda (todas confirmadas no explotables hoy, pero dependen de configuración de
-producción que este repo de trabajo no controla directamente, de defensa en profundidad
-pendiente, o de contratar un destino externo): `TRUSTED_PROXY_IPS` vacío en producción real, el
-balde compartido de rate-limit en shares públicos, la falta de rate-limit en los endpoints
-autenticados de shares dirigidos, la red no dedicada de los servicios `office_converter` y
-`clamav`, la falta de tope de páginas/reintentos en la indexación de PDFs de texto embebido, y
-la ausencia de backup real de los archivos de usuario en MinIO (solo sus metadatos) hasta que
-se configure un destino S3 externo.
+**Roadmap de construcción completo: Rondas 1 a 8, todas verificadas en vivo** (incluida
+verificación visual en navegador real, y desde Ronda 3 en adelante, reproducción de escenarios
+de punta a punta por el propio Auditor Final, incluida verificación de contenido real —no solo
+capturas— en las Rondas 5, 6, 7 y 8). Listo para uso interno de un solo usuario/equipo pequeño
+en red cerrada — los 6 bloqueadores de seguridad de la auditoría del 19 están resueltos, y el
+Drive ganó favoritos, orden real, copiar, cuota visible, etiquetas, compartir granular
+(contraseña, permisos, usuarios específicos) con notificaciones reales, versionado de archivos
+con historial completo, preview de video/audio/Office, búsqueda por contenido + OCR, escaneo de
+malware en toda subida, backups automáticos de Postgres con verificación real, y administración
+de tenants multi-tenant vía panel separado. **Todavía no listo para exposición pública a
+Internet sin decisión** sobre las deudas residuales de seguridad marcadas arriba en cada ronda
+(todas confirmadas no explotables hoy, pero dependen de configuración de producción que este
+repo de trabajo no controla directamente, de defensa en profundidad pendiente, o de contratar un
+destino externo): `TRUSTED_PROXY_IPS` vacío en producción real, el balde compartido de
+rate-limit en shares públicos, la falta de rate-limit en los endpoints autenticados de shares
+dirigidos, la red no dedicada de los servicios `office_converter` y `clamav`, la falta de tope
+de páginas/reintentos en la indexación de PDFs de texto embebido, la ausencia de backup real de
+los archivos de usuario en MinIO (solo sus metadatos) hasta que se configure un destino S3
+externo, y la ausencia de sesión/expiración/auditoría real en el panel de plataforma de la
+Ronda 8 (hoy solo la propia key, sin capa adicional).
 
-**Patrón recurrente confirmado en 4 de las últimas 5 rondas, siempre atrapado por el propio
+**Patrón recurrente confirmado en 5 de las últimas 6 rondas, siempre atrapado por el propio
 proceso antes de cerrar la ronda, nunca por pytest solo:** un bug de "código que funciona en el
 proceso de tests pero se rompe en el proceso/entorno real" (Ronda 4: `celery_worker` con imagen
 vieja; Ronda 5: contrato roto solo visible contra el backend real; Ronda 6: registro de mappers
 de SQLAlchemy envenenado según el orden de tareas en el worker real; Ronda 7: un permiso nuevo
 en el código que nunca se sembró en la tabla real, invisible para tests que usan un bypass
-directo de BD en vez del camino real de asignación de rol). Todos aparecieron recién al probar
-contra el stack Docker completo levantado, con datos y flujos reales. Confirma que la
-verificación en vivo (no solo tests unitarios/aislados, y no solo tests que "pasan" sin
-ejercitar el camino real que usa un usuario de verdad) sigue siendo imprescindible antes de
-cerrar cualquier ronda futura.
+directo de BD en vez del camino real de asignación de rol; Ronda 8: un campo (`admin_email`)
+descartado en silencio por el schema de respuesta, y una `tenant_id` sin tipar que solo
+explotaba con un valor real malformado — ninguno de los dos visible leyendo el código sin
+probarlo en vivo). Todos aparecieron recién al probar contra el stack Docker completo levantado,
+con datos y flujos reales. Confirma que la verificación en vivo (no solo tests
+unitarios/aislados, y no solo tests que "pasan" sin ejercitar el camino real que usa un usuario
+de verdad) sigue siendo imprescindible antes de cerrar cualquier ronda futura.
 
 **Lección de proceso confirmada en Ronda 4** (ya aplicada, dejar como recordatorio para
 rondas futuras y para cualquier deploy real): reconstruir solo `backend` no alcanza cuando el

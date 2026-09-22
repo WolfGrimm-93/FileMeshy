@@ -43,3 +43,12 @@ Desktop.ini
 # que pueda hacerse público
 CLAUDE.md
 docker-compose.prod.yml
+
+# Override de solo test/dev para probar modo cloud (multi-tenant) en local --
+# Docker Compose lo mergea automáticamente sin -f, así que NUNCA debe
+# comitearse: activaría DEPLOYMENT_MODE=cloud (y exige X-Tenant-Slug en toda
+# request via TenantMiddleware) para cualquiera que clone el repo y levante
+# el stack, rompiendo el modo local normal + la suite de tests existente
+# (ver pendiente.md, Ronda 8). Se genera puntualmente cuando hace falta
+# probar el panel de plataforma, se borra después.
+docker-compose.override.yml

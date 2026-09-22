@@ -311,3 +311,36 @@ def list_tenants(db) -> list:
 def get_tenant_by_id(db, tenant_id):
     """Tenant por ID, o None si no existe."""
     return db.query(Tenant).filter(Tenant.id == tenant_id).first()
+
+
+# ============================================================
+# WRAPPER PÚBLICO DE ESCRITURA (Ronda 8 -- panel de administración de tenants)
+# ============================================================
+
+def actualizar_tenant(db, tenant_id, *, is_active: bool | None = None, plan: str | None = None) -> Tenant | None:
+    """PATCH parcial sobre un tenant existente -- solo pisa los campos que vinieron
+    explícitos (no `None`), para no resetear sin querer un campo que el llamante
+    no quiso tocar. Devuelve `None` si el tenant no existe, o la fila actualizada.
+
+    Desactivar un tenant (`is_active=False`) NO toca su schema ni sus datos --
+    solo el flag que `TenantMiddleware._resolve_schema` (app/shared/middleware/tenant.py)
+    ya lee en cada request: con el flag en `False`, el middleware devuelve 403
+    ("Tenant inactivo") antes de resolver el schema, sin tocar una sola fila del
+    tenant. Reactivarlo (`is_active=True`) revierte el bloqueo sin ningún otro
+    efecto -- los datos siguieron intactos todo el tiempo.
+
+    `updated_at` no se toca a mano -- ya tiene `onupdate=func.now()` en el
+    modelo (Tenant.updated_at), se actualiza solo con cualquier UPDATE real.
+    """
+    tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+    if tenant is None:
+        return None
+
+    if is_active is not None:
+        tenant.is_active = is_active
+    if plan is not None:
+        tenant.plan = plan
+
+    db.commit()
+    db.refresh(tenant)
+    return tenant

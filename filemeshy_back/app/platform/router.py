@@ -19,21 +19,38 @@ Exentos de TenantMiddleware (administran la tabla `tenants` en sí, viven en
 """
 import secrets
 from typing import Optional
+from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import APIKeyHeader
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.database import get_db
 from app.configuration import service as configuration_service
-from app.tenants.service import provisionar_tenant, ProvisioningError, list_tenants, get_tenant_by_id
+from app.tenants.service import (
+    provisionar_tenant,
+    ProvisioningError,
+    list_tenants,
+    get_tenant_by_id,
+    actualizar_tenant,
+)
 from app.shared.schemas.common import SuccessResponse
 from app.platform.schemas import (
     TenantCreateRequest,
     TenantCreateResponse,
     TenantListItem,
+    TenantUpdateRequest,
 )
+# Reusa el rate limiter real (Redis con fallback en memoria) ya usado por
+# /auth/login y /auth/register -- no reimplementar rate limiting desde cero.
+from app.auth.service import RateLimiter
+# Reusa la resolución de IP confiable (Ronda 1: no confía en headers
+# spoofeables como X-Real-IP/CF-Connecting-IP salvo que la conexión TCP real
+# venga de settings.TRUSTED_PROXY_IPS) -- mismo motivo que /auth, un secreto
+# de alto privilegio como X-Platform-Key no puede rate-limitearse por un
+# header que cualquier cliente controla.
+from app.auth.router import _get_real_ip
 
 # ===== PLATAFORMA (Fase 3 -- alta y config de tenants) =====
 # Credencial separada del login de tenant: un usuario de una empresa NUNCA
@@ -41,15 +58,51 @@ from app.platform.schemas import (
 # el router de /api/v1/platform ni se registra fuera de ese modo (ver main.py).
 platform_key_header = APIKeyHeader(name="X-Platform-Key", auto_error=False)
 
+# Umbral propio para X-Platform-Key, más estricto que el rate limit de login
+# de usuario normal (settings.RATE_LIMIT_MAX_ATTEMPTS=5/15min) -- esta
+# credencial da acceso de alta/baja de TODOS los tenants, un secreto de
+# privilegio más alto que una contraseña individual. 10 intentos fallidos
+# cada 15 minutos por IP: generoso para un operador que se equivoca tipeando
+# la key, pero corta rápido un intento de fuerza bruta.
+PLATFORM_RATE_LIMIT_MAX_ATTEMPTS = 10
+PLATFORM_RATE_LIMIT_LOCK_DURATION = 900  # 15 minutos en segundos
 
-def get_platform_admin(api_key: Optional[str] = Depends(platform_key_header)) -> None:
+
+def get_platform_admin(request: Request, api_key: Optional[str] = Depends(platform_key_header)) -> None:
     """Verifica el header X-Platform-Key contra PLATFORM_API_KEY (comparación
-    en tiempo constante -- es un secreto, no un valor cualquiera)."""
+    en tiempo constante -- es un secreto, no un valor cualquiera).
+
+    Rate limit por IP ANTES de comparar la key -- así un lockout ya activo
+    devuelve 429 sin ni siquiera evaluar `compare_digest` de nuevo. Solo
+    cuenta como intento (RateLimiter.record_attempt) el caso de key ausente o
+    incorrecta -- una key correcta usada muchas veces (uso legítimo repetido
+    del panel) nunca sube el contador, y además limpia cualquier resto de
+    intentos fallidos previos (mismo criterio que /auth/login en un login
+    exitoso: no dejar un cupo casi agotado colgando después de que quedó
+    demostrado que quien pega es el operador real)."""
+    ip_address = _get_real_ip(request)
+    rl_key = f"platform_admin:ip:{ip_address}"
+
+    is_allowed, rl_message = RateLimiter.check_rate_limit(
+        rl_key,
+        max_attempts=PLATFORM_RATE_LIMIT_MAX_ATTEMPTS,
+        lock_duration=PLATFORM_RATE_LIMIT_LOCK_DURATION,
+    )
+    if not is_allowed:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=rl_message)
+
     if not settings.PLATFORM_API_KEY or not api_key or not secrets.compare_digest(api_key, settings.PLATFORM_API_KEY):
+        # window_seconds = mismo valor que lock_duration -- el contador de
+        # intentos fallidos decae en la misma ventana de 15 minutos en la que
+        # se cuentan ("10 intentos fallidos / 15 minutos", no un contador que
+        # sobreviva una hora entera como el default genérico de RateLimiter).
+        RateLimiter.record_attempt(rl_key, window_seconds=PLATFORM_RATE_LIMIT_LOCK_DURATION)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Credencial de plataforma inválida",
         )
+
+    RateLimiter.clear(rl_key)
 
 
 # ========================================================================
@@ -190,13 +243,46 @@ def listar_tenants(db: Session = Depends(get_db)):
 
 
 @platform_router.get("/tenants/{tenant_id}", response_model=SuccessResponse)
-def ver_tenant(tenant_id: str, db: Session = Depends(get_db)):
+def ver_tenant(tenant_id: UUID, db: Session = Depends(get_db)):
     tenant = get_tenant_by_id(db, tenant_id)
     if not tenant:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tenant no encontrado")
     return SuccessResponse(
         status=200,
         message="Tenant encontrado",
+        data=TenantListItem.model_validate(tenant).model_dump(mode="json"),
+    )
+
+
+@platform_router.patch("/tenants/{tenant_id}", response_model=SuccessResponse)
+def actualizar_tenant_endpoint(tenant_id: UUID, payload: TenantUpdateRequest, db: Session = Depends(get_db)):
+    """Activa/desactiva un tenant o le cambia el plan -- único endpoint de
+    escritura del panel de administración además del alta (`POST /tenants`).
+
+    400 explícito (no la validación automática de Pydantic, ver el docstring
+    de TenantUpdateRequest) si el body no trae ningún campo -- un PATCH que no
+    cambia nada es un error de uso, no algo que valga la pena aceptar en
+    silencio.
+
+    `tenant_id: UUID` (no `str`) -- mismo criterio que el resto del codebase
+    (access_control, tags, notifications, storage_quota, users): un valor no-UUID
+    en el path se rechaza con 422 automático de FastAPI/Pydantic ANTES de tocar
+    la DB. Sin esto, `actualizar_tenant`/`get_tenant_by_id` reciben el string
+    crudo y Postgres lo rechaza con `DataError` -- 500 genérico en vez de un
+    error limpio (hallazgo de revisión adversarial, reproducido en vivo)."""
+    if not payload.tiene_algun_campo():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="El PATCH debe incluir al menos uno de: is_active, plan.",
+        )
+
+    tenant = actualizar_tenant(db, tenant_id, is_active=payload.is_active, plan=payload.plan)
+    if tenant is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tenant no encontrado")
+
+    return SuccessResponse(
+        status=200,
+        message="Tenant actualizado",
         data=TenantListItem.model_validate(tenant).model_dump(mode="json"),
     )
 

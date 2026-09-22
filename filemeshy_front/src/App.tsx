@@ -1,9 +1,10 @@
 import './assets/index.css'
 import { RouterProvider, createBrowserRouter, Navigate } from 'react-router-dom'
-import { lazy } from 'react'
+import { lazy, Suspense, useEffect, type ReactNode } from 'react'
 import { setNavigate } from './shared/utils/navigation'
 import { RootLayout, ProtectedLayout, PublicLayout } from './app/layout'
 import { RootErrorBoundary } from './app/components'
+import { FullScreenLoader } from '@/ui/loading'
 import {
   authLoader,
   publicLoader,
@@ -12,6 +13,7 @@ import {
   dashboardLoader
 } from './app/routes/loaders'
 import { Permission } from './app/routes'
+import { PlatformAuthGuard } from './modules/platform_admin/guards/PlatformAuthGuard'
 
 // Páginas públicas — import directo (sin lazy) para carga inmediata
 import { LoginPage } from './modules/auth/pages/LoginPage'
@@ -58,9 +60,27 @@ const NotificacionesPage = lazy(() => import('./modules/notifications/pages/Noti
 const NotFoundPage = lazy(() => import('./modules/platform/pages/NotFoundPage'))
 const UnauthorizedPage = lazy(() => import('./modules/auth/pages/UnauthorizedPage'))
 
+// Panel de plataforma (Ronda 8, modo cloud) -- administración de tenants.
+// Módulo AISLADO a propósito: ver comentario de la rama del router más
+// abajo (fuera de RootLayout/PublicLayout/ProtectedLayout, sin Sidebar,
+// sin loaders de auth normales -- solo alcanzable tipeando la URL).
+const PlatformLoginPage = lazy(() => import('./modules/platform_admin/pages/PlatformLoginPage'))
+const PlatformTenantsPage = lazy(() => import('./modules/platform_admin/pages/PlatformTenantsPage'))
+
 // ==================== ROUTER CONFIGURATION ====================
 
 // const LoadingFallback = () => <FullScreenLoader message="Cargando aplicación..." />
+
+// El splash de carga inicial (#splash en index.html) normalmente lo saca
+// SplashRemover, DENTRO de RootLayout (ver app/layout/RootLayout.tsx) -- pero
+// las rutas de /plataforma/* son hermanas de RootLayout a propósito (ver
+// más abajo), así que nunca pasan por ese componente. Sin este mismo
+// mecanismo acá, el splash queda visible para siempre y bloquea todos los
+// clics (confirmado en vivo con Playwright antes de este fix).
+function PlatformSplashRemover({ children }: { children: ReactNode }) {
+  useEffect(() => { window.__removeSplash?.() }, [])
+  return <>{children}</>
+}
 
 const router = createBrowserRouter([
   // ==================== MAIN APP ROUTES ====================
@@ -246,6 +266,39 @@ const router = createBrowserRouter([
         ],
       },
     ],
+  },
+
+  // ==================== PANEL DE PLATAFORMA (Ronda 8, modo cloud) ====================
+  // Ramas TOP-LEVEL, hermanas de RootLayout -- a propósito NO viven dentro de
+  // RootLayout/PublicLayout/ProtectedLayout: sin AuthProvider/ConfigProvider,
+  // sin Sidebar/Navbar, sin loaders de auth normales (authLoader/
+  // requirePermissions), inalcanzables desde la navegación normal de la app.
+  // Se autentican con un secreto de operador (X-Platform-Key), no con el
+  // login/RBAC de ningún tenant -- ver PlatformAuthGuard y
+  // modules/platform_admin/services/platformAdmin.api.ts para el porqué.
+  {
+    path: '/plataforma/login',
+    element: (
+      <PlatformSplashRemover>
+        <Suspense fallback={<FullScreenLoader />}>
+          <PlatformLoginPage />
+        </Suspense>
+      </PlatformSplashRemover>
+    ),
+    errorElement: <RootErrorBoundary />,
+  },
+  {
+    path: '/plataforma/tenants',
+    element: (
+      <PlatformSplashRemover>
+        <PlatformAuthGuard>
+          <Suspense fallback={<FullScreenLoader />}>
+            <PlatformTenantsPage />
+          </Suspense>
+        </PlatformAuthGuard>
+      </PlatformSplashRemover>
+    ),
+    errorElement: <RootErrorBoundary />,
   },
 ])
 

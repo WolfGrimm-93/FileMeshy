@@ -5,6 +5,7 @@ diseño completo (alcance, decisión de arquitectura, endpoints planeados).
 """
 
 from datetime import datetime
+from typing import Optional
 from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator
@@ -39,6 +40,32 @@ class TenantCreateResponse(BaseModel):
     tenant_id: UUID
     slug: str
     schema_name: str
+    # `provisionar_tenant()` (app/tenants/service.py) YA devuelve este campo en
+    # su dict de resultado (la credencial del super admin recién generada,
+    # única vez que se puede mostrar) -- faltaba acá en el schema de salida,
+    # así que `TenantCreateResponse(**resultado)` lo descartaba en silencio
+    # (Pydantic ignora por defecto los campos del dict que el modelo no
+    # declara). Hallazgo de QA en vivo del frontend: el modal de credenciales
+    # del panel quedaba con el email vacío después de crear un tenant real.
+    admin_email: str
+
+
+class TenantUpdateRequest(BaseModel):
+    """PATCH parcial -- ambos campos opcionales, pero al menos uno tiene que venir.
+
+    La validación de "al menos un campo" NO se hace acá con @model_validator
+    (a diferencia de TenantCreateRequest.rechazar_schema_reservado más arriba):
+    un ValueError ahí lo dispara Pydantic DURANTE el parseo del body, antes de
+    que la request llegue siquiera al router -- y FastAPI lo traduce siempre a
+    422, nunca al 400 que pide el contrato de este endpoint (un PATCH `{}` es
+    un error de uso/negocio -- "no pediste cambiar nada" -- no un error de
+    forma/tipo de dato). Por eso queda como un método simple que el router
+    llama a mano y convierte en HTTPException(400, ...) él mismo."""
+    is_active: Optional[bool] = None
+    plan: Optional[str] = Field(default=None, max_length=32)
+
+    def tiene_algun_campo(self) -> bool:
+        return self.is_active is not None or self.plan is not None
 
 
 class TenantListItem(BaseModel):
