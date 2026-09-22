@@ -71,6 +71,20 @@ class FileOut(BaseModel):
     updated_at: datetime
     deleted_at: Optional[datetime] = None
     is_favorite: bool = False
+    # Ronda 9 (subida multipart + antivirus asíncrono): 'clean' | 'pending' |
+    # 'infected' | 'scan_failed' (ver docstring de `File.scan_status` en
+    # app/files/models.py). SIEMPRE 'clean' en cualquier respuesta que llegue
+    # acá por un listado/búsqueda/detalle normal -- el filtro centralizado en
+    # `app/files/repository.py::CRUDFile` ya excluye todo lo que no sea
+    # 'clean' de esas lecturas. El único lugar donde este campo viaja con un
+    # valor DISTINTO de 'clean' es la respuesta de
+    # `POST /uploads/{id}/complete` (`app/uploads/router.py`), que devuelve
+    # el `File` recién creado tal cual, todavía 'pending' -- así el frontend
+    # puede mostrar "procesando" en vez de asumir que ya está listo. Default
+    # 'clean' acá solo como red de seguridad (cualquier `File` real siempre
+    # trae la columna poblada, `from_attributes=True` la lee directo del
+    # ORM).
+    scan_status: str = "clean"
     tags: List[TagOut] = Field(default_factory=list)
     # Solo se setea en resultados de `GET /files?q=...` (Ronda 6: búsqueda
     # por contenido + OCR) -- `None` en cualquier otra respuesta que reuse

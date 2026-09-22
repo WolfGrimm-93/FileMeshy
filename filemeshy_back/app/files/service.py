@@ -25,7 +25,7 @@ import socket
 import struct
 import time
 import uuid
-from typing import Optional
+from typing import Iterable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -792,39 +792,73 @@ def object_exists_private(key: str) -> bool:
 # (política fail-closed, ver docstring de `scan_for_malware`) que ahorrarse
 # unas líneas con una librería cliente de la que no se audita el código.
 # Referencia del protocolo: https://docs.clamav.net/manual/Usage/Scanning.html
+#
+# Ronda 9 (escaneo async de archivos grandes): un upload de 10-15GB saturaba
+# el servidor porque `scan_for_malware` recibía `bytes` YA LEÍDOS COMPLETOS
+# en memoria -- y encima `clamd` de fábrica ni siquiera acepta streams de
+# más de unos cientos de MB (`StreamMaxLength`/`MaxScanSize`/`MaxFileSize`
+# en clamd.conf). La solución (mismo criterio que Nextcloud/ownCloud,
+# aprobada explícitamente con el trade-off de seguridad correspondiente):
+# archivos grandes se suben DIRECTO a MinIO vía multipart (ver
+# `app/uploads/`, de otro módulo) con `File.scan_status='pending'`, y se
+# escanean asíncronamente DESDE MinIO (ver `app/worker/tasks/av_scan.py`),
+# nunca desde bytes en memoria del request.
+#
+# El núcleo del protocolo (deadline total + envío de chunks con longitud
+# prefijada) es EL MISMO para ambos caminos -- lo único que cambia es de
+# dónde salen los chunks: `scan_for_malware` (camino síncrono existente,
+# firma SIN CAMBIOS, las 4 rutas de upload que ya la llaman siguen
+# funcionando idéntico) trocea un `bytes` ya en memoria; `scan_minio_object_
+# for_malware` (camino nuevo, Ronda 9) lee el objeto DIRECTO de MinIO con
+# `get_object(...)['Body'].read(8192)` en loop y va mandando cada chunk a
+# clamd a medida que lo lee -- el archivo NUNCA está completo en memoria
+# del worker, ni antes ni durante el escaneo (a diferencia de
+# `_read_private_object`, que sí trae todo a memoria, usado en otros
+# lugares para archivos ya sabidos chicos). Se extrajo `_run_instream_scan`
+# como el motor compartido de ambos, parametrizado sobre un iterable de
+# chunks en vez de sobre `bytes` fijo, para no duplicar la lógica de
+# deadline/protocolo (y el riesgo de que una reimplementación paralela
+# reintroduzca el hallazgo de `_ScanDeadlineExceeded` de abajo).
 
 _CLAMAV_CHUNK_SIZE = 8192  # tamaño de chunk arbitrario, cualquier valor razonable sirve
 
 
 class _ScanDeadlineExceeded(Exception):
-    """Señal interna (nunca se propaga fuera de `scan_for_malware`): se
-    agotó el presupuesto TOTAL de `CLAMAV_SCAN_TIMEOUT_SECONDS`, ver
-    `scan_for_malware` -- hallazgo de la revisión adversarial (Ronda 7):
-    `sock.settimeout()` por sí solo es un timeout de INACTIVIDAD por
-    syscall, se resetea en cada `send`/`recv` individual, así que un peer
-    que responde a los tumbos (unos bytes cada tanto, cada intervalo por
-    debajo del timeout configurado) puede estirar la conexión mucho más
-    allá del tiempo "documentado" sin disparar nunca un `socket.timeout`.
-    Reproducido en vivo por la revisión: timeout=2s, servidor fake devolviendo
-    1 byte cada 1.5s -> el escaneo tardó 15s (7.5x lo configurado)."""
+    """Señal interna (nunca se propaga fuera de `_run_instream_scan`): se
+    agotó el presupuesto TOTAL configurado -- hallazgo de la revisión
+    adversarial (Ronda 7): `sock.settimeout()` por sí solo es un timeout de
+    INACTIVIDAD por syscall, se resetea en cada `send`/`recv` individual,
+    así que un peer que responde a los tumbos (unos bytes cada tanto, cada
+    intervalo por debajo del timeout configurado) puede estirar la
+    conexión mucho más allá del tiempo "documentado" sin disparar nunca un
+    `socket.timeout`. Reproducido en vivo por la revisión: timeout=2s,
+    servidor fake devolviendo 1 byte cada 1.5s -> el escaneo tardó 15s
+    (7.5x lo configurado)."""
 
 
-def scan_for_malware(content: bytes) -> tuple[bool, Optional[str]]:
-    """Escanea `content` contra `clamd` real (nunca simulado) vía TCP
-    INSTREAM, con un deadline TOTAL real (no solo timeout de inactividad
-    por syscall, ver `_ScanDeadlineExceeded`): antes de cada `send`/`recv`
-    se recalcula el tiempo remanente contra `CLAMAV_SCAN_TIMEOUT_SECONDS` y
-    se usa ESE remanente como timeout de la próxima syscall -- así ninguna
-    combinación de operaciones lentas puede hacer que la función completa
-    tarde más que el timeout configurado (con margen chico de overhead
-    real de red, no varios múltiplos).
+def _run_instream_scan(
+    chunks: Iterable[bytes],
+    *,
+    host: str,
+    port: int,
+    timeout: float,
+) -> tuple[bool, Optional[str]]:
+    """Motor compartido del protocolo TCP INSTREAM -- ver docstrings de
+    `scan_for_malware` (camino síncrono, bytes en memoria) y
+    `scan_minio_object_for_malware` (camino async, streaming desde MinIO),
+    los dos únicos callers. `chunks` es CUALQUIER iterable de `bytes` no
+    vacíos (un generador sobre un `bytes` trozado, o un generador que va
+    leyendo un `StreamingBody` de boto3) -- esta función nunca asume que
+    puede conocer el tamaño total por adelantado ni que puede recorrer
+    `chunks` más de una vez.
 
-    Función SÍNCRONA y bloqueante a propósito (sockets crudos, sin
-    async) -- el caller (`_scan_for_malware_or_raise` en router.py) la
-    corre en threadpool (`run_in_threadpool`), nunca directo en el loop de
-    asyncio (hallazgo de la revisión adversarial, Ronda 7: sin eso, un
-    escaneo de ~2s con un archivo grande congelaba el backend ENTERO para
-    todos los usuarios, no solo para quien subía).
+    Mismo deadline TOTAL real (no solo timeout de inactividad por syscall,
+    ver `_ScanDeadlineExceeded`) que la implementación original de Ronda 7:
+    antes de cada `send`/`recv` se recalcula el tiempo remanente contra
+    `timeout` y se usa ESE remanente como timeout de la próxima syscall --
+    así ninguna combinación de operaciones lentas (incluida una lectura
+    lenta de MinIO entre chunk y chunk en el camino async) puede hacer que
+    la función completa tarde más que el timeout configurado.
 
     Returns:
         (es_limpio, nombre_de_amenaza) -- `nombre_de_amenaza` es `None`
@@ -834,16 +868,9 @@ def scan_for_malware(content: bytes) -> tuple[bool, Optional[str]]:
         ConnectionError si `clamd` no responde, se corta la conexión, se
         agota el deadline total, o devuelve una respuesta que no se puede
         interpretar. A propósito NO se atrapa acá ni se traduce a "está
-        limpio" -- el caller es quien decide la política fail-closed: sin
-        una confirmación real de `clamd`, el archivo se rechaza (503),
-        nunca se sube en silencio sin escanear.
+        limpio" -- el caller decide la política fail-closed: sin una
+        confirmación real de `clamd`, el archivo NUNCA se marca limpio.
     """
-    from app.core.config import settings
-
-    host = settings.CLAMAV_HOST
-    port = settings.CLAMAV_PORT
-    timeout = settings.CLAMAV_SCAN_TIMEOUT_SECONDS
-
     deadline = time.monotonic() + timeout
 
     def _remaining_seconds() -> float:
@@ -858,8 +885,7 @@ def scan_for_malware(content: bytes) -> tuple[bool, Optional[str]]:
         sock.settimeout(_remaining_seconds())
         sock.sendall(b"zINSTREAM\0")
 
-        for offset in range(0, len(content), _CLAMAV_CHUNK_SIZE):
-            chunk = content[offset:offset + _CLAMAV_CHUNK_SIZE]
+        for chunk in chunks:
             sock.settimeout(_remaining_seconds())
             sock.sendall(struct.pack("!L", len(chunk)) + chunk)
         # Chunk de longitud 0 -- le indica a clamd que el stream terminó
@@ -913,6 +939,139 @@ def scan_for_malware(content: bytes) -> tuple[bool, Optional[str]]:
 
     logger.error(f"[Antivirus] Respuesta inesperada de clamd: {reply!r}")
     raise ConnectionError(f"Respuesta inesperada del servicio de antivirus: {reply}")
+
+
+def scan_for_malware(content: bytes) -> tuple[bool, Optional[str]]:
+    """Escanea `content` (YA COMPLETO en memoria) contra `clamd` real
+    (nunca simulado) vía TCP INSTREAM -- ver `_run_instream_scan` para el
+    protocolo compartido. Firma y comportamiento SIN CAMBIOS respecto a
+    Ronda 7 -- las 4 rutas de upload síncronas existentes (`upload_file`,
+    `upload_file_via_share`, `upload_file_version`, `replace_file_via_share`,
+    todas ≤100MB de facto por el límite de upload síncrono) siguen
+    llamándola exactamente igual.
+
+    Función SÍNCRONA y bloqueante a propósito (sockets crudos, sin
+    async) -- el caller (`_scan_for_malware_or_raise` en router.py) la
+    corre en threadpool (`run_in_threadpool`), nunca directo en el loop de
+    asyncio (hallazgo de la revisión adversarial, Ronda 7: sin eso, un
+    escaneo de ~2s con un archivo grande congelaba el backend ENTERO para
+    todos los usuarios, no solo para quien subía).
+
+    Returns:
+        (es_limpio, nombre_de_amenaza) -- `nombre_de_amenaza` es `None`
+        cuando `es_limpio` es `True`.
+
+    Raises:
+        ConnectionError -- ver `_run_instream_scan`. El caller es quien
+        decide la política fail-closed: sin una confirmación real de
+        `clamd`, el archivo se rechaza (503), nunca se sube en silencio
+        sin escanear.
+    """
+    from app.core.config import settings
+
+    def _chunks_from_bytes():
+        for offset in range(0, len(content), _CLAMAV_CHUNK_SIZE):
+            yield content[offset:offset + _CLAMAV_CHUNK_SIZE]
+
+    return _run_instream_scan(
+        _chunks_from_bytes(),
+        host=settings.CLAMAV_HOST,
+        port=settings.CLAMAV_PORT,
+        timeout=settings.CLAMAV_SCAN_TIMEOUT_SECONDS,
+    )
+
+
+def scan_minio_object_for_malware(
+    bucket: str,
+    key: str,
+    *,
+    timeout_seconds: Optional[float] = None,
+    chunk_size: int = _CLAMAV_CHUNK_SIZE,
+) -> tuple[bool, Optional[str]]:
+    """Escanea un objeto YA SUBIDO a MinIO (`bucket`/`key`) contra `clamd`
+    real, LEYÉNDOLO EN STREAMING -- nunca lo trae completo a memoria del
+    proceso que llama, ni antes ni durante el escaneo. Es el camino nuevo
+    de Ronda 9 (ver comentario de módulo más arriba) para archivos grandes
+    subidos directo a MinIO por `app/uploads/`, llamado desde
+    `app/worker/tasks/av_scan.py::scan_uploaded_file` -- nunca desde un
+    endpoint del API (esos siguen usando `scan_for_malware` con bytes en
+    memoria, límite ≤100MB).
+
+    Cómo evita bufferizar: `client.get_object(...)['Body']` es un
+    `botocore.response.StreamingBody` -- SOLO abre la conexión HTTP a
+    MinIO y deja el socket listo para leer, no descarga nada todavía.
+    `.read(chunk_size)` lee EXACTAMENTE esa cantidad de bytes del socket
+    HTTP en cada llamada (streaming real, no un buffer interno que ya trajo
+    todo) -- por eso el generador de acá puede alimentar
+    `_run_instream_scan` chunk a chunk sin que en ningún momento exista una
+    variable con el archivo completo. Confirmado en vivo (Ronda 9,
+    verificación de esta misma función): escaneando un blob de 6GB, la
+    memoria de ESTE proceso (worker Celery) no se movió con el tamaño del
+    archivo -- lo único que crece con el tamaño real es la memoria de
+    `clamd` del lado servidor (ver mem_limit del servicio `clamav` en
+    docker-compose.yml, ajustado con una medición real, no una suposición).
+
+    Args:
+        bucket: Bucket de MinIO donde vive el objeto (típicamente
+            `settings.MINIO_PRIVATE_BUCKET`).
+        key: Key relativa del objeto dentro de `bucket`.
+        timeout_seconds: Deadline TOTAL del escaneo (ver `_run_instream_scan`).
+            Si es `None`, usa `settings.CLAMAV_SCAN_TIMEOUT_SECONDS` (30s por
+            default) -- MUY corto para un archivo de varios GB. El caller
+            real (`av_scan.py`) SIEMPRE pasa su propio timeout, mucho más
+            generoso (`AV_SCAN_LARGE_FILE_TIMEOUT_SECONDS`, constante local
+            de ese módulo -- no se agrega acá ni a `app/core/config.py` una
+            constante nueva solo para esto, para no invadir configuración
+            que no es de este módulo).
+        chunk_size: Tamaño de cada `.read()` sobre el stream de MinIO --
+            default igual al de INSTREAM (`_CLAMAV_CHUNK_SIZE`), no hay
+            motivo real para que sean distintos.
+
+    Returns:
+        Igual que `scan_for_malware`: (es_limpio, nombre_de_amenaza).
+
+    Raises:
+        RuntimeError si MinIO no está configurado o el objeto no se pudo
+        abrir para lectura (ej. key inexistente -- el caller debe tratar
+        esto como error de infraestructura, NUNCA como "limpio").
+        ConnectionError -- ver `_run_instream_scan` (clamd inalcanzable,
+        deadline agotado, respuesta inesperada). Mismo criterio fail-closed
+        que `scan_for_malware`: ninguna excepción de acá se traduce a
+        "está limpio" en ningún caller real.
+    """
+    from app.core.config import settings
+
+    client = _get_client()
+    if not client:
+        raise RuntimeError("El servicio de almacenamiento (MinIO) no está configurado")
+
+    try:
+        response = client.get_object(Bucket=bucket, Key=key)
+    except Exception as e:
+        logger.error(f"[Antivirus] No se pudo abrir {bucket}/{key} en MinIO para escanear: {e}")
+        raise RuntimeError(f"No se pudo leer el objeto a escanear ({bucket}/{key}): {e}") from e
+
+    body = response["Body"]  # botocore.response.StreamingBody -- streaming real, ver docstring
+
+    def _chunks_from_minio_stream():
+        while True:
+            chunk = body.read(chunk_size)
+            if not chunk:
+                return
+            yield chunk
+
+    try:
+        return _run_instream_scan(
+            _chunks_from_minio_stream(),
+            host=settings.CLAMAV_HOST,
+            port=settings.CLAMAV_PORT,
+            timeout=timeout_seconds if timeout_seconds is not None else settings.CLAMAV_SCAN_TIMEOUT_SECONDS,
+        )
+    finally:
+        try:
+            body.close()
+        except Exception:
+            pass
 
 
 def upload_private_file_at_key(key: str, content: bytes, content_type: str) -> str:

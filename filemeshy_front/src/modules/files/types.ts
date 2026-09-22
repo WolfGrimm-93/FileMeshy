@@ -42,6 +42,44 @@ export interface FileOut {
    * degradar bien en ese caso (sin mostrar ningún indicador).
    */
   matched_by?: 'name' | 'content' | 'both'
+  /**
+   * Ronda 9 (subida resumable) -- estado del escaneo antivirus asíncrono
+   * para archivos subidos por el camino nuevo de
+   * `POST /uploads/{session_id}/complete`. `undefined` en archivos subidos
+   * por el camino viejo (`POST /files/upload`, escanea SÍNCRONO desde
+   * Ronda 7, nunca crea el `File` en estado distinto de 'clean') -- la UI
+   * debe tratar `undefined` igual que `'clean'` (nunca bloquear ni mostrar
+   * "procesando" para archivos que no lo tienen).
+   *
+   * OJO 1 (verificado leyendo `filemeshy_back/app/files/repository.py`,
+   * `CRUDFile.get`/`get_active` -- código real de los otros 2 agentes de
+   * esta ronda): el filtro `scan_status == 'clean'` es GLOBAL para toda
+   * lectura por id, `GET /files/{id}` incluido -- ni el propio dueño puede
+   * leer un archivo 'pending'/'infected'/'scan_failed' por ahí, le da 404
+   * igual que si no existiera. Por eso la señal PRIMARIA para resolver
+   * "procesando" no es pollear ese endpoint (un 404 ahí es ambiguo, no
+   * distingue "sigue escaneando" de "lo marcaron infectado"), sino las
+   * notificaciones que crea `app/worker/tasks/av_scan.py` al resolver
+   * (`extra_data.file_id` + `severity`) -- ver
+   * `store/uploadsStore.ts::pollProcessingItems`, que además usa
+   * `GET /files/{id}` como señal secundaria (solo puede confirmar 'clean',
+   * nunca "infectado").
+   *
+   * OJO 2: a esta fecha `app/files/schemas.py::FileOut` (el schema Pydantic
+   * real) TODAVÍA no declara este campo -- aunque `complete_upload()` cree
+   * el `File` con `scan_status='pending'`, la respuesta de `/complete` lo va
+   * a omitir del JSON hasta que se agregue ahí (haciendo que hoy, en la
+   * práctica, todo archivo multipart complete "directo a `done`" en vez de
+   * mostrar "procesando" -- degradación segura gracias al `undefined` de
+   * arriba, pero vale la pena que quede corregido en el backend).
+   *
+   * `'scan_failed'` (visto en `av_scan.py`) -- el AV no pudo confirmar tras
+   * varios reintentos (servicio caído, no necesariamente malicioso). Queda
+   * en el union por completitud del contrato, aunque -- mismo OJO 1 de
+   * arriba -- nunca llega 200 con este valor desde `GET /files/{id}`; se
+   * resuelve por notificación (`severity: 'warning'`).
+   */
+  scan_status?: 'pending' | 'clean' | 'infected' | 'scan_failed'
 }
 
 /**

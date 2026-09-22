@@ -231,6 +231,30 @@ services:
     image: clamav/clamav:stable
     volumes:
       - clamav_data:/var/lib/clamav
+    # Ronda 9: escaneo asíncrono de archivos grandes -- por defecto la imagen
+    # trae StreamMaxLength/MaxScanSize/MaxFileSize en unos pocos cientos de
+    # MB (ver /etc/clamav/clamd.conf de fábrica), muy por debajo de
+    # MAX_LARGE_UPLOAD_SIZE_MB (20GB, ver app/worker/tasks/av_scan.py). Sin
+    # subir estos 3 límites, clamd cortaría la conexión INSTREAM a mitad de
+    # un archivo grande con "size limit exceeded" -- el escaneo async
+    # (`scan_minio_object_for_malware` en app/files/service.py) fallaría
+    # SIEMPRE para cualquier archivo de más de unos cientos de MB, sin
+    # importar cuánta memoria/tiempo se le dé al worker.
+    #
+    # El entrypoint oficial de esta imagen (`/init`, confirmado leyéndolo en
+    # vivo dentro del contenedor) soporta config por variables de entorno
+    # `CLAMD_CONF_<Directiva>` -- descomenta/reemplaza esa directiva en
+    # `clamd.conf` en el arranque, no hace falta un volumen con config
+    # propia. 21000M (margen sobre los 20480MB de MAX_LARGE_UPLOAD_SIZE_MB)
+    # en los 3 -- StreamMaxLength gatea el tamaño del stream INSTREAM en sí,
+    # MaxFileSize el tamaño del "archivo" escaneado, MaxScanSize el total de
+    # datos escaneados (relevante si algún día se escanean archivos
+    # comprimidos) -- un archivo grande no-comprimido pega contra los 3 casi
+    # por igual, así que los 3 quedan iguales.
+    environment:
+      CLAMD_CONF_StreamMaxLength: "21000M"
+      CLAMD_CONF_MaxScanSize: "21000M"
+      CLAMD_CONF_MaxFileSize: "21000M"
     cap_drop:
       - ALL
     cap_add:
@@ -241,11 +265,47 @@ services:
       - SETGID
     security_opt:
       - no-new-privileges:true
-    # ClamAV recomienda 2-3GB libres para cargar la base de firmas completa
-    # en memoria -- 2g de tope, generoso pero acotado (sin límite, un
-    # contenido adversarial via INSTREAM no debería poder tumbar el resto
-    # del stack).
-    mem_limit: 2g
+    # Ronda 7: 2g bastaba para escanear en memoria bytes ya acotados a
+    # decenas/cientos de MB por request síncrono. Ronda 9: MEDIDO EN VIVO
+    # contra este mismo stack (no una suposición) con blobs benignos reales
+    # de 2GB y 6GB subidos a MinIO y escaneados por streaming real (socket
+    # INSTREAM, cgroup memory.current leído directo de
+    # /sys/fs/cgroup/.../memory.current cada 50-100ms durante el escaneo):
+    #
+    #   - Idle, con la base de firmas completa cargada: ~1.0-1.15GB estable.
+    #   - Un escaneo de 6GB: la memoria SUBE de forma aprox. proporcional a
+    #     los bytes ya recibidos, no se mantiene plana -- `clamd` escribe el
+    #     stream INSTREAM a un archivo temporal (`TemporaryDirectory`, no
+    #     seteado = default de clamd, cae en el filesystem del propio
+    #     contenedor, que acá es disco real vía overlay2, NO tmpfs) y lo
+    #     relee para escanear; ese archivo temporal cuenta como memoria de
+    #     la cgroup vía page cache (`memory.current` en cgroup v2 incluye
+    #     cache de archivo, no solo RSS de aplicación).
+    #   - CRÍTICO -- probado a propósito con `mem_limit` bajo (3g) durante
+    #     un escaneo de 6GB, y de nuevo con 2 escaneos de 6GB EN PARALELO
+    #     contra un límite de 8g: en ambos casos la memoria de la cgroup
+    #     quedó pegada EXACTO en el tope configurado durante el resto del
+    #     escaneo (el kernel recicla ese page cache bajo presión en vez de
+    #     matar el proceso, porque es reclamable) y el escaneo terminó
+    #     limpio igual ("stream: OK" real) las 2 veces -- un `mem_limit`
+    #     por debajo del tamaño del archivo NO rompe el escaneo, solo fuerza
+    #     más I/O de disco real (hay de sobra: NVMe con cientos de GB
+    #     libres) en vez de servir todo desde cache.
+    #
+    # Con eso confirmado (capar memoria es seguro, no catastrófico), 6g
+    # es una elección deliberada de equilibrio, no el peor caso extremo:
+    # cubre sin fricción el caso común (baseline ~1.1GB + varios GB de
+    # margen para un solo archivo grande típico) y, para el caso extremo
+    # (2 archivos de 15-20GB terminando casi juntos, tope real de
+    # `AV_SCAN_CONCURRENCY_LIMIT=2` en app/worker/tasks/av_scan.py), se
+    # apoya en el reciclado de page cache ya validado en vivo arriba en vez
+    # de reservarle a este único contenedor decenas de GB dedicados en un
+    # host de 30GB que además comparte con otros proyectos de esta misma
+    # máquina (ver Homelab/Desarrollo en Obsidian). El límite de
+    # concurrencia del semáforo Redis es la defensa PRIMARIA contra que
+    # muchos escaneos grandes simultáneos tumben `clamd`; `mem_limit` es el
+    # backstop, no la única capa.
+    mem_limit: 6g
     cpus: 1.0
     pids_limit: 256
     # La imagen ya trae su propio HEALTHCHECK (`clamdcheck.sh`, ver

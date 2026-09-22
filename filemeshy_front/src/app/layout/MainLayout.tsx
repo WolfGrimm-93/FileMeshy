@@ -5,6 +5,11 @@ import SwitchedSessionBanner from '@/modules/auth/components/SwitchedSessionBann
 import { useLogout } from '@/modules/auth/hooks/useLogout'
 import { ConfirmDialog } from '@/ui'
 import { useSidebarStore } from '@/app/store/sidebarStore'
+// Panel flotante global de subidas grandes (multipart) -- ver comentario en el
+// propio componente sobre por qué vive acá (fuera de FilesPage/UploadModal) y
+// no dentro del árbol de /archivos: tiene que sobrevivir a cerrar el modal de
+// subida y a navegar a otra página de la app.
+import UploadsTray from '@/modules/files/components/UploadsTray'
 
 interface MainLayoutProps {
   children: ReactNode
@@ -93,6 +98,11 @@ export default function MainLayout({ children }: MainLayoutProps) {
           </div>
         </div>
       </div>
+
+      {/* Panel flotante global de subidas grandes en curso/pausadas/procesando + banner de
+          sesiones sin terminar detectadas en IndexedDB (ver UploadsTray.tsx) -- se auto-oculta
+          cuando no hay nada que mostrar. */}
+      <UploadsTray />
 
       {/* Diálogo de confirmación de logout */}
       <ConfirmDialog

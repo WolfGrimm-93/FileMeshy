@@ -79,6 +79,24 @@ class File(Base):
     deleted_at = Column(DateTime(timezone=True), nullable=True)
     is_favorite = Column(Boolean, nullable=False, server_default='false')
 
+    # Ronda 9 (coordinación de subida multipart + antivirus asíncrono):
+    # 'clean' | 'pending' | 'infected' | 'scan_failed'. Default 'clean' -- el
+    # camino de upload SÍNCRONO existente (≤ MAX_UPLOAD_SIZE_MB, sin cambios
+    # en esta ronda) ya escanea con ClamAV ANTES de crear la fila, así que
+    # cualquier File nuevo de ESE camino nace 'clean' sin que su código
+    # tenga que setear nada (server_default a nivel de columna, ver la
+    # migración de esta ronda). Solo el camino NUEVO de subida multipart
+    # (`app/uploads/service.py::complete_upload`) crea filas 'pending' --
+    # quedan invisibles/no descargables hasta que el escaneo asíncrono de AV
+    # (`app/worker/tasks/av_scan.py`, módulo aparte, construido en paralelo
+    # esta misma ronda) las resuelva a 'clean' (limpio confirmado),
+    # 'infected' (amenaza real, cuarentena) o 'scan_failed' (reintentos
+    # agotados sin poder escanear, ej. clamd caído) -- las CUATRO se filtran
+    # de forma centralizada en `app/files/repository.py::CRUDFile`
+    # (get/get_active/get_children/get_trash/search/get_by_folder_ids), que
+    # solo deja pasar 'clean'.
+    scan_status = Column(String(20), nullable=False, server_default='clean')
+
     owner = relationship("User", foreign_keys=[owner_id], lazy="select")
     folder = relationship("Folder", foreign_keys=[folder_id], lazy="select")
     tags = relationship("Tag", secondary=file_tags, back_populates="files", lazy="select")

@@ -15,6 +15,7 @@ from app.files.router import folders_router, files_router, shares_router, public
 from app.storage_quota.router import router as storage_quota_router
 from app.tags.router import router as tags_router
 from app.backups.router import router as backups_router
+from app.uploads.router import router as uploads_router
 from app.shared.feature_flags import router as feature_flags_router
 
 # Router principal V1 - prefijo /api/v1 se define aquí
@@ -82,3 +83,9 @@ api_router.include_router(permissions_router)  # Catálogo permisos canónicos
 # Backups automáticos + verificación (Ronda 7) -- prefijo /admin/backups ya
 # fijado en el propio router (mismo criterio que admin_configuration_router).
 api_router.include_router(backups_router)
+
+# Subida multipart directa cliente→MinIO para archivos grandes (Ronda 9) --
+# prefijo /uploads ya fijado en el propio router. Feature normal de usuario
+# autenticado (mismo permiso files.upload que POST /files/upload), no un
+# endpoint de plataforma/admin.
+api_router.include_router(uploads_router)

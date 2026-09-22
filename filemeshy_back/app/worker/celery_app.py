@@ -6,16 +6,27 @@ Colas:
   default    → notificaciones normales, seguridad
   emails     → envío de emails (con rate limiting)
   reports    → generación de snapshots y vistas materializadas
-  maintenance → limpieza y mantenimiento periódico, y (Ronda 7) backups
-               automáticos de Postgres/MinIO -- reusa esta cola en vez de
-               una propia: son tareas de infraestructura de la misma
-               naturaleza (corren de madrugada, no son sensibles a latencia)
-               que ya conviven acá (cleanup-temp-files, purge-deleted-...).
+  maintenance → limpieza y mantenimiento periódico, (Ronda 7) backups
+               automáticos de Postgres/MinIO y (Ronda 9) limpieza de
+               sesiones de subida multipart abandonadas -- reusa esta cola
+               en vez de una propia: son tareas de infraestructura de la
+               misma naturaleza (corren de madrugada o cada pocas horas, no
+               son sensibles a latencia) que ya conviven acá
+               (cleanup-temp-files, purge-deleted-...).
   indexing   → extracción de texto/OCR de archivos (Ronda 6), cola propia
                separada de 'default' -- OCR puede tardar bastante (ver
                TASK_TIME_LIMIT_SECONDS en app/worker/tasks/indexing.py), no
                debería hacer esperar notificaciones u otras tareas rápidas
                si el worker está ocupado indexando un PDF grande.
+  av_scan    → escaneo antivirus asíncrono de archivos grandes (Ronda 9,
+               ver app/worker/tasks/av_scan.py), cola propia separada de
+               'indexing' a propósito -- un escaneo de un archivo de varios
+               GB puede tardar minutos (deadline interno hasta
+               AV_SCAN_LARGE_FILE_TIMEOUT_SECONDS) y tiene su PROPIO límite
+               de concurrencia (semáforo Redis, AV_SCAN_CONCURRENCY_LIMIT)
+               para no tumbar `clamd` -- mezclarla con la cola de indexing
+               (que ya tiene su propio ritmo de OCR) haría que ninguna de
+               las dos pueda razonar sobre su propia concurrencia real.
 """
 
 from celery import Celery
@@ -75,6 +86,7 @@ def _register_all_orm_models() -> None:
     from app.storage_quota.models import UserStorageQuota  # noqa: F401
     from app.tags.models import Tag, file_tags, folder_tags  # noqa: F401
     from app.backups.models import BackupRun  # noqa: F401
+    from app.uploads.models import UploadSession  # noqa: F401
 
     configure_mappers()
 
@@ -113,6 +125,7 @@ def create_celery_app() -> Celery:
             Queue("reports",     routing_key="reports"),
             Queue("maintenance", routing_key="maintenance"),
             Queue("indexing",    routing_key="indexing"),
+            Queue("av_scan",     routing_key="av_scan"),
         ),
         task_default_queue="default",
         task_default_routing_key="default",
@@ -127,9 +140,16 @@ def create_celery_app() -> Celery:
             # Backups automáticos (Ronda 7) -- misma cola que mantenimiento,
             # ver comentario de "Colas" más arriba.
             "app.worker.tasks.backups.*":                             {"queue": "maintenance"},
+            # Limpieza de sesiones de subida multipart abandonadas (Ronda 9)
+            # -- misma cola que mantenimiento, mismo criterio que backups: es
+            # infraestructura de limpieza periódica, no sensible a latencia.
+            "app.worker.tasks.uploads.*":                             {"queue": "maintenance"},
             # Indexación de contenido/OCR (Ronda 6) -- cola propia, ver
             # comentario de "Colas" más arriba.
             "app.worker.tasks.indexing.*":                            {"queue": "indexing"},
+            # Escaneo antivirus asíncrono de archivos grandes (Ronda 9) --
+            # cola propia, ver comentario de "Colas" más arriba.
+            "app.worker.tasks.av_scan.*":                             {"queue": "av_scan"},
         },
 
         # ─── Reintentos ─────────────────────────────────────────────────────
@@ -215,6 +235,16 @@ def create_celery_app() -> Celery:
                 "schedule": crontab(hour=4, minute=0),
                 "options": {"queue": "maintenance"},
             },
+            # Sesiones de subida multipart abandonadas (Ronda 9) — cada 6
+            # horas, mismo intervalo que cleanup-expired-sessions (mismo
+            # espíritu: liberar recursos de algo que el cliente nunca volvió
+            # a tocar). Aborta el multipart real en MinIO y libera la cuota
+            # reservada -- ver app/worker/tasks/uploads.py.
+            "cleanup-abandoned-upload-sessions": {
+                "task": "app.worker.tasks.uploads.cleanup_abandoned_upload_sessions",
+                "schedule": crontab(minute=0, hour="*/6"),
+                "options": {"queue": "maintenance"},
+            },
         },
     )
 
@@ -225,6 +255,8 @@ def create_celery_app() -> Celery:
         "app.worker.tasks.security",
         "app.worker.tasks.indexing",
         "app.worker.tasks.backups",
+        "app.worker.tasks.uploads",
+        "app.worker.tasks.av_scan",
     ])
 
     return app

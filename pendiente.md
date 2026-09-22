@@ -425,6 +425,120 @@ local (el modo real de este stack y de producción hoy).
   `PLATFORM_API_KEY`) — ya documentado en el comentario del `.gitignore`, pero no hay ninguna
   guía paso a paso en el repo.
 
+**Hecho (2026-09-22) — Ronda 9, post-roadmap: subida de archivos grandes (10-20GB) sin
+saturar el servidor, resumable, sin crecer horizontal ni verticalmente.** Pedido explícito del
+usuario tras el cierre del roadmap original de 8 rondas: 10 personas subiendo en simultáneo 1-2
+archivos de 10-15GB cada una rompía el sistema (el backend leía cada archivo COMPLETO a RAM
+antes de escanear/subir, sin límite de memoria en el contenedor). Investigación previa (interna y
+externa, Nextcloud/ownCloud/tus.io/S3 multipart) llevó a la arquitectura implementada, la misma
+que usan los proyectos open-source maduros investigados:
+
+- **Subida multipart directa navegador→MinIO** vía URLs presignadas (S3 multipart), pasando por
+  un proxy de nginx que reenvía en streaming (`proxy_request_buffering off`) — los bytes NUNCA
+  tocan la memoria del proceso backend. Resumabilidad real y gratuita: cada parte (256MB) es
+  reintentable por separado; si se corta la conexión o se cierra la pestaña/reinicia la PC, al
+  volver el cliente pide `ListParts` real contra MinIO y solo sube lo que falta — verificado en
+  vivo con archivos de hasta 700MB (varias partes) cortando la conexión a mitad y recargando la
+  página a mitad de una subida real, sin resubir nada ya confirmado.
+- **Antivirus asíncrono con gate de visibilidad** (mismo patrón que Nextcloud/ownCloud,
+  confirmado por investigación): el archivo queda `scan_status='pending'` — invisible para TODOS,
+  ni el propio dueño lo ve/descarga/comparte — hasta que un worker de Celery lo escanea en
+  streaming real desde MinIO (nunca bufferiza el archivo completo, confirmado con `docker stats`
+  en vivo: memoria del worker estable independiente del tamaño del archivo). Limpio → visible +
+  indexado para búsqueda por contenido (si ≤512MB, tope propio para no reintroducir el problema
+  de memoria del lado del worker de indexación de la Ronda 6). Infectado → cuarentena real (objeto
+  movido a bucket separado, original borrado, fila `File` conservada como registro auditable, NO
+  borrada) + notificación. `clamd` inalcanzable → fail-closed real, reintentos con backoff, nunca
+  pasa a `clean` sin confirmación. **Los uploads chicos (≤100MB) siguen exactamente igual que
+  antes** — síncronos, sin cambios; esta ronda solo agrega un segundo camino para archivos
+  grandes, no debilitó la seguridad existente.
+- **Cuota reservada por adelantado** (atómica, ya existente desde Ronda 1), con verificación real
+  del tamaño final contra lo reservado al completar (un cliente no puede declarar de menos y
+  subir de más). **Admission control** con tope global Y por usuario (`MAX_CONCURRENT_LARGE_UPLOADS`/
+  `_PER_USER`) para no saturar el I/O de disco de MinIO ni la cola de escaneo con demasiadas
+  subidas grandes simultáneas, con limpieza autorecuperable en horas (no días) de sesiones
+  abandonadas.
+
+Pasó por el flujo completo: recon (interno + investigación externa) → implementación (3 agentes
+en paralelo: coordinación/cuota, antivirus/infra, frontend) → revisión adversarial (2 agentes:
+seguridad, producto/correctitud) → feedback → auditor final → pruebas (2 agentes de confirmación
+independiente) → una segunda vuelta de feedback por un hallazgo real que apareció recién en
+Pruebas. Bugs reales encontrados y corregidos en el camino:
+
+1. **[3 bugs de integración, encontrados y corregidos durante la implementación misma, antes de
+   la revisión adversarial]** El proxy nuevo de nginx rompía la firma SigV4 de las URLs
+   presignadas de tres formas distintas, cada una encontrada recién al probar en vivo contra el
+   proxy real (nunca visibles probando la firma o nginx por separado): (a) el `Host` que nginx
+   reenviaba a MinIO estaba hardcodeado en vez de preservar el original; (b) un prefijo de path
+   artificial (`/storage-proxy`) quedaba parte del recurso firmado por SigV4, pero MinIO usa ESE
+   MISMO path para resolver el bucket — estructuralmente no había forma de que un path
+   satisficiera ambas cosas a la vez, se resolvió reusando el location de descarga YA EXISTENTE
+   (sin prefijo artificial) en vez de uno nuevo; (c) `$host` de nginx descarta el puerto del Host
+   entrante, y con `SignedHeaders=host` el puerto también es parte de lo firmado — corregido a
+   `$http_host`. Confirmado en vivo de punta a punta (PUT real de datos → 200 con ETag real de
+   MinIO) recién después de los 3 fixes juntos.
+2. **[ALTO, revisión adversarial de seguridad]** DoS trivial de admisión: un solo usuario podía
+   agotar TODO el cupo global de subidas grandes abriendo sesiones sin completarlas ni abortarlas
+   (sin límite por usuario), bloqueando la feature para todos los demás hasta 48-54hs (el TTL de
+   reanudación de sesión se compartía con el TTL del cupo de concurrencia). Corregido: tope por
+   usuario + TTL de admisión corto (4hs) y renovable, desacoplado del plazo de reanudación (48hs),
+   con poda automática de miembros vencidos en cada chequeo (autorecuperable en horas, no en días,
+   sin depender de la tarea periódica de limpieza).
+3. **[MEDIO, revisión adversarial de seguridad]** Fuga permanente de cuota en archivos puestos en
+   cuarentena — los bytes de un archivo infectado quedaban contados para siempre en la cuota del
+   dueño, sin ningún camino de liberación (el archivo es invisible, no se puede ni ver para
+   borrar). Corregido: se libera la cuota reservada al confirmarse la cuarentena.
+4. **[Funcional, revisión adversarial de producto]** Los archivos subidos por el camino grande
+   nunca quedaban indexados para búsqueda por contenido (la Ronda 6 nunca se conectó a este
+   camino nuevo). Corregido, con tope de 512MB documentado (la tarea de indexación no fue
+   diseñada para streaming, encolarla sin tope reintroduciría el problema de memoria original del
+   lado del worker de indexación).
+5. **[MEDIO/ALTO, encontrado en la fase de Pruebas, después del veredicto del Auditor Final]** El
+   modal de subida quedaba completamente bloqueado (ni X, ni Escape, ni backdrop, ni navegar a
+   otra página) mientras un archivo grande estaba en estado `uploading` — contradecía
+   directamente el propósito de la ronda (subidas que pueden tardar horas, el usuario debería
+   poder seguir usando la app). El motor de subida vive en un store global independiente del
+   modal (ya existe un panel flotante, `UploadsTray`, para seguir viendo el progreso) — no había
+   ninguna necesidad técnica real para el bloqueo, era un criterio heredado sin reconsiderar del
+   camino simple (donde sí tiene sentido, ahí no se tocó). Corregido y reverificado en vivo con
+   throttling de red real (16/16 aserciones): cerrar el modal a mitad de una subida real, navegar
+   a otra página, la subida sigue y termina bien.
+
+Suite: **112 passed, 8 skipped (feature condicional de Ronda 8, no relacionada), 0 failed** —
+subió de 94 (fin de Ronda 8) a 112. Reverificada de forma independiente por 3 agentes distintos
+en fases separadas (implementación, auditor final, pruebas), todas coincidiendo exacto.
+
+**Deuda residual nueva, no bloqueante:**
+
+- El header `Retry-After` que el backend manda en el 503 de admission control **nunca llega al
+  cliente** — bug preexistente (no introducido por esta ronda): el manejador global de excepciones
+  (`app/main.py::http_exception_handler`) reconstruye la respuesta descartando por completo
+  `exc.headers`, afecta a CUALQUIER endpoint que use `HTTPException(headers=...)`, no solo este.
+  Mitigado del lado frontend (ya no depende de ese header, usa un tope propio de reintentos), pero
+  el bug de fondo sigue sin arreglar.
+- `backup_minio_objects` (Ronda 7) podría en teoría llevarse copia de un archivo todavía
+  `pending` (sin escanear) si el backup S3 externo se configurara algún día — hoy NO está
+  configurado en ningún entorno real, riesgo puramente teórico.
+- `scan_uploaded_file` (la tarea de escaneo asíncrono) no resuelve `tenant_schema` en
+  `DEPLOYMENT_MODE=cloud` — no usado en ningún entorno real hoy, documentado en el docstring de
+  la tarea para cuando/si se active.
+- Gaps de cobertura de tests identificados por QA en la fase de Pruebas (no son bugs, son
+  ausencia de test automatizado en caminos críticos): el camino fail-closed real de la tarea de
+  escaneo (`clamd` inalcanzable → reintentos → `scan_failed`) se prueba llamando directo a un
+  helper interno, no ejercitando el `try/except` real de la tarea completa — una regresión ahí
+  pasaría en verde sin que ningún test la note. Tampoco hay ningún assert programático de que
+  `scan_minio_object_for_malware` efectivamente hace streaming (la propiedad central de toda la
+  ronda depende hoy de verificación manual con `docker stats`, no de un test automatizado). Y el
+  tope GLOBAL de admisión (a diferencia del tope por usuario, que sí tiene test) nunca se prueba
+  en aislamiento.
+- La firma EICAR estándar de prueba deja de detectarse pasado los 68 bytes exactos (cualquier
+  padding rompe la detección) — confirmado como comportamiento esperado de esa firma específica
+  en toda la industria (evita falsos positivos masivos si alguien rellena un archivo real grande
+  con el string EICAR), NO una falla real de ClamAV — se confirmó detección real con una firma
+  de prueba sin esa restricción en archivos de hasta 600MB, en cualquier posición. Implicancia
+  práctica: EICAR puro no sirve para probar/simular un archivo infectado por el camino grande en
+  el futuro, hace falta una firma de prueba sin restricción de tamaño.
+
 ### 🟠 Seguridad — importante pero no bloqueante
 
 - `SECRET_KEY` con default hardcodeado en `core/config.py:32` — mitigado por una guarda que
@@ -477,13 +591,21 @@ local (el modo real de este stack y de producción hoy).
   administración de tenants (rate-limit, PATCH activar/desactivar con efecto real vía
   `TenantMiddleware`, validación de UUID), y regresión de los 3 fixes de seguridad más fáciles
   de reproducir automatizadamente (spoofing de IP, DoS 2FA, flag de registro).
+- Tras la Ronda 9: **112 passed, 8 skipped, 0 failed**, sin flakiness. Los 8 skipped siguen
+  siendo `test_platform_tenants.py` completo (solo corren con `DEPLOYMENT_MODE=cloud` activo, ver
+  Ronda 8). Suma de la Ronda 9: subida multipart de archivos grandes (sesiones, admisión global Y
+  por usuario, cuota real contra tamaño verificado, resumabilidad vía `ListParts` real), antivirus
+  asíncrono (limpio/infectado/`clamd` caído con reintentos, cuarentena real con liberación de
+  cuota, streaming sin bufferizar el archivo completo).
 - Última corrida (contra la imagen final reconstruida, backend Y `celery_worker`, modo `local`
-  por defecto): **94 passed, 8 skipped, 0 failed**, sin flakiness. Los 8 skipped son
-  `test_platform_tenants.py` completo (solo corren con `DEPLOYMENT_MODE=cloud` activo, ver
-  Ronda 8) — pasan 8/8 cuando se activa puntualmente.
+  por defecto): **112 passed, 8 skipped, 0 failed**, reverificada de forma independiente por 3
+  agentes en fases separadas de la Ronda 9 (implementación, auditor final, pruebas).
 - Falta: tests de frontend (cero — cada ronda se verificó visualmente a mano con Playwright
   ad-hoc, no queda como suite automatizada), tests de aislamiento multi-tenant más allá de los
-  de la Ronda 8, y CI que corra esto automáticamente (no hay ningún pipeline en el repo).
+  de la Ronda 8, CI que corra esto automáticamente (no hay ningún pipeline en el repo), y los
+  gaps de cobertura puntuales que dejó documentados la Ronda 9 (ver esa sección: camino
+  fail-closed del escaneo AV no ejercitado de punta a punta, streaming de MinIO→clamd sin
+  assert programático, tope global de admisión sin test en aislamiento).
 
 ### 📋 Funcionalidades de producto — gaps priorizados (vs. `docs/checklist-funcionalidades.md`)
 
@@ -514,6 +636,11 @@ menor, no planificado en ninguna ronda por ahora.
 **Resuelto en Ronda 8 (2026-09-22):** UI de administración de tenants (multi-tenant), como
 panel separado del admin normal — crear/listar/activar/desactivar/cambiar plan, protegido por
 `X-Platform-Key`. Cierra el roadmap de construcción completo (rondas 1 a 8).
+
+**Resuelto en Ronda 9 (2026-09-22, post-roadmap):** subida de archivos grandes (10-20GB) sin
+saturar el servidor — multipart resumable directo a MinIO, antivirus asíncrono con gate de
+visibilidad, admission control, sin necesidad de escalar horizontal ni verticalmente. Ver
+narrativa completa más arriba.
 
 Gaps que siguen abiertos:
 
@@ -573,12 +700,12 @@ Gaps que siguen abiertos:
   puntual más abajo) — no es producción. Se puede tirar abajo con `docker compose down -v`
   cuando se quiera.
 - Rondas 1 (`d91a47f`), 2 (`61ca9f1`), 3 (`9b08c35`), 4 (`7e9feba`), 5 (`a1c2680`), 6
-  (`d833b83`) y 7 (`05bd75f`) commiteadas, 2026-09-20/21. Ronda 8 (panel de administración de
-  tenants) en working tree al momento de escribir esto, commit pendiente inmediato. Recordatorio
-  operativo real (no solo de código): antes de considerar el permiso `backups.view` activo en
-  cualquier entorno nuevo, hay que correr `scripts/seed_permissions.py` — agregar un permiso al
-  dict de `permissions.py` no lo propaga solo a las tablas reales (bug real de la Ronda 7, ya
-  corregido en este stack).
+  (`d833b83`), 7 (`05bd75f`) y 8 (`e76e197`) commiteadas, 2026-09-20/22. Ronda 9 (subida de
+  archivos grandes) en working tree al momento de escribir esto, commit pendiente inmediato.
+  Recordatorio operativo real (no solo de código): antes de considerar el permiso `backups.view`
+  activo en cualquier entorno nuevo, hay que correr `scripts/seed_permissions.py` — agregar un
+  permiso al dict de `permissions.py` no lo propaga solo a las tablas reales (bug real de la
+  Ronda 7, ya corregido en este stack).
 - El stack de prueba se cayó por reinicios del host varias veces durante el trabajo de las
   Rondas 2 a 7 — siempre se recuperó sin pérdida de código (todo en disco) ni de datos de
   prueba (volumen de Postgres persistente); solo hizo falta recrear el contenedor backend con
@@ -604,7 +731,8 @@ Aprobado con el usuario el 2026-09-20. Cada ronda se diseña en detalle recién 
 | 5 (hecho) | Preview extendido (video, audio, documentos de Office) — **completa** |
 | 6 (hecho) | Búsqueda por contenido + OCR — **completa** |
 | 7 (hecho) | Antivirus (ClamAV) en upload + backups automáticos de Postgres/MinIO — **completa** (MinIO condicional a config externa, ver Ronda 7 arriba) |
-| 8 (hecho) | UI de administración de tenants — **completa**, roadmap cerrado |
+| 8 (hecho) | UI de administración de tenants — **completa**, roadmap original cerrado |
+| 9 (hecho) | Post-roadmap, pedido explícito del usuario 2026-09-22: subida de archivos grandes (10-20GB) sin saturar el servidor, resumable — **completa** |
 
 Fuera de alcance por decisión de producto (no construir sin pedido explícito nuevo): cliente
 de escritorio, app móvil, sincronización selectiva, acceso offline real, edición colaborativa
@@ -612,28 +740,32 @@ en tiempo real.
 
 ### Semáforo
 
-**Roadmap de construcción completo: Rondas 1 a 8, todas verificadas en vivo** (incluida
-verificación visual en navegador real, y desde Ronda 3 en adelante, reproducción de escenarios
-de punta a punta por el propio Auditor Final, incluida verificación de contenido real —no solo
-capturas— en las Rondas 5, 6, 7 y 8). Listo para uso interno de un solo usuario/equipo pequeño
-en red cerrada — los 6 bloqueadores de seguridad de la auditoría del 19 están resueltos, y el
-Drive ganó favoritos, orden real, copiar, cuota visible, etiquetas, compartir granular
-(contraseña, permisos, usuarios específicos) con notificaciones reales, versionado de archivos
-con historial completo, preview de video/audio/Office, búsqueda por contenido + OCR, escaneo de
-malware en toda subida, backups automáticos de Postgres con verificación real, y administración
-de tenants multi-tenant vía panel separado. **Todavía no listo para exposición pública a
-Internet sin decisión** sobre las deudas residuales de seguridad marcadas arriba en cada ronda
-(todas confirmadas no explotables hoy, pero dependen de configuración de producción que este
-repo de trabajo no controla directamente, de defensa en profundidad pendiente, o de contratar un
-destino externo): `TRUSTED_PROXY_IPS` vacío en producción real, el balde compartido de
-rate-limit en shares públicos, la falta de rate-limit en los endpoints autenticados de shares
-dirigidos, la red no dedicada de los servicios `office_converter` y `clamav`, la falta de tope
-de páginas/reintentos en la indexación de PDFs de texto embebido, la ausencia de backup real de
-los archivos de usuario en MinIO (solo sus metadatos) hasta que se configure un destino S3
-externo, y la ausencia de sesión/expiración/auditoría real en el panel de plataforma de la
-Ronda 8 (hoy solo la propia key, sin capa adicional).
+**Roadmap original completo (Rondas 1-8) + Ronda 9 post-roadmap, todas verificadas en vivo**
+(incluida verificación visual en navegador real, y desde Ronda 3 en adelante, reproducción de
+escenarios de punta a punta por el propio Auditor Final, incluida verificación de contenido
+real —no solo capturas— en las Rondas 5, 6, 7, 8 y 9). Listo para uso interno de un solo
+usuario/equipo pequeño en red cerrada — los 6 bloqueadores de seguridad de la auditoría del 19
+están resueltos, y el Drive ganó favoritos, orden real, copiar, cuota visible, etiquetas,
+compartir granular (contraseña, permisos, usuarios específicos) con notificaciones reales,
+versionado de archivos con historial completo, preview de video/audio/Office, búsqueda por
+contenido + OCR, escaneo de malware en toda subida, backups automáticos de Postgres con
+verificación real, administración de tenants multi-tenant vía panel separado, y subida de
+archivos grandes (10-20GB) resumable y sin saturar el servidor con antivirus asíncrono. **Todavía
+no listo para exposición pública a Internet sin decisión** sobre las deudas residuales de
+seguridad marcadas arriba en cada ronda (todas confirmadas no explotables hoy, pero dependen de
+configuración de producción que este repo de trabajo no controla directamente, de defensa en
+profundidad pendiente, o de contratar un destino externo): `TRUSTED_PROXY_IPS` vacío en
+producción real, el balde compartido de rate-limit en shares públicos, la falta de rate-limit en
+los endpoints autenticados de shares dirigidos, la red no dedicada de los servicios
+`office_converter` y `clamav`, la falta de tope de páginas/reintentos en la indexación de PDFs de
+texto embebido, la ausencia de backup real de los archivos de usuario en MinIO (solo sus
+metadatos) hasta que se configure un destino S3 externo, la ausencia de sesión/expiración/
+auditoría real en el panel de plataforma de la Ronda 8 (hoy solo la propia key, sin capa
+adicional), y el header `Retry-After` que el backend nunca logra entregar en ningún 503 con
+headers custom (bug preexistente, expuesto por la Ronda 9, mitigado del lado frontend pero no
+corregido de raíz).
 
-**Patrón recurrente confirmado en 5 de las últimas 6 rondas, siempre atrapado por el propio
+**Patrón recurrente confirmado en 6 de las últimas 7 rondas, siempre atrapado por el propio
 proceso antes de cerrar la ronda, nunca por pytest solo:** un bug de "código que funciona en el
 proceso de tests pero se rompe en el proceso/entorno real" (Ronda 4: `celery_worker` con imagen
 vieja; Ronda 5: contrato roto solo visible contra el backend real; Ronda 6: registro de mappers
@@ -641,11 +773,13 @@ de SQLAlchemy envenenado según el orden de tareas en el worker real; Ronda 7: u
 en el código que nunca se sembró en la tabla real, invisible para tests que usan un bypass
 directo de BD en vez del camino real de asignación de rol; Ronda 8: un campo (`admin_email`)
 descartado en silencio por el schema de respuesta, y una `tenant_id` sin tipar que solo
-explotaba con un valor real malformado — ninguno de los dos visible leyendo el código sin
-probarlo en vivo). Todos aparecieron recién al probar contra el stack Docker completo levantado,
-con datos y flujos reales. Confirma que la verificación en vivo (no solo tests
-unitarios/aislados, y no solo tests que "pasan" sin ejercitar el camino real que usa un usuario
-de verdad) sigue siendo imprescindible antes de cerrar cualquier ronda futura.
+explotaba con un valor real malformado; Ronda 9: tres bugs de firma SigV4 en el proxy de nginx,
+ninguno visible probando la firma o nginx por separado, solo contra el proxy real completo, más
+un modal de UI bloqueado que ningún test automatizado iba a atrapar — solo apareció al navegar
+de verdad con una subida real en curso). Todos aparecieron recién al probar contra el stack
+Docker completo levantado, con datos y flujos reales. Confirma que la verificación en vivo (no
+solo tests unitarios/aislados, y no solo tests que "pasan" sin ejercitar el camino real que usa
+un usuario de verdad) sigue siendo imprescindible antes de cerrar cualquier ronda futura.
 
 **Lección de proceso confirmada en Ronda 4** (ya aplicada, dejar como recordatorio para
 rondas futuras y para cualquier deploy real): reconstruir solo `backend` no alcanza cuando el

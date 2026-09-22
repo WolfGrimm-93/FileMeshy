@@ -106,6 +106,84 @@ class Settings(BaseSettings):
     # ===== FILES (Almacenamiento) =====
     MAX_UPLOAD_SIZE_MB: int = 100  # Nginx (filemeshy_front/nginx.conf) limita a 100MB -- nunca superar ese valor acá
 
+    # ===== SUBIDA MULTIPART DE ARCHIVOS GRANDES (Ronda 9) =====
+    # Camino NUEVO y aparte del de arriba -- exclusivo para archivos por
+    # encima de MAX_UPLOAD_SIZE_MB. El navegador sube cada parte DIRECTO a
+    # MinIO (vía el proxy nginx público, ver PUBLIC_STORAGE_PROXY_URL más
+    # abajo), los bytes nunca pasan por la memoria de este proceso -- ver
+    # app/uploads/service.py.
+    #
+    # Techo del camino nuevo. 20GB es un valor de partida razonable (cubre
+    # el caso real que motivó esta ronda, 10-15GB) sin comprometerse a un
+    # límite mucho más alto sin necesidad real -- se puede subir por env sin
+    # tocar código si hace falta.
+    MAX_LARGE_UPLOAD_SIZE_MB: int = 20480
+    # 256MB: con el techo de arriba da ~80 partes para el archivo más
+    # grande admitido, bien lejos del límite de MinIO/S3 (5MB-5GB por
+    # parte, hasta 10.000 partes) y de un tamaño cómodo para reintentar una
+    # sola parte sin tener que resubir mucho si se corta la conexión.
+    LARGE_UPLOAD_PART_SIZE_BYTES: int = 256 * 1024 * 1024
+    # Tope GLOBAL de sesiones 'in_progress' SIMULTÁNEAS (todos los usuarios
+    # sumados) -- protege el I/O de disco de MinIO de demasiadas subidas
+    # grandes en paralelo, no la memoria del backend (que en este camino ya
+    # no importa, ver docstring del módulo). Ver
+    # app/uploads/service.py::_try_reserve_admission_slot.
+    MAX_CONCURRENT_LARGE_UPLOADS: int = 15
+    # Tope POR USUARIO -- agregado tras la revisión adversarial de seguridad
+    # de esta ronda (hallazgo real, severidad ALTA, reproducido en vivo): sin
+    # esto, un solo usuario podía abrir sesiones sin completarlas/abortarlas
+    # hasta llenar el cupo GLOBAL de arriba y bloquear la feature para todos
+    # los demás. 3 deja margen real (varios archivos grandes en simultáneo,
+    # ej. subiendo distintos videos) sin que un usuario solo pueda acaparar
+    # un cupo global de 15.
+    MAX_CONCURRENT_LARGE_UPLOADS_PER_USER: int = 3
+    # TTL del cupo de CONCURRENCIA activa en Redis -- deliberadamente CORTO
+    # e independiente de `UPLOAD_SESSION_EXPIRY_HOURS` (48hs, el plazo para
+    # RETOMAR una sesión vieja, ver más abajo). Son dos conceptos distintos
+    # que NO deberían compartir plazo (mismo hallazgo de la revisión
+    # adversarial): una sesión abandonada de verdad debe dejar de contar
+    # contra el cupo de concurrencia mucho antes de que termine su ventana
+    # de 48hs para reanudarse. Se renueva en cada
+    # `POST /uploads/{id}/refresh-part-urls` mientras el usuario sigue
+    # activo (ver `app/uploads/service.py::_renew_admission_lease`). 4h es
+    # tiempo realista para subir hasta 20GB incluso en una conexión lenta.
+    LARGE_UPLOAD_ADMISSION_LEASE_HOURS: int = 4
+    # URL pública (la que el NAVEGADOR resuelve) del proxy nginx que
+    # reenvía transparente hacia MinIO interno (http://minio:9000) -- las
+    # URLs presignadas de cada parte se firman contra ESTE endpoint, nunca
+    # contra MINIO_ENDPOINT (ver app/uploads/service.py::_get_presign_client
+    # para el porqué completo, SigV4 firma el host).
+    #
+    # SOLO el host público, SIN ningún sufijo de path (nada de
+    # "/storage-proxy" ni similar) -- corregido tras la verificación en vivo
+    # de esta ronda: SigV4 firma también el PATH (CanonicalURI), no solo el
+    # Host, así que un prefijo artificial en la URL nunca puede coincidir a
+    # la vez con "lo que se firmó" y "el bucket real que MinIO necesita ver
+    # en el path" (confirmado en vivo contra MinIO real probando las 3
+    # combinaciones, ver hallazgo del agente de infra). El bucket
+    # (`MINIO_PRIVATE_BUCKET`) queda como primer segmento del path gracias al
+    # `addressing_style='path'` del cliente de firma -- la URL resultante
+    # queda `{PUBLIC_STORAGE_PROXY_URL}/{bucket}/{key}?X-Amz-...`, exactamente
+    # el mismo patrón de path que YA sirve hoy el location existente de
+    # descarga en nginx.conf (`~ ^/(filemeshy-media|filemeshy-media-private)/`,
+    # reusado también para subida por el agente de infra en vez de un
+    # location nuevo dedicado). Construido/configurado por el agente de
+    # infra de esta misma ronda (nginx.conf, docker-compose) -- acá solo se
+    # declara el setting. Default de dev: puerto publicado del contenedor
+    # `frontend` (58100, ver docker-compose.yml). Override real en
+    # producción vía env (dominio público real del frontend).
+    PUBLIC_STORAGE_PROXY_URL: str = "http://localhost:58100"
+    # Plazo para RETOMAR una sesión de subida grande interrumpida (ej. se
+    # cerró la pestaña, se reinició la PC) antes de que la tarea periódica
+    # de limpieza (app/worker/tasks/uploads.py) la dé por abandonada, aborte
+    # el multipart real en MinIO y libere la cuota reservada. 48h da margen
+    # real (alguien puede tardar más de una noche en volver a una subida de
+    # 15GB) sin dejar sesiones colgadas indefinidamente. Distinto del
+    # vencimiento de cada URL presignada individual (mucho más corto, ver
+    # `_PART_URL_EXPIRES_SECONDS` en app/uploads/service.py) -- para eso
+    # está POST /uploads/{id}/refresh-part-urls.
+    UPLOAD_SESSION_EXPIRY_HOURS: int = 48
+
     # ===== BACKUPS (Ronda 7 -- backups automáticos + verificación) =====
     # Backup de Postgres: pg_dump completo (toda la base física -- en modo
     # cloud eso incluye TODOS los schemas de tenant de una sola pasada,

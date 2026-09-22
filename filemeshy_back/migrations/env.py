@@ -30,6 +30,8 @@ from app.notifications.models import Notification
 from app.files.models import Folder, File, Share, FileVersion, FileContentIndex
 from app.storage_quota.models import UserStorageQuota
 from app.tags.models import Tag, file_tags, folder_tags
+from app.backups.models import BackupRun
+from app.uploads.models import UploadSession
 
 # ===== CONFIGURATION =====
 config = context.config

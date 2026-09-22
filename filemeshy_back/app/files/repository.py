@@ -35,6 +35,14 @@ _FILE_SORT_COLUMNS = {
     "size_bytes": File.size_bytes,
 }
 
+# Ronda 9 -- único valor de `File.scan_status` que hace a un archivo visible
+# en cualquier lectura normal (ver `CRUDFile`, docstring de la clase). Un
+# valor 'infected' NUNCA vuelve a 'clean' automáticamente -- solo existe el
+# camino manual de moderación (fuera de alcance de esta ronda), así que un
+# archivo infectado queda invisible para siempre, que es el comportamiento
+# deseado.
+_VISIBLE_SCAN_STATUS = "clean"
+
 
 def _resolve_sort_column(columns: dict, sort_by: str, sort_dir: str):
     """Resuelve `sort_by`/`sort_dir` a una expresión `order_by` real contra la
@@ -206,10 +214,57 @@ class CRUDFolder(CRUDBase[Folder, None, None]):
 
 
 class CRUDFile(CRUDBase[File, None, None]):
+    """Ronda 9 (coordinación de subida multipart + antivirus asíncrono):
+    TODOS los métodos de lectura de esta clase -- incluido `get()`, heredado
+    de `CRUDBase` pero sobreescrito acá -- filtran `File.scan_status ==
+    _VISIBLE_SCAN_STATUS` de forma centralizada. Un archivo 'pending'
+    (subida multipart todavía sin escanear) o 'infected' (AV lo marcó como
+    amenaza) queda invisible en CUALQUIER lectura que pase por este
+    repository -- listados normales, papelera, búsqueda, detalle,
+    descarga (`download_file` en app/files/router.py usa `_get_owned_file`,
+    que a su vez llama a `get()`), y también al resolver el archivo de un
+    share (`file_repo.get_active(db, share.file_id)`) -- ni siquiera el
+    propio dueño puede verlo/descargarlo mientras no esté 'clean'.
+
+    Se centraliza acá (un solo lugar) a propósito, en vez de parchear cada
+    endpoint de app/files/router.py uno por uno -- ese archivo lo tocan otros
+    dos agentes de esta misma ronda en paralelo (AV/infra y frontend no,
+    pero el de AV sí construye la tarea que marca 'clean'/'infected'), así
+    que modificarlo acá habría sido tanto fuera de alcance como un foco real
+    de conflictos de merge. Cubre confirmadamente los 9 call-sites reales de
+    `file_repo.*` que existen hoy en toda la app (get/get_active/get_children/
+    get_trash/search, ver `app/files/router.py` y
+    `app/worker/tasks/indexing.py`) -- verificado con grep antes de este
+    cambio, no es una suposición.
+
+    Para el escaneo de AV en sí (que necesita leer un `File` 'pending' para
+    poder actualizarlo a 'clean'/'infected'), ver `get_for_scan_worker` más
+    abajo -- el ÚNICO método de esta clase que NO aplica este filtro, a
+    propósito."""
+
+    def get(self, db: Session, id) -> Optional[File]:
+        return (
+            db.query(File)
+            .filter(File.id == id, File.scan_status == _VISIBLE_SCAN_STATUS)
+            .first()
+        )
+
+    def get_for_scan_worker(self, db: Session, file_id: UUID) -> Optional[File]:
+        """Lectura SIN el filtro de `scan_status` -- exclusivamente para la
+        tarea de escaneo asíncrono de AV (Ronda 9, módulo construido en
+        paralelo por otro agente de esta misma ronda:
+        `app.worker.tasks.av_scan.scan_uploaded_file`), que necesita poder
+        leer un `File` recién creado en `'pending'` para poder marcarlo
+        `'clean'`/`'infected'` después de escanearlo -- con el filtro
+        normal de `get()`, esa tarea jamás encontraría el archivo que tiene
+        que procesar. No usar para NADA que sirva contenido a un usuario
+        final."""
+        return db.query(File).filter(File.id == file_id).first()
+
     def get_active(self, db: Session, file_id: UUID) -> Optional[File]:
         return (
             db.query(File)
-            .filter(File.id == file_id, File.deleted_at.is_(None))
+            .filter(File.id == file_id, File.deleted_at.is_(None), File.scan_status == _VISIBLE_SCAN_STATUS)
             .first()
         )
 
@@ -224,7 +279,7 @@ class CRUDFile(CRUDBase[File, None, None]):
         tag_id: Optional[UUID] = None,
     ) -> List[File]:
         query = db.query(File).options(selectinload(File.tags)).filter(
-            File.owner_id == owner_id, File.deleted_at.is_(None)
+            File.owner_id == owner_id, File.deleted_at.is_(None), File.scan_status == _VISIBLE_SCAN_STATUS
         )
         if folder_id is None:
             query = query.filter(File.folder_id.is_(None))
@@ -247,7 +302,9 @@ class CRUDFile(CRUDBase[File, None, None]):
         favorites_only: bool = False,
         tag_id: Optional[UUID] = None,
     ) -> List[File]:
-        query = db.query(File).options(selectinload(File.tags)).filter(File.deleted_at.isnot(None))
+        query = db.query(File).options(selectinload(File.tags)).filter(
+            File.deleted_at.isnot(None), File.scan_status == _VISIBLE_SCAN_STATUS
+        )
         if owner_id is not None:
             query = query.filter(File.owner_id == owner_id)
         if favorites_only:
@@ -281,6 +338,7 @@ class CRUDFile(CRUDBase[File, None, None]):
         query = db.query(File).options(selectinload(File.tags)).filter(
             File.owner_id == owner_id,
             File.deleted_at.is_(None),
+            File.scan_status == _VISIBLE_SCAN_STATUS,
         )
         if content_ids:
             query = query.filter(or_(File.name.ilike(f"%{q}%"), File.id.in_(content_ids)))
@@ -310,7 +368,7 @@ class CRUDFile(CRUDBase[File, None, None]):
     def get_by_folder_ids(self, db: Session, folder_ids: List[UUID]) -> List[File]:
         if not folder_ids:
             return []
-        return db.query(File).filter(File.folder_id.in_(folder_ids)).all()
+        return db.query(File).filter(File.folder_id.in_(folder_ids), File.scan_status == _VISIBLE_SCAN_STATUS).all()
 
 
 class CRUDFileVersion(CRUDBase[FileVersion, None, None]):
