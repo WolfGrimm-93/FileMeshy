@@ -40,10 +40,6 @@ export default function RoleEditPage() {
 
   const isSuperAdmin = authUser?.role === 'SUPER_ADMIN'
 
-  useEffect(() => {
-    loadRole()
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [id])
 
   const loadRole = async () => {
     if (!id) return
@@ -79,6 +75,11 @@ export default function RoleEditPage() {
       setIsLoading(false)
     }
   }
+
+  useEffect(() => {
+    loadRole()
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id])
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()

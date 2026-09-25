@@ -51,6 +51,8 @@ The email must be valid for login: reserved domains (`.local`, `.test`, `.invali
   security patches.
 - The frontend CSP allows one inline script by SHA-256 hash (see `filemeshy_front/nginx.conf`);
   if the inline script in `index.html` changes, recompute the hash.
+- Tests: backend `docker compose exec backend python -m pytest tests` (needs the stack running and pytest from `requirements-dev.txt`); frontend `pnpm test` in `filemeshy_front/`. CI (`.github/workflows/ci.yml`) runs lint, type-check, frontend tests, build and dependency audit.
+- Behind a reverse proxy set `TRUSTED_PROXY_IPS` (IPs or CIDR) so rate limiting and audit logs use the real client IP; `TRUSTED_PROXY_IP_HEADERS` (default `["x-real-ip"]`) chooses which header to trust. See [docs/operacion.md](docs/operacion.md) (Spanish).
 - File contents in MinIO are **not** backed up unless an external S3-compatible destination is
   configured (`BACKUP_S3_*` variables). Only the PostgreSQL database is backed up by default.
 

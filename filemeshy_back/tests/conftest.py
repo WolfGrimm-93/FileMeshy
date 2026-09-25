@@ -85,8 +85,9 @@ def _reset_own_rate_limit_bucket():
         from app.core.cache import cache
 
         if cache.enabled and cache.client:
-            for prefix in ("rl:", "rl_lock:", "rl_lockout_count:"):
+            for prefix in ("rl:", "rl_lock:", "rl_lockout_count:", "rlfw:"):
                 cache.client.delete(f"{prefix}register:ip:127.0.0.1")
+                cache.client.delete(f"{prefix}public_share:127.0.0.1")
     except Exception:
         # Best-effort -- si Redis no está disponible por algún motivo, los
         # tests igual corren (probablemente contra el fallback en memoria,

@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { Modal } from '@/ui/modals/Modal'
 import { Button } from '@/ui/buttons/Button'
 import type { FilterGroup, FilterValues } from './types'
-import { renderFilterField } from './inputs'
+import { FilterFieldRenderer } from './inputs'
 
 export interface FilterModalProps {
   isOpen: boolean
@@ -101,7 +101,7 @@ export function FilterModal({
             <div className="space-y-4">
               {group.fields.map((field) => (
                 <div key={field.key}>
-                  {renderFilterField(field, draft, handleFieldChange, field.key === firstFieldKey)}
+                  <FilterFieldRenderer field={field} values={draft} onChange={handleFieldChange} autoFocus={field.key === firstFieldKey} />
                 </div>
               ))}
             </div>

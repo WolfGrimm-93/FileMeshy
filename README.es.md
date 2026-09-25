@@ -55,6 +55,8 @@ con ese usuario.
 - La CSP del frontend permite un script inline por hash SHA-256 (ver
   `filemeshy_front/nginx.conf`); si cambia el script inline de `index.html`, hay que recalcular
   el hash.
+- Tests: backend `docker compose exec backend python -m pytest tests` (requiere el stack levantado y pytest de `requirements-dev.txt`); frontend `pnpm test` en `filemeshy_front/`. El CI (`.github/workflows/ci.yml`) corre lint, type-check, tests de frontend, build y auditoría de dependencias.
+- Detrás de un reverse proxy configurá `TRUSTED_PROXY_IPS` (IPs o CIDR) para que el rate-limit y la auditoría usen la IP real del cliente; `TRUSTED_PROXY_IP_HEADERS` (default `["x-real-ip"]`) elige en qué header confiar. Ver [docs/operacion.md](docs/operacion.md).
 - El contenido de los archivos en MinIO **no** tiene backup salvo que se configure un destino
   S3-compatible externo (variables `BACKUP_S3_*`). Por defecto solo se respalda la base de datos
   PostgreSQL.

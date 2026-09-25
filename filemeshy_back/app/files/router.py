@@ -40,9 +40,11 @@ from starlette.concurrency import run_in_threadpool
 
 from app.access_control.service import has_permission
 from app.auth.service import RateLimiter, get_current_active_user
+from app.audit.service import log_audit
 from app.core.config import settings
 from app.core.database import SessionLocal, get_db
 from app.core.security import get_password_hash, verify_password
+from app.shared.utils.client_ip import get_real_ip, rate_limit_ip_key
 from app.files.models import File as FileModel, FileVersion, Folder, Share
 from app.files.repository import (
     file_content_index_repo,
@@ -185,6 +187,37 @@ def _enforce_office_preview_rate_limit(current_user: User) -> None:
     if not is_allowed:
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=rl_message)
     RateLimiter.record_attempt(rl_key, window_seconds=OFFICE_PREVIEW_RATE_LIMIT_WINDOW_SECONDS)
+
+
+def _audit_download(
+    db: Session,
+    request: Request,
+    *,
+    user_id,
+    user_email: Optional[str],
+    file_id,
+    file_name: str,
+    via: str,
+    share_id=None,
+) -> None:
+    """Registra una fila de auditoría `DOWNLOAD` sobre `files`. Se llama
+    DESPUÉS de generar la URL con éxito (los 404/403 no llegan acá). Nunca
+    rompe la descarga: `log_audit` captura sus propios errores. La IP es la
+    real (respeta TRUSTED_PROXY_IPS). NO se audita el preview."""
+    new_data = {"name": file_name, "via": via}
+    if share_id is not None:
+        new_data["share_id"] = str(share_id)
+    log_audit(
+        db,
+        request=request,
+        user_id=str(user_id) if user_id is not None else None,
+        user_email=user_email,
+        action="DOWNLOAD",
+        table_name="files",
+        record_id=str(file_id),
+        new_data=new_data,
+        ip_address=get_real_ip(request),
+    )
 
 
 def _resolve_verified_content_type(content: bytes, declared_content_type: str) -> str:
@@ -595,6 +628,17 @@ def _enqueue_content_indexing(file_id: UUID) -> None:
     try:
         from app.core.database import tenant_schema_ctx
         from app.worker.tasks.indexing import index_file_content
+
+        # Nuevo encolado -> el contador de intentos (tope de redelivery)
+        # arranca de cero. Best-effort: sesión propia y corta.
+        try:
+            reset_db = SessionLocal()
+            try:
+                file_content_index_repo.reset_attempts(reset_db, file_id)
+            finally:
+                reset_db.close()
+        except Exception:
+            logger.warning(f"No se pudo resetear attempts de indexación de {file_id}", exc_info=True)
 
         index_file_content.delay(tenant_schema_ctx.get(), str(file_id))
     except Exception:
@@ -1211,6 +1255,7 @@ def get_file(
 
 @files_router.get("/{file_id}/download", response_model=DownloadUrlResponse)
 def download_file(
+    request: Request,
     file_id: UUID,
     force_download: bool = Query(False),
     db: Session = Depends(get_db),
@@ -1219,6 +1264,14 @@ def download_file(
     file_obj = _get_owned_file(db, file_id, current_user, active_only=True)
     disposition = _download_disposition(file_obj, force=force_download)
     url = generate_presigned_url(file_obj.storage_key, response_content_disposition=disposition)
+    # Auditoría explícita de la descarga (el AuditMiddleware solo cubre
+    # escrituras). Valores capturados ANTES: log_audit hace commit y puede
+    # expirar los objetos ORM.
+    _audit_download(
+        db, request,
+        user_id=current_user.id, user_email=current_user.email,
+        file_id=file_obj.id, file_name=file_obj.name, via="direct",
+    )
     return DownloadUrlResponse(download_url=url)
 
 
@@ -1859,6 +1912,31 @@ def _resolve_share_download_target(db: Session, share: Share, file_id: UUID) -> 
     return file_obj
 
 
+# Throttle por USUARIO autenticado de los endpoints de shares dirigidos
+# (mismo patrón que `_enforce_office_preview_rate_limit`): lecturas 60/min,
+# escrituras (subida/reemplazo, que además leen el archivo completo a
+# memoria) 30/min (la UI sube de a un archivo, >10 seguidos es legítimo).
+# Ventana FIJA (RateLimiter.check_fixed_window): N por ventana de 60s, no "N
+# sin pausa de 60s".
+DIRECTED_SHARE_READ_RATE_LIMIT_MAX = 60
+DIRECTED_SHARE_WRITE_RATE_LIMIT_MAX = 30
+DIRECTED_SHARE_RATE_LIMIT_WINDOW_SECONDS = 60
+
+
+def _enforce_directed_share_rate_limit(current_user: User, bucket: str) -> None:
+    """`bucket` es 'read' o 'write'. Clave por usuario: `directed_share_read:{id}`
+    / `directed_share_write:{id}`."""
+    max_attempts = (
+        DIRECTED_SHARE_WRITE_RATE_LIMIT_MAX if bucket == "write" else DIRECTED_SHARE_READ_RATE_LIMIT_MAX
+    )
+    rl_key = f"directed_share_{bucket}:{current_user.id}"
+    is_allowed, rl_message = RateLimiter.check_fixed_window(
+        rl_key, max_requests=max_attempts, window_seconds=DIRECTED_SHARE_RATE_LIMIT_WINDOW_SECONDS
+    )
+    if not is_allowed:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=rl_message)
+
+
 def _get_directed_share_for_viewer(db: Session, share_id: UUID, current_user: User) -> Share:
     """Share DIRIGIDO (shared_with_user_id NOT NULL) vigente, accesible por
     el destinatario o por el dueño del recurso (`created_by_id`) -- 404 para
@@ -1893,22 +1971,31 @@ def get_share_content(
     (`get_public_share`), pero autenticado y solo para el destinatario o el
     dueño (ver `_get_directed_share_for_viewer`). Acepta `path` para navegar
     subcarpetas igual que el público, por paridad con esa UI."""
+    _enforce_directed_share_rate_limit(current_user, "read")
     share = _get_directed_share_for_viewer(db, share_id, current_user)
     return _build_share_content_response(db, share, path=path, force_download=force_download)
 
 
 @shares_router.get("/{share_id}/download/{file_id}", response_model=DownloadUrlResponse)
 def download_share_file(
+    request: Request,
     share_id: UUID,
     file_id: UUID,
     force_download: bool = Query(False),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
 ):
+    _enforce_directed_share_rate_limit(current_user, "read")
     share = _get_directed_share_for_viewer(db, share_id, current_user)
     file_obj = _resolve_share_download_target(db, share, file_id)
     disposition = _download_disposition(file_obj, force=force_download)
     url = generate_presigned_url(file_obj.storage_key, response_content_disposition=disposition)
+    _audit_download(
+        db, request,
+        user_id=current_user.id, user_email=current_user.email,
+        file_id=file_obj.id, file_name=file_obj.name, via="directed_share",
+        share_id=share.id,
+    )
     return DownloadUrlResponse(download_url=url)
 
 
@@ -1961,6 +2048,7 @@ async def upload_file_via_share(
     archivo nuevo dentro de ella. La cuota se reserva contra el DUEÑO real de
     la carpeta (`target_folder.owner_id`), nunca contra `current_user` -- ver
     diseño de Ronda 3."""
+    _enforce_directed_share_rate_limit(current_user, "write")
     share = _get_share_for_write(db, share_id, current_user)
     _require_edit_permission(share)
     if share.folder_id is None:
@@ -2015,6 +2103,7 @@ async def replace_file_via_share(
     libera) y queda una `FileVersion` con `created_by_id` = el destinatario
     que subió el reemplazo (no el dueño), mientras que la cuota se sigue
     reservando contra el DUEÑO real del archivo (mismo criterio de Ronda 3)."""
+    _enforce_directed_share_rate_limit(current_user, "write")
     share = _get_share_for_write(db, share_id, current_user)
     _require_edit_permission(share)
     if share.file_id is None:
@@ -2067,16 +2156,18 @@ def _enforce_public_share_rate_limit(request: Request) -> None:
     """Throttle por IP de los endpoints públicos de shares, reusando la misma
     infraestructura de Redis que ya usa `/auth/login` (`RateLimiter`, ver
     app/auth/service.py)."""
-    ip_address = request.client.host if request.client else "unknown"
-    rl_key = f"public_share:{ip_address}"
-    is_allowed, rl_message = RateLimiter.check_rate_limit(
+    # IP real (respeta TRUSTED_PROXY_IPS): tras nginx, request.client.host
+    # es la IP del proxy y todos los visitantes compartirían un solo cupo.
+    ip_address = get_real_ip(request)
+    # IPv6 agrupada por /64 (rate_limit_ip_key); IPv4 sin cambio.
+    rl_key = f"public_share:{rate_limit_ip_key(ip_address)}"
+    is_allowed, rl_message = RateLimiter.check_fixed_window(
         rl_key,
-        max_attempts=PUBLIC_SHARE_RATE_LIMIT_MAX_REQUESTS,
-        lock_duration=PUBLIC_SHARE_RATE_LIMIT_WINDOW_SECONDS,
+        max_requests=PUBLIC_SHARE_RATE_LIMIT_MAX_REQUESTS,
+        window_seconds=PUBLIC_SHARE_RATE_LIMIT_WINDOW_SECONDS,
     )
     if not is_allowed:
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=rl_message)
-    RateLimiter.record_attempt(rl_key, window_seconds=PUBLIC_SHARE_RATE_LIMIT_WINDOW_SECONDS)
 
 
 def _get_valid_share(db: Session, token: str) -> Share:
@@ -2146,4 +2237,10 @@ def download_public_share_file(
     file_obj = _resolve_share_download_target(db, share, file_id)
     disposition = _download_disposition(file_obj, force=force_download)
     url = generate_presigned_url(file_obj.storage_key, response_content_disposition=disposition)
+    _audit_download(
+        db, request,
+        user_id=None, user_email=None,
+        file_id=file_obj.id, file_name=file_obj.name, via="public_share",
+        share_id=share.id,
+    )
     return PublicDownloadResponse(download_url=url)

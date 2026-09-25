@@ -24,9 +24,6 @@ export default function NotificacionesComponent({ onSave }: NotificacionesProps)
     system_notifications: false
   })
 
-  useEffect(() => {
-    loadPreferences()
-  }, [])
 
   const loadPreferences = async () => {
     try {
@@ -44,6 +41,10 @@ export default function NotificacionesComponent({ onSave }: NotificacionesProps)
       setLoading(false)
     }
   }
+
+  useEffect(() => {
+    loadPreferences()
+  }, [])
 
   const handleToggle = (field: keyof UserPreferencesUpdate) => {
     setFormData(prev => ({ ...prev, [field]: !prev[field] }))

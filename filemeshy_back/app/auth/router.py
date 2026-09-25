@@ -182,28 +182,9 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 # Utilidades internas — Turnstile + detección de IP
 # ---------------------------------------------------------------------------
 
-def _get_real_ip(request: Request) -> str:
-    """Obtiene la IP real del cliente.
-
-    `direct_ip` (request.client.host) es la IP de la conexión TCP real -- la
-    única que ningún cliente puede falsificar. Los headers CF-Connecting-IP
-    (Cloudflare) y X-Real-IP (nginx) SOLO se confían si `direct_ip` está en
-    `settings.TRUSTED_PROXY_IPS` -- es decir, si la request de verdad pasó
-    por un proxy conocido que los pone. Sin esta validación, cualquier
-    cliente podía mandar esos headers con el valor que quisiera y evadir por
-    completo el rate-limit/CAPTCHA por IP de /auth (hallazgo de auditoría de
-    seguridad -- confirmado en vivo rotando X-Real-IP contra /auth/register).
-    """
-    direct_ip = request.client.host if request.client else "unknown"
-    if direct_ip not in settings.TRUSTED_PROXY_IPS:
-        return direct_ip
-    cf_ip = request.headers.get("cf-connecting-ip")
-    if cf_ip:
-        return cf_ip.strip()
-    real_ip = request.headers.get("x-real-ip")
-    if real_ip:
-        return real_ip.strip()
-    return direct_ip
+# Reexportado desde el módulo neutral (platform/router.py y tests lo importan
+# desde acá).
+from app.shared.utils.client_ip import get_real_ip as _get_real_ip  # noqa: E402,F401
 
 
 def _is_local_ip(ip: str) -> bool:

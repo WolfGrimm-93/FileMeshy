@@ -2,11 +2,13 @@ import { useRef, useState } from 'react';
 import type { DragEvent, ChangeEvent } from 'react';
 import { Upload, Image as ImageIcon, X } from 'lucide-react';
 import { getFileTypeIcon } from '@/shared/utils/fileTypeIcon';
+import { formatBytes } from '@/shared/utils/downloadFile';
 
 export interface FileUploadProps {
   accept?: string;
   multiple?: boolean;
-  maxSize?: number; // in MB
+  /** Tope por archivo en MB. undefined/Infinity = sin tope de cliente (no se muestra número). */
+  maxSize?: number;
   onFilesSelected?: (files: File[]) => void;
   variant?: 'default' | 'compact' | 'image';
   disabled?: boolean;
@@ -16,7 +18,7 @@ export interface FileUploadProps {
 export const FileUpload = ({
   accept,
   multiple = false,
-  maxSize = 10,
+  maxSize,
   onFilesSelected,
   variant = 'default',
   disabled = false,
@@ -26,8 +28,11 @@ export const FileUpload = ({
   const [error, setError] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
+  // Sin tope si maxSize es undefined o no finito (Infinity/NaN)
+  const hasSizeLimit = maxSize !== undefined && Number.isFinite(maxSize);
+
   const validateFiles = (files: File[]): File[] => {
-    const maxSizeBytes = maxSize * 1024 * 1024;
+    const maxSizeBytes = hasSizeLimit ? maxSize * 1024 * 1024 : Infinity;
     const validFiles: File[] = [];
 
     for (const file of files) {
@@ -138,7 +143,7 @@ export const FileUpload = ({
                 Clic para subir o arrastra aquí
               </p>
               <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                PNG, JPG, GIF hasta {maxSize}MB
+                {hasSizeLimit ? `PNG, JPG, GIF hasta ${maxSize}MB` : 'PNG, JPG, GIF'}
               </p>
             </div>
           </div>
@@ -180,9 +185,11 @@ export const FileUpload = ({
               o haz clic para seleccionar
             </p>
           </div>
-          <p className="text-xs text-gray-500 dark:text-gray-400">
-            Tamaño máximo: {maxSize}MB
-          </p>
+          {hasSizeLimit && (
+            <p className="text-xs text-gray-500 dark:text-gray-400">
+              Tamaño máximo: {maxSize}MB
+            </p>
+          )}
         </div>
       </div>
       {error && <p className="mt-2 text-sm text-red-600 dark:text-red-400">{error}</p>}
@@ -204,14 +211,6 @@ export interface FileListProps {
 }
 
 export const FileList = ({ files, onRemove, className = '' }: FileListProps) => {
-  const formatFileSize = (bytes: number): string => {
-    if (bytes === 0) return '0 Bytes';
-    const k = 1024;
-    const sizes = ['Bytes', 'KB', 'MB', 'GB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
-  };
-
   const getFileIcon = (type: string) => {
     const Icon = getFileTypeIcon(type);
     return <Icon className="w-5 h-5" />;
@@ -232,7 +231,7 @@ export const FileList = ({ files, onRemove, className = '' }: FileListProps) => 
                 {file.name}
               </p>
               <p className="text-xs text-gray-500 dark:text-gray-400">
-                {formatFileSize(file.size)}
+                {formatBytes(file.size)}
               </p>
             </div>
           </div>

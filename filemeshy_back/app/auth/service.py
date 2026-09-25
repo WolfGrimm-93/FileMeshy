@@ -763,6 +763,9 @@ _rl_logger = logging.getLogger("filemeshy.rate_limit")
 _memory_store: Dict[str, Dict] = {}
 _memory_lockout_counts: Dict[str, Dict] = {}  # identifier -> {"count": int, "last": datetime}
 _rl_lock = threading.Lock()
+_memory_fixed_windows: Dict[str, Dict] = {}  # ventana fija (check_fixed_window)
+# Umbral de entradas del fallback en memoria antes de purgar (cota de memoria).
+MEMORY_FIXED_WINDOWS_MAX_ENTRIES = 10_000
 
 # ===== LOCKOUT PROGRESIVO =====
 # Escalada real (no un bloqueo fijo repetido): cada vez que la MISMA
@@ -827,6 +830,62 @@ class RateLimiter:
             RateLimiter._record_redis(redis, identifier, window_seconds)
         else:
             RateLimiter._record_memory(identifier)
+
+    @staticmethod
+    def check_fixed_window(identifier: str, max_requests: int, window_seconds: int) -> Tuple[bool, str]:
+        """Throttle de VENTANA FIJA: como máximo `max_requests` por ventana de
+        `window_seconds`, contadas desde la primera request de la ventana (el
+        TTL se fija solo al primer INCR, no se renueva). Cuenta y decide en
+        una sola operación atómica. Distinto de check_rate_limit +
+        record_attempt (que renuevan el TTL en cada intento y bloquean con
+        lockout): se usa solo para los throttles de volumen de shares."""
+        redis = RateLimiter._get_redis()
+        if redis:
+            try:
+                key = f"rlfw:{identifier}"
+                pipe = redis.pipeline()
+                pipe.incr(key)
+                pipe.ttl(key)
+                count, ttl = pipe.execute()
+                if int(count) == 1 or ttl is None or int(ttl) < 0:
+                    redis.expire(key, window_seconds)
+                    ttl = window_seconds
+                if int(count) > max_requests:
+                    return False, f"Demasiadas solicitudes. Intenta en {max(1, int(ttl))} segundos"
+                return True, "OK"
+            except Exception as exc:
+                _rl_logger.warning("check_fixed_window Redis falló, usando memoria: %s", exc)
+        with _rl_lock:
+            now = time.monotonic()
+            if len(_memory_fixed_windows) > MEMORY_FIXED_WINDOWS_MAX_ENTRIES:
+                RateLimiter._purge_memory_fixed_windows(now)
+            entry = _memory_fixed_windows.get(identifier)
+            if entry is None or now - entry["start"] >= entry.get("window", window_seconds):
+                entry = {"start": now, "count": 0, "window": window_seconds}
+                _memory_fixed_windows[identifier] = entry
+            entry["count"] += 1
+            if entry["count"] > max_requests:
+                remaining = max(1, int(window_seconds - (now - entry["start"])))
+                return False, f"Demasiadas solicitudes. Intenta en {remaining} segundos"
+            return True, "OK"
+
+    @staticmethod
+    def _purge_memory_fixed_windows(now: float) -> None:
+        """Cota de memoria del fallback (Redis caído). Llamar con `_rl_lock`
+        tomado. Primero descarta ventanas vencidas (cada entrada guarda su
+        propia `window`); si aun así se supera el umbral, descarta las que
+        vencen antes (las más viejas/más cerca de expirar) hasta bajar (cota
+        dura), así una ventana larga de un atacante activo se conserva."""
+        for key in [k for k, e in _memory_fixed_windows.items() if now - e["start"] >= e["window"]]:
+            del _memory_fixed_windows[key]
+        excess = len(_memory_fixed_windows) - MEMORY_FIXED_WINDOWS_MAX_ENTRIES
+        if excess > 0:
+            oldest = sorted(
+                _memory_fixed_windows,
+                key=lambda k: _memory_fixed_windows[k]["start"] + _memory_fixed_windows[k]["window"],
+            )[:excess]
+            for key in oldest:
+                del _memory_fixed_windows[key]
 
     @staticmethod
     def clear(identifier: str) -> None:

@@ -4,7 +4,7 @@
 # digest vigente al 2026-09-22.
 FROM node:22-alpine@sha256:b6f26b36c8ff49624cfdac716b8ea1138d606df02586a77d364bb5536a634f85 AS build
 
-RUN corepack enable && corepack prepare pnpm@latest --activate
+RUN corepack enable && corepack prepare pnpm@11.6.0 --activate
 
 WORKDIR /app
 

@@ -3,6 +3,7 @@ de reset de contraseña."""
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
 from uuid import UUID
 from datetime import datetime, timedelta, timezone
 import random
@@ -10,6 +11,9 @@ from sqlalchemy.orm import Session
 
 from app.auth.models import PasswordResetSession
 from app.auth.service import CodeHashService
+
+if TYPE_CHECKING:  # solo para anotaciones (código legado, ver nota de CRUDPasswordReset)
+    from app.auth.models import PasswordResetCode
 
 
 class CRUDPasswordReset:

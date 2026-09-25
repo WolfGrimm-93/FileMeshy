@@ -16,7 +16,14 @@ import type { AxiosError } from 'axios'
 export function extractErrorMessage(error: unknown, fallback = 'Ocurrió un error inesperado'): string {
   if (error && typeof error === 'object' && 'response' in error) {
     const axiosError = error as AxiosError
-    const data = axiosError.response?.data as any | undefined
+    // Cuerpo de error del backend: forma laxa, se valida campo por campo abajo
+    type ErrorBody = {
+      code?: string
+      message?: string
+      data?: { code?: string; message?: string }
+      detail?: string | Array<{ msg?: string }> | Record<string, unknown>
+    }
+    const data = axiosError.response?.data as ErrorBody | undefined
 
     // Errores con estructura { code, message } (ej. password reset)
     if (data?.code && data?.message) {
@@ -31,7 +38,7 @@ export function extractErrorMessage(error: unknown, fallback = 'Ocurrió un erro
     // Errores de validación de Pydantic (422): detail es un array
     if (Array.isArray(data?.detail)) {
       const validationError = data.detail[0]
-      if (validationError && 'msg' in validationError) {
+      if (validationError && 'msg' in validationError && validationError.msg) {
         return validationError.msg
       }
     }

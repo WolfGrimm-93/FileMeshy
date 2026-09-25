@@ -212,6 +212,12 @@ class FileContentIndex(Base):
     extraction_status = Column(String(20), nullable=False, server_default="pending")
     error_message = Column(Text, nullable=True)
     indexed_at = Column(DateTime(timezone=True), nullable=True)
+    # Intentos de indexación del encolado actual (tope contra redelivery
+    # indefinida, ver app/worker/tasks/indexing.py::MAX_INDEX_ATTEMPTS).
+    attempts = Column(Integer, nullable=False, server_default="0", default=0)
+    # Último inicio de intento (lo pone `register_attempt`); el barrido de
+    # filas 'pending' huérfanas (maintenance) lo usa para medir antigüedad.
+    attempted_at = Column(DateTime(timezone=True), nullable=True)
 
     file = relationship("File", foreign_keys=[file_id], lazy="select")
 

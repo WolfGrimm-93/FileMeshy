@@ -1,3 +1,4 @@
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
 from typing import List, Literal, Optional
 
@@ -246,7 +247,39 @@ class Settings(BaseSettings):
     # proxy real delante del backend, ver docker-compose.prod.yml) -- o
     # dejar vacío si Cloudflare Tunnel entrega directo sin un proxy
     # intermedio que reescriba esos headers.
+    # Acepta IPs sueltas o CIDR (ej. 172.18.0.0/16). Entrada inválida ->
+    # error claro al arrancar (ver validator abajo).
     TRUSTED_PROXY_IPS: List[str] = []
+
+    @field_validator("TRUSTED_PROXY_IPS", mode="after")
+    @classmethod
+    def _validate_trusted_proxies(cls, value):
+        # Import diferido (el módulo de utils importa settings de forma lazy).
+        from app.shared.utils.client_ip import parse_trusted_proxies
+
+        parse_trusted_proxies(value)  # lanza ValueError con el valor inválido
+        return value
+
+    # Headers de los que se lee la IP del cliente, en orden de preferencia,
+    # y SOLO cuando la conexión directa viene de TRUSTED_PROXY_IPS. Default
+    # seguro: solo x-real-ip (nginx.conf lo pisa con $remote_addr).
+    # cf-connecting-ip es opt-in explícito: activarlo únicamente si el proxy
+    # de confianza lo sanea/pisa (Cloudflare lo pone, pero un nginx que solo
+    # pisa X-Real-IP lo dejaría pasar tal cual lo mande el cliente).
+    TRUSTED_PROXY_IP_HEADERS: List[str] = ["x-real-ip"]
+
+    @field_validator("TRUSTED_PROXY_IP_HEADERS", mode="after")
+    @classmethod
+    def _validate_proxy_ip_headers(cls, value):
+        allowed = {"x-real-ip", "cf-connecting-ip"}
+        normalized = [str(h).strip().lower() for h in value]
+        invalid = [h for h in normalized if h not in allowed]
+        if invalid:
+            raise ValueError(
+                f"TRUSTED_PROXY_IP_HEADERS contiene valores no permitidos: {invalid} "
+                f"(permitidos: {sorted(allowed)})"
+            )
+        return normalized
 
     class Config:
         env_file = ".env"

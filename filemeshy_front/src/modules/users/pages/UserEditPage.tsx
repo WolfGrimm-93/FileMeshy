@@ -7,6 +7,7 @@ import { useUserStore } from '../store/userStore'
 import { rolesService } from '@/modules/access_control/services/roles.service'
 import type { RoleSummary } from '@/modules/access_control/types/role.types'
 import type { UserFormData } from '../types'
+import type { UserUpdate } from '../services/user.service'
 
 export default function UserEditPage() {
   const navigate = useNavigate()
@@ -97,7 +98,7 @@ export default function UserEditPage() {
     }
 
     // Preparar datos de actualización
-    const updateData: any = {
+    const updateData: UserUpdate = {
       email: formData.email,
       first_name: formData.first_name,
       last_name: formData.last_name,

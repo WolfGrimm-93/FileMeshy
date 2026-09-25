@@ -45,10 +45,6 @@ export default function RoleDetailPage() {
   // de lo que aclara. Se muestra "Acceso total" en vez de esa lista parcial.
   const isSuperAdminRole = role?.name === 'SUPER_ADMIN'
 
-  useEffect(() => {
-    loadRole()
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [id])
 
   const loadRole = async () => {
     if (!id) return
@@ -74,6 +70,11 @@ export default function RoleDetailPage() {
       setIsLoading(false)
     }
   }
+
+  useEffect(() => {
+    loadRole()
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id])
 
   const handleEdit = () => {
     if (!role) return

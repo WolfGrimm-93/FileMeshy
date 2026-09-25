@@ -47,7 +47,13 @@ class UserUpdate(BaseModel):
 
 
 class User(UserBase):
-    """Schema de usuario con datos de BD."""
+    """Schema de usuario con datos de BD (SALIDA).
+
+    `email` es `str` a propósito: la validación de EmailStr es cosa de los
+    schemas de ENTRADA (UserCreate/UserUpdate/LoginRequest). Validarla al
+    serializar datos ya guardados rompía el listado completo (500) por un solo
+    usuario legado con dominio reservado (ej. *.local)."""
+    email: str
     id: UUID
     role_id: Optional[UUID] = None
     role: Optional[str] = None  # Computed: se llena desde role_obj.name

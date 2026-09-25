@@ -610,6 +610,80 @@ reproducible; si vuelve a aparecer, reabrir con pasos exactos.
 **Hallazgo nuevo, sin corregir:** el modal de subida muestra "Tamaño máximo: 1073741824MB" — son
 bytes rotulados como MB (`FileUpload.tsx` / uso en el modal de subida). Cosmético, pero confunde.
 
+**Hecho (2026-09-25) — Ronda 11: cierre de deuda del backlog (flujo multi-agente completo).**
+Recon (2) → implementación (3) → revisión adversarial (2) → feedback → auditor final (1, veredicto
+APTO CON RESERVAS) → pruebas (2, backend y navegador real), con gating estricto entre fases.
+
+Resuelto y verificado:
+
+- **Rate-limit de shares públicos por visitante real:** usa `get_real_ip` (nuevo
+  `app/shared/utils/client_ip.py`), con soporte de CIDR en `TRUSTED_PROXY_IPS` (rechaza `/0`,
+  entradas inválidas abortan el arranque), clave IPv6 normalizada al /64, y **ventana fija**
+  (`RateLimiter.check_fixed_window`) — antes el TTL se renovaba en cada intento (era "N requests
+  sin pausa de 60s"). Verificado en vivo: 30 OK y luego 429, y el bloqueo se levanta a los ~57s.
+- **Rate-limit en shares dirigidos autenticados** (lectura 60/60s, escritura 30/60s por usuario).
+- **`TRUSTED_PROXY_IP_HEADERS`** (nuevo, default `["x-real-ip"]`): `cf-connecting-ip` pasa a ser
+  opt-in porque `nginx.conf` solo pisa `X-Real-IP` y ese header era falsificable.
+- **Auditoría de descargas** (`action=DOWNLOAD`) en descarga propia, share dirigido y share
+  público (user_id NULL). Preview no se audita. Verificado en vivo con filas reales en `audit_log`.
+- **Indexación endurecida:** tope de páginas de PDF (`MAX_PDF_TEXT_PAGES`, 500), contador
+  `attempts` + `attempted_at` (migraciones `e5a1c7d3b9f2`, `f2b8d4e6a1c3`), `SoftTimeLimitExceeded`
+  ya no lo tragan los `except Exception` anidados, `reject_on_worker_lost=False` solo en esa
+  tarea, tope de tamaño, y **barrido periódico** `sweep_stale_pending_content_index` (beat cada
+  10 min) que marca `failed` las filas `pending` huérfanas. Verificado en vivo (fila vieja →
+  failed, reciente y `done` intactas). Migraciones probadas con downgrade/upgrade sobre 4466 filas.
+- **`scan_uploaded_file` con `tenant_schema`** (modo cloud). Solo unit tests: no hay entorno cloud.
+- **`GET /users` daba 500** con usuarios legados de dominio reservado (`.local`/`.test`): el
+  schema de RESPUESTA validaba `EmailStr`. Ahora `User.email` es `str` (la entrada sigue
+  validando). Hallazgo de las pruebas de cierre; verificado en vivo (200, 50 filas en la UI).
+- **QR de 2FA no se veía:** la CSP de la Ronda 10 no permitía `data:` en `img-src`. Corregido en
+  `nginx.conf` (3 lugares), verificado en navegador real (QR 450×450, cero violaciones CSP).
+  **Fue una regresión de la Ronda 10 que estuvo publicada en GitHub (`3ac8187`).**
+- **Infra:** healthchecks en los 8 servicios (dev), redes `av_net`/`converter_net` internas y
+  `clamav_egress`, `pnpm@11.6.0` fijado. Verificado en vivo: los 8 healthy; `clamav` sale a
+  internet y su `freshclam` actualiza firmas; `office_converter` **no** tiene salida ni DNS
+  externo; `mc` existe en la imagen de MinIO pinneada.
+- **CI/calidad:** `.github/workflows/ci.yml` (ruff==0.16.9, eslint, tsc, vitest, build,
+  docker build, SCA), `.github/dependabot.yml`, `filemeshy_back/ruff.toml` (ruff en 0),
+  `docs/operacion.md` (runbook con los cambios a aplicar a mano en producción).
+- **Frontend:** rótulo "Tamaño máximo: 1073741824MB" corregido, `formatBytes` robusto (TB,
+  negativos, redondeo), ESLint 58 → 46 errores (solo el bloque mecánico), vitest con 41 tests,
+  menú ⋮ extraído a `menuCoords.ts`.
+- Suite backend: **167 passed, 8 skipped, 0 failed** (2 corridas seguidas sin flakiness antes
+  del fix de `/users`). Frontend: 41/41 tests, `tsc -b` 0 errores.
+
+**Pendiente tras esta ronda (no resuelto):**
+
+- **DECISIÓN DEL USUARIO — IP real del visitante en producción:** con `nginx.conf` actual y
+  `TRUSTED_PROXY_IP_HEADERS` por defecto, en prod todos los visitantes de shares públicos
+  comparten un solo cupo (30/min) y la auditoría guarda la IP de Traefik. Dos caminos en
+  `docs/operacion.md` §5.3: `set_real_ip_from`/`real_ip_header` en nginx, o habilitar
+  `cf-connecting-ip` solo si el tráfico entra únicamente por Cloudflare. Sin esto, el fix de
+  CIDR/IPv6 no tiene efecto real en producción.
+- **Deuda de dependencias con CVEs conocidos** (medido con `pip-audit`/`pnpm audit`, ver
+  `docs/operacion.md` §7): `pypdf 4.3.1` (77, fix 6.9.2), `pillow 11.0.0` (33, fix 12.3.0),
+  `python-multipart 0.0.18` (12, en backend y office_converter, fix 0.0.31), `python-dotenv`,
+  `pymysql`, `starlette` transitiva del conversor, y `react-router` en el front (5, 2 altas, fix
+  ≥7.18.2). El job `sca` de CI es `continue-on-error` hasta que se actualicen. **Es lo más
+  urgente del backlog de seguridad.**
+- `docker-compose.prod.yml` (no versionado): aplicar a mano healthchecks, redes internas,
+  `mem_limit` del worker y `TRUSTED_PROXY_IPS` (ver `docs/operacion.md` §5). Renombrar
+  contenedores a `filemeshy-prod-<servicio>` sigue **pendiente de confirmación del usuario**.
+- ESLint: 46 errores + 8 warnings restantes (`set-state-in-effect` 36, `refs` 4 en `useAuth`,
+  `immutability` 3, `static-components` 2, `preserve-manual-memoization` 1) — cambian
+  comportamiento, requieren tests de esos flujos. CI corre eslint con `continue-on-error`.
+- El worker de dev corre sin `--beat`: el barrido no corre en dev (sí en prod).
+- 22 filas de indexación legadas `pending` con `attempted_at` NULL: por diseño el barrido no las
+  toca, quedan `pending` para siempre.
+- Posible bug sin confirmar: al crear un rol desde `/roles/nuevo` el rol quedó con 0 permisos
+  tras los clics de un agente de prueba (pudo ser error de puntería). Reproducir a mano.
+- Sin verificar: multi-parte real con más de 1 parte por curl (lo cubre el test), Firefox/Safari
+  (la CSP puede comportarse distinto), flujo completo de 2FA/reset de contraseña/backup manual,
+  y `SplitButton` (no se usa en ninguna pantalla).
+- Menores: el `GET /admin/config/email` responde 404 cuando no hay configuración y deja ruido en
+  consola (el front lo trata bien); "Navegador desconocido" en una sesión; `SplitButton` sin
+  handler de Escape; `formatBytes` etiqueta GiB como GB.
+
 ### 🟠 Seguridad — importante pero no bloqueante
 
 - `SECRET_KEY` con default hardcodeado en `core/config.py:32` — mitigado por una guarda que
@@ -619,8 +693,8 @@ bytes rotulados como MB (`FileUpload.tsx` / uso en el modal de subida). Cosméti
   ~~`python-jose`~~ y ~~`/health/detailed`~~: resueltos en la Ronda 10 (ver arriba).
 - Cifrado en reposo solo cubre secretos puntuales (TOTP, password SMTP vía Fernet) — el
   contenido de archivos de usuario en MinIO no tiene SSE aplicado por la aplicación.
-- `AuditLog` solo cubre POST/PUT/PATCH/DELETE — lecturas y descargas de archivos no dejan
-  rastro; un acceso indebido de solo lectura no es detectable vía auditoría.
+- `AuditLog` cubre POST/PUT/PATCH/DELETE y, desde la Ronda 11, las DESCARGAS de archivos
+  (propia, share dirigido, share público). Otras lecturas (listados, preview) siguen sin rastro.
 - Consola de MinIO de dev expuesta en `0.0.0.0:58103` con credenciales de desarrollo en texto
   plano en el compose — aceptable solo si la máquina no es alcanzable desde LAN/internet.
 - Rate-limit de shares públicos (`files/router.py:719-732`) usa `request.client.host` directo
@@ -715,29 +789,29 @@ Gaps que siguen abiertos:
 
 ### 🏗️ Estándares técnicos — gaps priorizados (vs. `docs/estandares-cliente-servidor-2026/`)
 
-1. Cero CI/CD — no hay pipeline (`.github/workflows` ni similar), nada corre lint/tests antes
-   de mergear.
-2. Sin SCA/escaneo de dependencias (Dependabot, `pip-audit`, `npm audit`).
+1. ~~Cero CI/CD~~ — Ronda 11: existe `.github/workflows/ci.yml` (ruff, eslint, tsc, vitest, build,
+   docker build, SCA). Falta que sea bloqueante: eslint/tsc/sca van con `continue-on-error`, y los
+   tests de backend (necesitan el stack) no corren en CI todavía.
+2. ~~Sin SCA~~ — Ronda 11: Dependabot + job `sca`. Los hallazgos reales están sin resolver (ver
+   "Deuda de dependencias" arriba).
 3. Logging no estructurado (texto plano) y sin métricas/alertas — sin Prometheus, sin
    OpenTelemetry, sin dashboard de errores. Dos configuraciones de logging compitiendo
    (`main.py` vs `core/logging_config.py`). `RequestLoggingMiddleware` es código muerto
    (nunca se registra en `main.py`, lo dice su propio docstring).
 4. Sin SLA/SLO, sin runbooks de incidentes, sin estrategia de rollback rápido (imágenes sin
    tag versionado — un rebuild sobreescribe `latest` sin dejar una versión previa conocida).
-5. Ruff sin archivo de configuración versionado en el backend (existe `.ruff_cache/` pero no
-   `pyproject.toml`/`ruff.toml`) — el lint no es reproducible ni forzado en CI (que tampoco existe).
+5. ~~Ruff sin configuración~~ — Ronda 11: `filemeshy_back/ruff.toml` (piso conservador), 0
+   hallazgos, forzado en CI.
 6. Sin mypy/type-checking estático en backend (el frontend sí tiene TS estricto).
 7. Sin exportación de datos ni cumplimiento GDPR/portabilidad; borrado de cuenta es
    hard-delete admin-only, sin flujo self-service.
 8. Sin passkeys/WebAuthn (solo TOTP).
-9. Healthchecks faltantes en `backend`/`celery_worker`/`frontend` de
-   `docker-compose.prod.yml` (sí los tienen postgres/redis/minio).
+9. Healthchecks: hechos en `docker-compose.yml` (Ronda 11); faltan en `docker-compose.prod.yml`
+   (no versionado, aplicar a mano).
 10. Swagger/Redoc/OpenAPI solo se exponen si `DEBUG=True` — en producción no hay contrato
     de API consultable ni por el propio equipo.
-11. ESLint del frontend no está limpio en baseline (confirmado en Ronda 8: 58 errores/8
-    warnings preexistentes en todo `filemeshy_front/`, ninguno introducido por rondas de
-    construcción) — mismo problema de fondo que el punto 5 (Ruff sin config forzada en
-    backend), del lado frontend: sin gate en CI, la deuda de lint solo crece.
+11. ESLint del frontend: bajó de 58 a 46 errores (+8 warnings) en la Ronda 11 con el bloque
+    mecánico; el resto cambia comportamiento y requiere tests (ver Ronda 11).
 
 ### 🐛 Bugs puntuales confirmados en vivo
 
@@ -756,7 +830,7 @@ Gaps que siguen abiertos:
   cuando se quiera.
 - Rondas 1 (`d91a47f`), 2 (`61ca9f1`), 3 (`9b08c35`), 4 (`7e9feba`), 5 (`a1c2680`), 6
   (`d833b83`), 7 (`05bd75f`) y 8 (`e76e197`) commiteadas, 2026-09-20/22. Ronda 9 (subida de
-  archivos grandes) commiteada (`bcc90e0`). Ronda 10 (endurecimiento) commiteada `3ac8187` (2026-09-24), cierre y fix del Dropdown el 2026-09-25.
+  archivos grandes) commiteada (`bcc90e0`). Ronda 10 (endurecimiento) commiteada `3ac8187` (2026-09-24), cierre y fix del Dropdown `7be99ae` (2026-09-25). Ronda 11 (cierre de deuda del backlog) commiteada el 2026-09-25.
   Recordatorio operativo real (no solo de código): antes de considerar el permiso `backups.view`
   activo en cualquier entorno nuevo, hay que correr `scripts/seed_permissions.py` — agregar un
   permiso al dict de `permissions.py` no lo propaga solo a las tablas reales (bug real de la
@@ -789,6 +863,7 @@ Aprobado con el usuario el 2026-09-20. Cada ronda se diseña en detalle recién 
 | 8 (hecho) | UI de administración de tenants — **completa**, roadmap original cerrado |
 | 9 (hecho) | Post-roadmap, pedido explícito del usuario 2026-09-22: subida de archivos grandes (10-20GB) sin saturar el servidor, resumable — **completa** |
 | 10 (hecho y verificado en vivo) | Endurecimiento: `Retry-After`, PyJWT, pin por digest, CSP, headers de `/assets/`, `/health/detailed`, validación de email del super admin, portal del Dropdown, tests de Ronda 9 |
+| 11 (hecho y verificado en vivo) | Cierre de deuda del backlog: IP real/CIDR + ventana fija, rate-limit de shares dirigidos, auditoría de descargas, indexación endurecida + barrido, `tenant_schema` en AV, healthchecks y redes internas, CI/Dependabot/ruff, vitest, fixes de `GET /users` y del QR de 2FA |
 
 Fuera de alcance por decisión de producto (no construir sin pedido explícito nuevo): cliente
 de escritorio, app móvil, sincronización selectiva, acceso offline real, edición colaborativa

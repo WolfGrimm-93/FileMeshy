@@ -23,7 +23,6 @@ para los casos de contenido limpio/EICAR. El caso de `clamd` caído usa un
 doble liviano de la tarea Celery (no el broker real) para poder controlar
 `self.request.retries` de forma determinística sin depender de reintentos
 reales con backoff de minutos -- ver `_FakeTask`."""
-import io
 import uuid
 from types import SimpleNamespace
 from uuid import UUID
@@ -90,7 +89,6 @@ def _object_exists_private(key: str) -> bool:
 
 
 def _object_exists_quarantine(key: str) -> bool:
-    from app.core.config import settings
     from app.files.service import _get_client
     from app.worker.tasks.av_scan import MINIO_QUARANTINE_BUCKET
 
@@ -544,7 +542,7 @@ def test_concurrency_semaphore_enforces_limit_and_requeues(client, db_session, m
         redis_client.delete(av_scan._SEMAPHORE_KEY)
 
     assert len(requeued_calls) == 1
-    assert requeued_calls[0][0] == [str(file_obj.id)]
+    assert requeued_calls[0][0] == [str(file_obj.id), None]
     assert requeued_calls[0][1] == av_scan.AV_SCAN_REQUEUE_COUNTDOWN_SECONDS
 
     # Nunca llegó a escanear -- sigue 'pending'.

@@ -95,6 +95,14 @@ services:
       - "58103:9001"
     volumes:
       - filemeshy_minio_data:/data
+    # `mc ready local` viene incluido en la imagen oficial (mismo check que
+    # ya usa docker-compose.prod.yml).
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
   backend:
     build:
@@ -117,13 +125,12 @@ services:
       redis:
         condition: service_healthy
       minio:
-        condition: service_started
-      # Definido por el agente que construye `filemeshy_office_converter/`
-      # en paralelo (Ronda 5) -- ver comentario de OFFICE_CONVERTER_URL más
-      # arriba. `condition: service_started` (no `service_healthy`) porque
-      # todavía no se sabe si ese servicio va a exponer un healthcheck.
+        condition: service_healthy
+      # Ahora `service_healthy`: office_converter tiene healthcheck propio
+      # (ver más abajo), así el backend no arranca antes de que el conversor
+      # responda.
       office_converter:
-        condition: service_started
+        condition: service_healthy
       # Ronda 7: antivirus -- ver comentario completo del servicio `clamav`
       # más abajo. A diferencia de `office_converter`, acá SÍ usamos
       # `service_healthy`: la imagen oficial trae un healthcheck real
@@ -136,6 +143,28 @@ services:
         condition: service_healthy
     ports:
       - "58101:8000"
+    # Redes: `default` (postgres/redis/minio + salida a internet) más las dos
+    # internas de aislamiento (ver bloque `networks:` al final del archivo).
+    networks:
+      - default
+      - av_net
+      - converter_net
+    # Healthcheck: la imagen no trae curl/wget y corre como no-root con
+    # filesystem read-only, así que se usa urllib de la stdlib de Python.
+    # /health responde 200 aun con la BD caída (el estado viaja en el JSON),
+    # por eso se valida el campo `status` y no solo el código HTTP.
+    # `start_period` largo: el CMD corre `alembic upgrade head` antes de
+    # uvicorn y, en el primer arranque, esta espera a clamav (depends_on).
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import json,sys,urllib.request; r=urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4); sys.exit(0 if r.status==200 and json.load(r).get('status')=='healthy' else 1)"
+      interval: 30s
+      timeout: 6s
+      retries: 5
+      start_period: 60s
 
   celery_worker:
     build:
@@ -149,10 +178,26 @@ services:
       redis:
         condition: service_healthy
       minio:
-        condition: service_started
+        condition: service_healthy
       # NO depende de `clamav` a propósito -- el worker de Celery (Ronda 6:
       # indexación/OCR) solo procesa contenido que YA pasó el escaneo de
       # `backend` al subirse, nunca escanea nada él mismo.
+    # Redes: `default` + `av_net` (la tarea av_scan de Ronda 9 sí habla con
+    # clamd para escanear archivos grandes ya subidos a MinIO).
+    networks:
+      - default
+      - av_net
+    # `inspect ping` es pesado (levanta la app de Celery entera): intervalo
+    # largo a propósito. Se apunta al hostname propio del worker
+    # (`celery@<hostname del contenedor>`, el default de Celery) para no
+    # depender de otros workers que pudieran compartir el broker. `$$` evita
+    # que compose interpole la variable: la resuelve el shell del contenedor.
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.worker.celery_app inspect ping -d celery@$$HOSTNAME --timeout 10"]
+      interval: 60s
+      timeout: 20s
+      retries: 3
+      start_period: 40s
 
   # Ronda 5: conversion Office -> PDF via LibreOffice headless, en su
   # propio contenedor aislado (ver filemeshy_office_converter/Dockerfile
@@ -189,6 +234,24 @@ services:
     cpus: 1.0
     pids_limit: 128
     restart: unless-stopped
+    # SOLO en `converter_net` (internal: true, sin salida a internet): un
+    # documento malicioso que logre ejecutar código en LibreOffice no puede
+    # exfiltrar datos ni bajar payloads. Solo `backend` la comparte.
+    # El hostname `office_converter` sigue resolviendo desde backend.
+    networks:
+      - converter_net
+    # python3 está en el PATH de la imagen (venv /opt/venv/bin). /health no
+    # invoca soffice, es liviano.
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=4).status==200 else 1)"
+      interval: 30s
+      timeout: 6s
+      retries: 3
+      start_period: 20s
 
   # Ronda 7: antivirus -- escaneo de malware (ClamAV) de todo contenido
   # nuevo ANTES de subirlo a MinIO (ver app/files/service.py::scan_for_malware
@@ -339,14 +402,49 @@ services:
       retries: 10
       start_period: 900s
     restart: unless-stopped
+    # Redes: `av_net` (internal, backend/celery_worker le hablan por acá) y
+    # `clamav_egress` (bridge normal, SOLO para que freshclam baje firmas).
+    # NO está en `default`: postgres/redis/minio/frontend no lo alcanzan.
+    # Trampa del gateway por defecto: un contenedor multi-red toma su ruta
+    # por defecto de una red con gateway; las redes `internal: true` no
+    # tienen, así que la salida debería ir por `clamav_egress`. Verificar en
+    # vivo (no se probó al escribir esto): `docker compose exec clamav
+    # freshclam` debe terminar sin errores de red, o
+    # `docker compose logs clamav | grep -i freshclam`. Si falla, revisar
+    # `docker compose exec clamav ip route`.
+    networks:
+      - av_net
+      - clamav_egress
 
   frontend:
     build:
       context: ./filemeshy_front
     depends_on:
       - backend
+    # Healthcheck: 127.0.0.1 (no localhost), nginx solo escucha IPv4.
+    # `depends_on: backend` se mantiene en service_started a propósito:
+    # el backend espera a clamav (start_period 900s) y no se quiere retrasar
+    # el frontend ~15 min en el primer arranque.
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     ports:
       - "58100:80"
+
+# Aislamiento de red (defensa en profundidad). Las redes `internal: true` no
+# tienen ruta hacia afuera. Los nombres de servicio (`clamav`,
+# `office_converter`) siguen resolviendo por DNS de compose en las redes
+# compartidas, no hace falta tocar CLAMAV_HOST ni OFFICE_CONVERTER_URL.
+networks:
+  av_net:
+    internal: true
+  converter_net:
+    internal: true
+  clamav_egress:
+    driver: bridge
 
 volumes:
   filemeshy_postgres_data:

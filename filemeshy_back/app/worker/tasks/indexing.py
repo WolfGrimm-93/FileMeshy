@@ -19,8 +19,11 @@ PENDIENTES.md)."""
 
 import io
 import logging
+import os
 from typing import Optional, Tuple
 from uuid import UUID
+
+from celery.exceptions import SoftTimeLimitExceeded
 
 from app.worker.celery_app import celery_app
 from app.worker.db import get_worker_db
@@ -37,11 +40,37 @@ MAX_CONTENT_CHARS = 100_000
 # no tiene otra tarea corriendo en paralelo en la misma cola mientras tanto).
 MAX_PDF_OCR_PAGES = 20
 
+# Tope de páginas de las que se extrae el texto EMBEBIDO de un PDF (pypdf).
+# Independiente del tope de OCR: sin esto, un PDF de miles de páginas hace
+# iterar/parsear todo el documento en una sola tarea aunque solo se persistan
+# MAX_CONTENT_CHARS caracteres. Configurable por env (mismo estilo que
+# av_scan.py). Además se corta apenas se acumulan MAX_CONTENT_CHARS.
+MAX_PDF_TEXT_PAGES = int(os.getenv("MAX_PDF_TEXT_PAGES", "500"))
+
+# Tope de intentos por (archivo, encolado): el contador `attempts` de
+# `file_content_index` se incrementa y COMMITEA al inicio de cada ejecución,
+# antes de leer nada -- así un archivo que mata al worker (OOM, SIGKILL) no
+# se re-procesa para siempre por redelivery (acks_late). Se resetea a 0 al
+# éxito y en cada nuevo encolado (`_enqueue_content_indexing`).
+MAX_INDEX_ATTEMPTS = int(os.getenv("MAX_INDEX_ATTEMPTS", "3"))
+
+# Tamaño máximo de archivo a indexar: `_read_private_object` lee el objeto
+# completo a memoria. Por defecto reutiliza el tope de av_scan.py
+# (AV_SCAN_INDEXING_MAX_SIZE_BYTES, 512MB) para que ambos caminos coincidan.
+INDEXING_MAX_SIZE_BYTES = int(
+    os.getenv("INDEXING_MAX_SIZE_BYTES", os.getenv("AV_SCAN_INDEXING_MAX_SIZE_BYTES", str(512 * 1024 * 1024)))
+)
+
+# Timeouts propios (segundos) para las herramientas externas (Tesseract /
+# poppler): no dependen solo del soft limit de Celery.
+OCR_IMAGE_TIMEOUT_SECONDS = int(os.getenv("OCR_IMAGE_TIMEOUT_SECONDS", "60"))
+PDF_RENDER_TIMEOUT_SECONDS = int(os.getenv("PDF_RENDER_TIMEOUT_SECONDS", "90"))
+
 # Timeout total de la tarea (segundos) -- OCR puede ser lento, pero tiene que
 # tener un techo. `SoftTimeLimitExceeded` se captura como fallo de extracción
 # (ver `index_file_content`), nunca deja el worker colgado indefinidamente.
 TASK_TIME_LIMIT_SECONDS = 180
-TASK_SOFT_TIME_LIMIT_SECONDS = 150
+TASK_SOFT_TIME_LIMIT_SECONDS = 120
 
 PLAIN_TEXT_MIME_TYPES = {
     "text/plain",
@@ -101,11 +130,21 @@ def _extract_pdf_text(content: bytes) -> str:
 
     reader = pypdf.PdfReader(io.BytesIO(content))
     parts = []
-    for page in reader.pages:
+    total_chars = 0
+    for page_number, page in enumerate(reader.pages):
+        # Tope de páginas y de caracteres acumulados (ya no se persistiría más).
+        if page_number >= MAX_PDF_TEXT_PAGES or total_chars >= MAX_CONTENT_CHARS:
+            break
         try:
-            parts.append(page.extract_text() or "")
+            page_text = page.extract_text() or ""
+        except SoftTimeLimitExceeded:
+            # No tragarla: si no, la señal no se repite y el hard limit mata
+            # el proceso.
+            raise
         except Exception:
             continue
+        parts.append(page_text)
+        total_chars += len(page_text)
     return "\n".join(parts)
 
 
@@ -118,11 +157,15 @@ def _ocr_pdf(content: bytes) -> str:
     from pdf2image import convert_from_bytes
     import pytesseract
 
-    images = convert_from_bytes(content, first_page=1, last_page=MAX_PDF_OCR_PAGES)
+    images = convert_from_bytes(
+        content, first_page=1, last_page=MAX_PDF_OCR_PAGES, timeout=PDF_RENDER_TIMEOUT_SECONDS
+    )
     parts = []
     for image in images:
         try:
-            parts.append(pytesseract.image_to_string(image, lang=TESSERACT_LANGS))
+            parts.append(pytesseract.image_to_string(image, lang=TESSERACT_LANGS, timeout=OCR_IMAGE_TIMEOUT_SECONDS))
+        except SoftTimeLimitExceeded:
+            raise
         except Exception:
             continue
     return "\n".join(parts)
@@ -172,7 +215,7 @@ def _ocr_image(content: bytes) -> str:
     import pytesseract
 
     image = Image.open(io.BytesIO(content))
-    return pytesseract.image_to_string(image, lang=TESSERACT_LANGS)
+    return pytesseract.image_to_string(image, lang=TESSERACT_LANGS, timeout=OCR_IMAGE_TIMEOUT_SECONDS)
 
 
 def _extract_text_for_mime(content: bytes, mime_type: str) -> Tuple[str, str]:
@@ -213,6 +256,9 @@ def _extract_text_for_mime(content: bytes, mime_type: str) -> Tuple[str, str]:
 @celery_app.task(
     bind=True,
     max_retries=0,
+    # Solo esta tarea: si el worker muere a mitad (OOM/SIGKILL/hard limit) NO se
+    # reencola indefinidamente (la config global es reject_on_worker_lost=True).
+    reject_on_worker_lost=False,
     name="app.worker.tasks.indexing.index_file_content",
     queue="indexing",
     time_limit=TASK_TIME_LIMIT_SECONDS,
@@ -250,6 +296,34 @@ def index_file_content(self, tenant_schema: Optional[str], file_id: str):
             logger.warning(f"index_file_content: archivo {file_id} no existe (¿borrado antes de indexar?)")
             return
 
+        # Contador de intentos: se incrementa y commitea ANTES de leer nada.
+        previous_attempts = file_content_index_repo.register_attempt(db, file_obj.id)
+        if previous_attempts >= MAX_INDEX_ATTEMPTS:
+            logger.error(
+                f"index_file_content: {file_obj.id} superó {MAX_INDEX_ATTEMPTS} intentos "
+                "(posible redelivery por caída del worker) -- se marca failed sin procesar"
+            )
+            _mark_failed(
+                db, file_obj.id,
+                f"Se superó el máximo de {MAX_INDEX_ATTEMPTS} intentos de indexación "
+                "(el procesamiento anterior no terminó)",
+            )
+            return
+
+        # Tope de tamaño ANTES de leer el objeto completo a memoria.
+        if file_obj.size_bytes is not None and file_obj.size_bytes > INDEXING_MAX_SIZE_BYTES:
+            file_content_index_repo.upsert(
+                db,
+                file_obj.id,
+                content_text=None,
+                extraction_status="unsupported",
+                error_message=(
+                    f"Archivo demasiado grande para indexar por contenido "
+                    f"({file_obj.size_bytes} bytes, máximo {INDEXING_MAX_SIZE_BYTES})"
+                ),
+            )
+            return
+
         try:
             content = _read_private_object(file_obj.storage_key)
             text, extraction_status = _extract_text_for_mime(content, file_obj.mime_type)
@@ -259,10 +333,17 @@ def index_file_content(self, tenant_schema: Optional[str], file_id: str):
                 file_obj.id,
                 content_text=content_text,
                 extraction_status=extraction_status,
+                attempts=0,  # éxito: resetea el contador
             )
             logger.info(
                 f"index_file_content: {file_obj.id} -> {extraction_status} "
                 f"({len(content_text) if content_text else 0} chars)"
+            )
+        except SoftTimeLimitExceeded:
+            logger.error(f"index_file_content: soft time limit indexando {file_id} (tenant={tenant_schema or 'public'})")
+            _mark_failed(
+                db, file_obj.id,
+                f"La extracción superó el tiempo máximo ({TASK_SOFT_TIME_LIMIT_SECONDS}s)",
             )
         except Exception as e:
             # Nunca el stack trace completo en `error_message` (queda
@@ -271,13 +352,21 @@ def index_file_content(self, tenant_schema: Optional[str], file_id: str):
             # los manejos de error de este proyecto (ver
             # `convert_office_to_pdf` en app/files/service.py).
             logger.exception(f"index_file_content: fallo indexando {file_id} (tenant={tenant_schema or 'public'})")
-            try:
-                file_content_index_repo.upsert(
-                    db,
-                    file_obj.id,
-                    content_text=None,
-                    extraction_status="failed",
-                    error_message=str(e)[:500],
-                )
-            except Exception:
-                logger.exception(f"index_file_content: no se pudo ni siquiera registrar el fallo de {file_id}")
+            _mark_failed(db, file_obj.id, str(e))
+
+
+def _mark_failed(db, file_id: UUID, message: str) -> None:
+    """Persiste `extraction_status='failed'` con un mensaje corto; nunca
+    lanza (ni siquiera si la propia escritura falla)."""
+    from app.files.repository import file_content_index_repo
+
+    try:
+        file_content_index_repo.upsert(
+            db,
+            file_id,
+            content_text=None,
+            extraction_status="failed",
+            error_message=message[:500],
+        )
+    except Exception:
+        logger.exception(f"index_file_content: no se pudo ni siquiera registrar el fallo de {file_id}")

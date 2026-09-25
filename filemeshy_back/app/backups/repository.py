@@ -7,7 +7,6 @@ MinIO, aplicar retención) vive en `app/worker/tasks/backups.py`.
 
 from datetime import datetime, timezone
 from typing import List, Optional
-from uuid import UUID
 
 from sqlalchemy.orm import Session
 

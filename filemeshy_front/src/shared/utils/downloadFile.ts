@@ -341,9 +341,18 @@ export function buildFilename(entityName: string, format: ExportFormat): string 
 }
 
 export function formatBytes(bytes: number): string {
+  // Valores no representables (negativo, NaN, Infinity): mismo placeholder que usan los consumidores para "sin dato"
+  if (!Number.isFinite(bytes) || bytes < 0) return '—'
   if (bytes === 0) return '0 B'
   const k = 1024
-  const sizes = ['B', 'KB', 'MB', 'GB']
-  const i = Math.floor(Math.log(bytes) / Math.log(k))
-  return `${parseFloat((bytes / Math.pow(k, i)).toFixed(1))} ${sizes[i]}`
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB']
+  // Acotado a TB para no indexar fuera del arreglo (>= 1 PB) ni con bytes < 1
+  let i = Math.min(Math.max(Math.floor(Math.log(bytes) / Math.log(k)), 0), sizes.length - 1)
+  let value = parseFloat((bytes / Math.pow(k, i)).toFixed(1))
+  // Si el redondeo llega a 1024 (ej. 1048575 B), subir de unidad en vez de mostrar "1024 KB"
+  if (value >= k && i < sizes.length - 1) {
+    i++
+    value = parseFloat((bytes / Math.pow(k, i)).toFixed(1))
+  }
+  return `${value} ${sizes[i]}`
 }

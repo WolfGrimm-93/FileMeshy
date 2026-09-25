@@ -1,0 +1,17 @@
+# Config de ruff "piso": solo reglas de errores reales (sintaxis, nombres
+# indefinidos, imports/variables sin uso). No obliga a reformatear ni a
+# reescribir el backend. Se puede ir ampliando el set de reglas de a poco.
+target-version = "py311"
+line-length = 120
+
+# Las migraciones de alembic son código generado/histórico.
+extend-exclude = ["migrations/versions"]
+
+[lint]
+select = ["E9", "F63", "F7", "F82", "F401", "F811", "F841"]
+
+[lint.per-file-ignores]
+# Re-exports intencionales
+"__init__.py" = ["F401"]
+# Importa todos los modelos solo para registrarlos en Base.metadata
+"migrations/env.py" = ["F401"]

@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# Mínimo privilegio: los jobs solo leen el repo.
+permissions:
+  contents: read
+
+# Cancela ejecuciones anteriores de la misma rama/PR.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# PENDIENTE: las actions están pineadas por versión mayor (tag), no por SHA de
+# commit. Pinear por SHA cuando se pueda verificar cada SHA contra el repo
+# oficial (dependabot con github-actions las mantiene al día).
+
+jobs:
+  backend-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # Versión fija: es la misma con la que se midió el baseline de
+      # filemeshy_back/ruff.toml. Actualizarla junto con ruff.toml (y con los
+      # PR de dependabot/ruff) para que las reglas no cambien sin aviso.
+      - name: Instalar ruff
+        run: pip install ruff==0.16.9
+      - name: ruff check (config en filemeshy_back/ruff.toml)
+        run: ruff check filemeshy_back
+
+  # TODO: tests de backend (pytest) NO están en CI todavía: necesitan
+  # postgres, redis, minio y clamav reales. Propuesta: job que haga
+  # `docker compose up -d --wait` (los healthchecks del compose ya permiten
+  # esperar) y luego `docker compose exec backend pytest`; ClamAV tarda
+  # varios minutos la primera vez, cachear el volumen clamav_data o usar un
+  # clamd de prueba.
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: filemeshy_front
+    steps:
+      - uses: actions/checkout@v4
+      # La versión de pnpm sale de "packageManager" en package.json.
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: filemeshy_front/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: filemeshy_front/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      # continue-on-error MIENTRAS el baseline de eslint no esté limpio (hay
+      # errores mecánicos en curso de corrección). QUITARLO cuando `eslint .`
+      # pase limpio, para que sea bloqueante.
+      - name: eslint
+        run: pnpm exec eslint .
+        continue-on-error: true
+      # Estado de `tsc -b` incierto (el build de prod lo saltea a propósito).
+      # No bloqueante hasta medir el baseline; después quitar continue-on-error.
+      - name: type-check (tsc -b)
+        run: pnpm exec tsc -b
+        continue-on-error: true
+      - name: tests
+        run: pnpm test
+      - name: build de producción
+        run: pnpm build:prod
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Solo build (sin up); `docker compose build` construye los servicios
+      # con `build:` de forma secuencial en el mismo runner.
+      - name: docker compose build
+        run: docker compose build
+
+  # SCA: dependencias con vulnerabilidades conocidas. continue-on-error porque
+  # hoy hay hallazgos conocidos (pillow, pypdf, python-multipart, starlette,
+  # react-router, etc.). Quitarlo cuando se actualicen.
+  sca:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Instalar pip-audit
+        run: pip install pip-audit
+      - name: pip-audit backend
+        run: pip-audit -r filemeshy_back/requirements.txt
+      - name: pip-audit office_converter
+        run: pip-audit -r filemeshy_office_converter/requirements.txt
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: filemeshy_front/package.json
+      - name: pnpm audit (solo prod)
+        working-directory: filemeshy_front
+        run: pnpm audit --prod

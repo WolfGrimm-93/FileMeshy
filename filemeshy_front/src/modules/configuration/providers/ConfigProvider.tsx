@@ -8,22 +8,14 @@ import { useEffect, useState, useCallback, useRef, type ReactNode } from 'react'
 import { configService, type PublicConfig } from '../services/config.service'
 import { adminConfigurationService } from '../services/admin-configuration.service'
 import { useAuth } from '@/modules/auth/hooks/useAuth'
+import { ConfigContext } from './configContext'
 
 // R5: intervalo de polling de la versión global de config (multi-terminal).
 // El aviso viejo (localStorage + evento `storage`) solo llega entre pestañas del
 // MISMO navegador -- nunca entre computadoras distintas.
 const CONFIG_VERSION_POLL_MS = 25_000
 
-export interface ConfigContextType {
-  config: PublicConfig | null
-  isLoading: boolean
-  error: Error | null
-  refreshConfig: () => Promise<void>
-}
-
-import { createContext, useContext } from 'react'
-
-const ConfigContext = createContext<ConfigContextType | undefined>(undefined)
+export type { ConfigContextType } from './configContext'
 
 export interface ConfigProviderProps {
   children: ReactNode
@@ -138,12 +130,3 @@ export const ConfigProvider = ({ children }: ConfigProviderProps) => {
     </ConfigContext.Provider>
   )
 }
-
-export const useConfig = () => {
-  const context = useContext(ConfigContext)
-  if (context === undefined) {
-    throw new Error('useConfig debe ser usado dentro de ConfigProvider')
-  }
-  return context
-}
-

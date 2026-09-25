@@ -487,6 +487,7 @@ class CRUDFileContentIndex(CRUDBase[FileContentIndex, None, None]):
         content_text: Optional[str],
         extraction_status: str,
         error_message: Optional[str] = None,
+        attempts: Optional[int] = None,
     ) -> FileContentIndex:
         """Reemplaza (o crea) la fila de índice de `file_id` -- relación 1:1,
         SIEMPRE refleja la extracción MÁS RECIENTE. Usado por
@@ -501,9 +502,43 @@ class CRUDFileContentIndex(CRUDBase[FileContentIndex, None, None]):
         record.extraction_status = extraction_status
         record.error_message = error_message
         record.indexed_at = datetime.now(timezone.utc)
+        # `attempts=None` conserva el contador actual (los caminos de fallo
+        # no lo resetean); un valor explícito (0 en éxito) lo pisa.
+        if attempts is not None:
+            record.attempts = attempts
         db.commit()
         db.refresh(record)
         return record
+
+    def register_attempt(self, db: Session, file_id: UUID) -> int:
+        """Incrementa y COMMITEA el contador de intentos de forma ATÓMICA
+        (INSERT ... ON CONFLICT DO UPDATE ... RETURNING: sin carrera
+        lectura/escritura ni IntegrityError si dos workers crean la fila a la
+        vez). Devuelve el valor ANTERIOR (0 en la primera ejecución). Si no
+        hay fila la crea en 'pending'. Se llama al inicio de la tarea, antes
+        de leer nada."""
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        now = datetime.now(timezone.utc)
+        stmt = (
+            pg_insert(FileContentIndex)
+            .values(file_id=file_id, extraction_status="pending", attempts=1, attempted_at=now)
+            .on_conflict_do_update(
+                index_elements=[FileContentIndex.file_id],
+                set_={"attempts": FileContentIndex.attempts + 1, "attempted_at": now},
+            )
+            .returning(FileContentIndex.attempts)
+        )
+        new_value = db.execute(stmt).scalar_one()
+        db.commit()
+        return int(new_value) - 1
+
+    def reset_attempts(self, db: Session, file_id: UUID) -> None:
+        """Pone attempts=0 (nuevo encolado). No crea fila si no existe."""
+        record = self.get_by_file_id(db, file_id)
+        if record is not None and (record.attempts or 0) != 0:
+            record.attempts = 0
+            db.commit()
 
 
 folder_repo = CRUDFolder(Folder)

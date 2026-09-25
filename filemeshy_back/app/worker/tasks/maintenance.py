@@ -5,6 +5,7 @@ Limpieza de datos obsoletos, consistencia e integridad.
 """
 
 import logging
+import os
 from datetime import datetime, timedelta, timezone
 
 from app.worker.celery_app import celery_app
@@ -367,4 +368,54 @@ def purge_deleted_files_and_folders(days: int = 30):
         except Exception:
             logger.exception(f"purge_deleted_files_and_folders: fallo en tenant '{clave}'")
 
+    return resultados
+
+
+# Módulo dueño: files (indexación de contenido).
+# Antigüedad (minutos) a partir de la cual una fila de índice en 'pending' se
+# considera huérfana: `index_file_content` corre con reject_on_worker_lost=False,
+# así que si el worker muere (OOM/SIGKILL/hard limit de 180s) nadie la
+# actualiza. Debe ser bastante mayor que el hard limit (180s = 3 min).
+INDEX_PENDING_STALE_MINUTES = int(os.getenv("INDEX_PENDING_STALE_MINUTES", "15"))
+
+
+@celery_app.task(name="app.worker.tasks.maintenance.sweep_stale_pending_content_index")
+def sweep_stale_pending_content_index(stale_minutes: int = None):
+    """Marca 'failed' las filas de `file_content_index` que siguen 'pending'
+    con el último intento más viejo que `stale_minutes`. No toca filas
+    'done'/'failed'/'unsupported' ni pending recientes. Cada 10 minutos."""
+    minutes = stale_minutes if stale_minutes is not None else INDEX_PENDING_STALE_MINUTES
+    resultados = {}
+    for schema in iter_tenant_schemas():
+        clave = schema or "public"
+        try:
+            with get_worker_db(schema_name=schema) as db:
+                from app.files.models import FileContentIndex
+
+                cutoff = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+                count = (
+                    db.query(FileContentIndex)
+                    .filter(
+                        FileContentIndex.extraction_status == "pending",
+                        FileContentIndex.attempted_at.isnot(None),
+                        FileContentIndex.attempted_at < cutoff,
+                    )
+                    .update(
+                        {
+                            "extraction_status": "failed",
+                            "error_message": (
+                                f"La indexación no terminó en {minutes} minutos "
+                                "(el worker probablemente se cayó durante el procesamiento)"
+                            ),
+                            "content_text": None,
+                        },
+                        synchronize_session=False,
+                    )
+                )
+                db.commit()
+                if count:
+                    logger.warning(f"sweep_stale_pending_content_index: {count} filas pending huérfanas -> failed (tenant={clave})")
+                resultados[clave] = {"marcadas_failed": count}
+        except Exception:
+            logger.exception(f"sweep_stale_pending_content_index: fallo en tenant '{clave}'")
     return resultados

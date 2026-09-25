@@ -27,22 +27,6 @@ interface UploadModalProps {
   onUploaded: (file: FileOut) => void
 }
 
-/**
- * `FileUpload` (ver `@/ui/file-upload/FileUpload.tsx`) rechaza en el cliente
- * cualquier archivo por encima de `maxSize` (en MB) -- su default es 10MB.
- * Sin pasar esto explícito, el botón "Seleccionar archivos" de este modal
- * rechazaba en silencio (solo un texto chico bajo la dropzone, sin toast)
- * cualquier archivo de más de 10MB -- incluidos los de 11-100MB que el
- * camino simple soporta perfectamente, y por supuesto cualquier archivo
- * grande del camino resumable nuevo. Bug preexistente encontrado al cablear
- * este modal contra la subida grande (el drag&drop de `FilesPage.tsx` no
- * pasa por este componente, así que no lo sufría). Acá lo subimos a un
- * techo generoso (1PB) -- la validación real de tamaño la hacen el backend
- * (100MB para el camino simple) y el routing simple/multipart de
- * `uploadsStore.ts`, no esta dropzone.
- */
-const NO_PRACTICAL_CLIENT_SIZE_LIMIT_MB = 1024 * 1024 * 1024
-
 function statusIcon(item: UploadItem) {
   switch (item.status) {
     case 'done':
@@ -91,7 +75,8 @@ export default function UploadModal({ isOpen, onClose, folderId, onUploaded }: U
       }
     >
       <div className="space-y-4">
-        <FileUpload multiple onFilesSelected={uploadFiles} maxSize={NO_PRACTICAL_CLIENT_SIZE_LIMIT_MB} />
+        {/* Sin maxSize: sin tope de cliente; la validación real la hacen el backend y el routing simple/multipart de uploadsStore */}
+        <FileUpload multiple onFilesSelected={uploadFiles} />
 
         {items.length > 0 && (
           <ul className="space-y-3 max-h-96 overflow-y-auto">

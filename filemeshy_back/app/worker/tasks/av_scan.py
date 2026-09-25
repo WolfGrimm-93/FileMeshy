@@ -56,6 +56,7 @@ entorno si hace falta ajustarlas sin tocar código.
 import logging
 import os
 import time
+from typing import Optional
 from uuid import UUID
 
 from app.worker.celery_app import celery_app
@@ -457,7 +458,7 @@ def _handle_scan_infra_error(task, db, file_obj, error: Exception) -> None:
 # Tarea principal
 # ---------------------------------------------------------------------------
 
-def _requeue_for_concurrency(file_id: str) -> None:
+def _requeue_for_concurrency(file_id: str, tenant_schema: Optional[str] = None) -> None:
     """Reencola una invocación NUEVA (no un `self.retry()`) cuando no hay
     cupo de concurrencia -- a propósito NO usa el mecanismo de retry de
     Celery para esto: `self.retry()` incrementa `self.request.retries`, el
@@ -469,7 +470,7 @@ def _requeue_for_concurrency(file_id: str) -> None:
     atención manual" que en realidad nunca tuvo un error real. Por eso acá
     se reencola con `apply_async` normal, una invocación fresca con
     `self.request.retries == 0`."""
-    scan_uploaded_file.apply_async(args=[file_id], countdown=AV_SCAN_REQUEUE_COUNTDOWN_SECONDS)
+    scan_uploaded_file.apply_async(args=[file_id, tenant_schema], countdown=AV_SCAN_REQUEUE_COUNTDOWN_SECONDS)
 
 
 @celery_app.task(
@@ -480,24 +481,19 @@ def _requeue_for_concurrency(file_id: str) -> None:
     time_limit=TASK_TIME_LIMIT_SECONDS,
     soft_time_limit=TASK_SOFT_TIME_LIMIT_SECONDS,
 )
-def scan_uploaded_file(self, file_id: str):
+def scan_uploaded_file(self, file_id: str, tenant_schema: Optional[str] = None):
     """Escanea `file_id` (subido grande, vía `app/uploads/`) DESDE MinIO en
     streaming real -- ver docstring del módulo para el flujo completo.
 
-    Contrato REAL confirmado contra el código del módulo `app/uploads/`
-    (otro agente de esta misma ronda, `app/uploads/service.py::
-    _enqueue_av_scan`): encola con `scan_uploaded_file.delay(str(file_id))`
-    -- UN SOLO argumento posicional, sin `tenant_schema` (a diferencia de
-    `app.worker.tasks.indexing.index_file_content`, que sí lo recibe). Por
-    eso acá se usa `get_worker_db(schema_name=None)` -- correcto tal cual en
-    `DEPLOYMENT_MODE=local` (el único modo real hoy, ver
-    app/core/config.py). En `DEPLOYMENT_MODE=cloud` (fundación multi-tenant
-    todavía no activada en ningún entorno real) esta tarea NO resolvería el
-    schema del tenant dueño del archivo -- limitación heredada del contrato
-    tal cual lo definió el módulo que encola, no algo que este archivo
-    pueda arreglar sin tocar `app/uploads/service.py` (fuera de alcance de
-    esta ronda para este agente). Documentado también en el resumen final
-    de la ronda.
+    Contrato: `scan_uploaded_file(file_id, tenant_schema=None)`. El segundo
+    argumento es opcional para seguir aceptando mensajes ya encolados con un
+    solo argumento (`.delay(str(file_id))`). En `DEPLOYMENT_MODE=cloud`,
+    `app/uploads/service.py::_enqueue_av_scan` encola con el schema del
+    tenant (`tenant_schema_ctx.get()`) y esta tarea lo usa en
+    `get_worker_db(schema_name=tenant_schema)`; se propaga también al
+    reencolado por concurrencia y a los reintentos (`self.retry` reutiliza
+    `request.args`, que ya incluyen el schema). Sin schema (modo local)
+    se comporta igual que siempre.
 
     Idempotente ante reencolados/duplicados: si `file_obj.scan_status` ya
     no es `'pending'` cuando corre (otro worker ya lo procesó), no hace
@@ -508,7 +504,7 @@ def scan_uploaded_file(self, file_id: str):
             f"[AVScan] Sin cupo de concurrencia (límite={AV_SCAN_CONCURRENCY_LIMIT}) -- "
             f"reencolando {file_id} en {AV_SCAN_REQUEUE_COUNTDOWN_SECONDS}s"
         )
-        _requeue_for_concurrency(file_id)
+        _requeue_for_concurrency(file_id, tenant_schema)
         return
 
     try:
@@ -516,7 +512,7 @@ def scan_uploaded_file(self, file_id: str):
         from app.files.repository import file_repo
         from app.files.service import scan_minio_object_for_malware
 
-        with get_worker_db(schema_name=None) as db:
+        with get_worker_db(schema_name=tenant_schema) as db:
             # `get_for_scan_worker` (no `get()`) a propósito -- `file_repo.get()`
             # filtra `scan_status == 'clean'` (gate de visibilidad, ver
             # docstring de `CRUDFile` en app/files/repository.py), así que

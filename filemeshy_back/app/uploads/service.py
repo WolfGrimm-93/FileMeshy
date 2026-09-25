@@ -361,9 +361,12 @@ def _enqueue_av_scan(file_id: UUID) -> None:
     hasta que algo lo encole (manualmente, o cuando ese módulo exista de
     verdad)."""
     try:
+        from app.core.database import tenant_schema_ctx
         from app.worker.tasks.av_scan import scan_uploaded_file
 
-        scan_uploaded_file.delay(str(file_id))
+        # Schema del tenant (None en modo local) para que el worker abra la
+        # sesión contra el schema correcto en modo cloud.
+        scan_uploaded_file.delay(str(file_id), tenant_schema_ctx.get())
     except Exception as exc:
         logger.warning(f"[Uploads] No se pudo encolar el escaneo de AV para file_id={file_id}: {exc}")
 

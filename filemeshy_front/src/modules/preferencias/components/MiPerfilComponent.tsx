@@ -29,10 +29,6 @@ export default function MiPerfilComponent({ onSave }: MiPerfilProps) {
     avatar: ''
   })
 
-  useEffect(() => {
-    loadProfile()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [authUser?.id])
 
   const loadProfile = async () => {
     if (!authUser) return
@@ -57,6 +53,11 @@ export default function MiPerfilComponent({ onSave }: MiPerfilProps) {
       setLoading(false)
     }
   }
+
+  useEffect(() => {
+    loadProfile()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authUser?.id])
 
   const handleInputChange = (field: keyof UserUpdate, value: string) => {
     setFormData(prev => ({ ...prev, [field]: value }))

@@ -15,12 +15,15 @@ import { AmountRangeField } from './AmountRangeField'
 import { BooleanField } from './BooleanField'
 import { RadioField } from './RadioField'
 
-export function renderFilterField(
-  field: FilterFieldDef,
-  values: FilterValues,
-  onChange: (key: string, value: unknown) => void,
+interface FilterFieldRendererProps {
+  field: FilterFieldDef
+  values: FilterValues
+  onChange: (key: string, value: unknown) => void
   autoFocus: boolean
-): ReactNode {
+}
+
+// Es un componente (no una función render) para cumplir react-refresh
+export function FilterFieldRenderer({ field, values, onChange, autoFocus }: FilterFieldRendererProps): ReactNode {
   switch (field.type) {
     case 'select':
       return <SelectField field={field} values={values} onChange={onChange} autoFocus={autoFocus} />
@@ -41,5 +44,3 @@ export function renderFilterField(
     }
   }
 }
-
-export { SelectField, MultiSelectField, DateRangeField, AmountRangeField, BooleanField, RadioField }

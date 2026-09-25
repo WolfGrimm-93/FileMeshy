@@ -1,4 +1,4 @@
-import { useConfig } from '@/modules/configuration/providers/ConfigProvider'
+import { useConfig } from '@/modules/configuration/hooks/useConfig'
 import { type CompanyConfig } from '@/modules/configuration/services/config.service'
 import { logger, LogSection } from '@/shared/utils/logger'
 
@@ -31,7 +31,7 @@ const DEFAULT_COMPANY_INFO: CompanyConfig = {
  * en lugar de hacer su propia llamada, evitando duplicación de requests
  * 
  * Para nuevo código, usar directamente:
- * import { useConfig } from '@/modules/configuration/providers/ConfigProvider'
+ * import { useConfig } from '@/modules/configuration/hooks/useConfig'
  * const { config } = useConfig()
  * 
  * @returns CompanyConfig | null - Información de la empresa desde BD

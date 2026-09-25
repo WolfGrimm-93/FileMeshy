@@ -235,6 +235,13 @@ def create_celery_app() -> Celery:
                 "schedule": crontab(hour=4, minute=0),
                 "options": {"queue": "maintenance"},
             },
+            # Filas de índice de contenido 'pending' huérfanas (worker caído
+            # durante index_file_content) -> failed. Cada 10 minutos.
+            "sweep-stale-pending-content-index": {
+                "task": "app.worker.tasks.maintenance.sweep_stale_pending_content_index",
+                "schedule": crontab(minute="*/10"),
+                "options": {"queue": "maintenance"},
+            },
             # Sesiones de subida multipart abandonadas (Ronda 9) — cada 6
             # horas, mismo intervalo que cleanup-expired-sessions (mismo
             # espíritu: liberar recursos de algo que el cliente nunca volvió

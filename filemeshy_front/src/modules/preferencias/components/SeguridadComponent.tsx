@@ -7,6 +7,7 @@ import { Shield, Lock, Key, Eye, EyeOff, Laptop, Smartphone, Trash2, AlertTriang
 import { toast } from '@/ui/toast/CustomToast'
 import { authService } from '@/modules/auth/services/auth.service'
 import type { PasswordChange, SecurityPolicies, TwoFactorSetupData, TwoFactorStatus } from '@/modules/auth/services/auth.service'
+import type { AxiosError } from 'axios'
 import { useAuth } from '@/modules/auth/hooks/useAuth'
 import { userService } from '@/modules/users/services/user.service'
 import type { UserSession } from '@/modules/users/services/user.service'
@@ -63,14 +64,6 @@ export default function SeguridadComponent({ onSave }: SeguridadProps) {
     message: ''
   })
 
-  useEffect(() => {
-    loadSecurityData()
-  }, [])
-
-  useEffect(() => {
-    checkPasswordStrength(passwordData.new_password)
-  }, [passwordData.new_password, policies])
-
   const loadSecurityData = async () => {
     if (!authUser) return
     try {
@@ -117,8 +110,8 @@ export default function SeguridadComponent({ onSave }: SeguridadProps) {
       setTwoFAView('show-backup')
       setTwoFAStatus({ enabled: true, backup_codes_remaining: setupData?.backup_codes.length ?? 0 })
       toast.success('2FA activado correctamente')
-    } catch (err: any) {
-      toast.error(err?.response?.data?.detail || 'Código incorrecto')
+    } catch (err) {
+      toast.error((err as AxiosError<{ detail?: string }>)?.response?.data?.detail || 'Código incorrecto')
       setTotpCode('')
     } finally {
       setTwoFALoading(false)
@@ -135,8 +128,8 @@ export default function SeguridadComponent({ onSave }: SeguridadProps) {
       setTwoFAView('idle')
       setTotpCode('')
       toast.success('2FA desactivado')
-    } catch (err: any) {
-      toast.error(err?.response?.data?.detail || 'Código incorrecto')
+    } catch (err) {
+      toast.error((err as AxiosError<{ detail?: string }>)?.response?.data?.detail || 'Código incorrecto')
       setTotpCode('')
     } finally {
       setTwoFALoading(false)
@@ -162,7 +155,7 @@ export default function SeguridadComponent({ onSave }: SeguridadProps) {
     }
 
     let strength = 0
-    let issues: string[] = []
+    const issues: string[] = []
 
     // Longitud
     if (password.length >= policies.min_password_length) {
@@ -214,6 +207,14 @@ export default function SeguridadComponent({ onSave }: SeguridadProps) {
     setPasswordStrength({ strength, message })
   }
 
+  useEffect(() => {
+    loadSecurityData()
+  }, [])
+
+  useEffect(() => {
+    checkPasswordStrength(passwordData.new_password)
+  }, [passwordData.new_password, policies])
+
   const handlePasswordChange = async (e: React.FormEvent) => {
     e.preventDefault()
 
@@ -241,9 +242,9 @@ export default function SeguridadComponent({ onSave }: SeguridadProps) {
       })
       
       onSave?.()
-    } catch (error: any) {
+    } catch (error) {
       console.error('Error cambiando contraseña:', error)
-      toast.error(error.response?.data?.detail || 'Error al cambiar la contraseña')
+      toast.error((error as AxiosError<{ detail?: string }>).response?.data?.detail || 'Error al cambiar la contraseña')
     } finally {
       setSaving(false)
     }

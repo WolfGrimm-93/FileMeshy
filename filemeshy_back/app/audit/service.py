@@ -37,6 +37,7 @@ def log_audit(
     record_id: Any,
     old_data: Optional[Dict] = None,
     new_data: Optional[Dict] = None,
+    ip_address: Optional[str] = None,
 ):
     """
     Helper para registrar acciones de auditoría.
@@ -64,16 +65,20 @@ def log_audit(
         record_id: ID del registro afectado
         old_data: Datos antes del cambio (para UPDATE/DELETE)
         new_data: Datos después del cambio (para CREATE/UPDATE)
+        ip_address: IP a registrar (opcional). Si no se pasa, se usa
+            request.client.host como siempre; los llamadores que quieran la
+            IP real detrás de un proxy de confianza pasan
+            `get_real_ip(request)` (app/shared/utils/client_ip.py).
     """
     try:
         # Extraer información del request si está disponible
-        ip_address = None
         user_agent = None
         endpoint = None
         method = None
 
         if request:
-            ip_address = request.client.host if request.client else None
+            if ip_address is None:
+                ip_address = request.client.host if request.client else None
             user_agent = request.headers.get("user-agent")
             endpoint = str(request.url.path) if request.url else None
             method = request.method

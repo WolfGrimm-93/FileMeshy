@@ -132,12 +132,6 @@ export const ResetPassword = () => {
     return () => clearInterval(interval)
   }, [expiresAt, step, navigate])
   
-  // Auto-submit cuando el código tiene exactamente 6 dígitos
-  useEffect(() => {
-    if (step === 'code' && code.length === 6 && !isLoading && !sessionExpired) {
-      handleVerifyCode({ preventDefault: () => {} } as React.FormEvent)
-    }
-  }, [code]) // eslint-disable-line react-hooks/exhaustive-deps
   
   // ===== HANDLER PASO 1: Solicitar Código =====
   const handleRequestCode = async (e: React.FormEvent) => {
@@ -246,6 +240,13 @@ export const ResetPassword = () => {
       setIsLoading(false)
     }
   }
+
+  // Auto-submit cuando el código tiene exactamente 6 dígitos
+  useEffect(() => {
+    if (step === 'code' && code.length === 6 && !isLoading && !sessionExpired) {
+      handleVerifyCode({ preventDefault: () => {} } as React.FormEvent)
+    }
+  }, [code]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ===== HANDLER PASO 3: Confirmar Contraseña =====
   const handleConfirmPassword = async (e: React.FormEvent) => {

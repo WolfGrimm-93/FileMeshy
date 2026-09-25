@@ -6,7 +6,7 @@ import { Eye, Edit, Trash2, Printer, Download, CheckCircle, XCircle, ReceiptText
 // TIPOS
 // =============================================
 
-export interface Column<T = Record<string, any>> {
+export interface Column<T extends object = Record<string, unknown>> {
   key: keyof T & string
   label: string
   render?: (value: T[keyof T & string], row: T) => ReactNode
@@ -16,7 +16,7 @@ export interface Column<T = Record<string, any>> {
   sortable?: boolean // Aceptado pero ignorado (sorting es backend-side)
 }
 
-export interface TableAction<T = Record<string, any>> {
+export interface TableAction<T extends object = Record<string, unknown>> {
   icon: 'view' | 'edit' | 'delete' | 'print' | 'export' | 'activate' | 'deactivate' | 'nota'
   label: string
   onClick: (row: T) => void
@@ -24,7 +24,7 @@ export interface TableAction<T = Record<string, any>> {
   color?: string
 }
 
-export interface DataTableProps<T extends Record<string, any>> {
+export interface DataTableProps<T extends object> {
   columns?: Column<T>[]
   data: T[]
   actions?: TableAction<T>[]
@@ -96,7 +96,7 @@ const ALIGN_CLASS = {
 // COMPONENTE
 // =============================================
 
-export function DataTable<T extends Record<string, any>>({
+export function DataTable<T extends object>({
   columns: columnsProp,
   data,
   actions,
