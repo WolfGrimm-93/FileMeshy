@@ -575,11 +575,40 @@ endurecimiento, sin features nuevas de producto. Cambios:
   streaming con memoria acotada (assert programático) y tope global de admisión en aislamiento
   (`test_av_scan_async.py`, `test_large_upload_multipart.py`).
 
-**Verificación pendiente de esta ronda:** la suite completa y la verificación en navegador no
-se re-ejecutaron al momento de documentar y commitear (el stack estaba parcialmente caído).
-Antes de dar la ronda por desplegada: reconstruir `backend` Y `celery_worker` (comparten
-código, ver lección de la Ronda 4), correr la suite y navegar login/preview con la consola
-abierta para confirmar que la CSP nueva no bloquea nada.
+**Cierre y verificación en vivo (2026-09-25).** Se reconstruyeron `backend`, `celery_worker` y
+`frontend` y se recreó el stack completo (estaba caído). Resultado:
+
+- **Suite completa: 123 passed, 8 skipped, 0 failed** (los 8 skipped son `test_platform_tenants.py`,
+  solo corren en modo `cloud`). Subió de 112 a 123 con los tests de la Ronda 10.
+- **Headers reales con curl:** CSP nueva presente en `/` y en `/assets/*`; `/assets/` conserva
+  `X-Frame-Options`, `Referrer-Policy`, `Content-Security-Policy` y `X-Content-Type-Options`. El hash
+  SHA-256 de la CSP coincide con el script inline del `index.html` servido.
+- **Navegador real (Playwright/Chromium), sin ninguna violación de CSP en consola:** login,
+  dashboard, página de Archivos, subida de 2 archivos, preview de imagen desde MinIO
+  (`naturalWidth` 200, el origen `:58102` permitido por `img-src` funciona), y tema claro/oscuro
+  persistido tras recargar (el script inline con hash se ejecuta).
+- **`Retry-After` en vivo:** al abrir una 4ª sesión de subida grande, el 503 real llega con
+  `Retry-After: 30` (bug original reproducido y confirmado resuelto). Al abortar las sesiones el
+  cupo se libera (siguiente `initiate` → 201).
+- **`/health/detailed`:** sin auth responde 401 (sigue gateado); `/health` público sin detalle.
+- **PyJWT:** el login emite y valida tokens con la librería nueva.
+- **Email `.local`:** `create_super_admin.py` lo rechaza con mensaje claro; con dominio válido crea
+  la cuenta y el login funciona.
+
+**Defecto encontrado y corregido durante el cierre:** el fix del menú ⋮ de la primera versión de
+la Ronda 10 (portal con `position: fixed`) dejaba los últimos ítems INALCANZABLES con una
+ventana baja (a 480px de alto el menú de 335px se salía del viewport y, al ser `fixed`, no se
+podía scrollear a él). Ahora `Dropdown.tsx` abre hacia arriba cuando abajo no entra y hay más
+lugar arriba, y acota `maxHeight` al espacio disponible con scroll interno. Verificado en
+navegador real a 800/600/480/320px de alto: el menú queda dentro del viewport y el último ítem
+("Eliminar") es alcanzable en todos.
+
+**Bug del modo claro: NO reproducible.** En el build actual el toggle cambia la clase de `<html>`,
+el fondo cambia (`rgb(3,7,17)` → `rgb(246,247,249)`) y persiste al recargar. Se cierra como no
+reproducible; si vuelve a aparecer, reabrir con pasos exactos.
+
+**Hallazgo nuevo, sin corregir:** el modal de subida muestra "Tamaño máximo: 1073741824MB" — son
+bytes rotulados como MB (`FileUpload.tsx` / uso en el modal de subida). Cosmético, pero confunde.
 
 ### 🟠 Seguridad — importante pero no bloqueante
 
@@ -598,7 +627,8 @@ abierta para confirmar que la CSP nueva no bloquea nada.
   — detrás de nginx en prod es un balde único compartido por todo el tráfico público, no limita
   por visitante real.
 - ~~Menú ⋮ de la tabla de Archivos clippeado en la última fila~~ — corregido en la Ronda 10
-  con un portal (`Dropdown.tsx`). Falta reverificarlo visualmente en navegador.
+  (portal + apertura hacia arriba + `maxHeight`), verificado en navegador a 4 alturas.
+- Modal de subida: "Tamaño máximo" muestra bytes con sufijo MB (cosmético, sin corregir).
 
 ### 🧪 Testing — antes no existía nada
 
@@ -617,7 +647,7 @@ abierta para confirmar que la CSP nueva no bloquea nada.
   administración de tenants (rate-limit, PATCH activar/desactivar con efecto real vía
   `TenantMiddleware`, validación de UUID), y regresión de los 3 fixes de seguridad más fáciles
   de reproducir automatizadamente (spoofing de IP, DoS 2FA, flag de registro).
-- Tras la Ronda 9: **112 passed, 8 skipped, 0 failed**, sin flakiness. Los 8 skipped siguen
+- Tras la Ronda 10: **123 passed, 8 skipped, 0 failed**. Antes, tras la Ronda 9: 112 passed, 8 skipped, 0 failed, sin flakiness. Los 8 skipped siguen
   siendo `test_platform_tenants.py` completo (solo corren con `DEPLOYMENT_MODE=cloud` activo, ver
   Ronda 8). Suma de la Ronda 9: subida multipart de archivos grandes (sesiones, admisión global Y
   por usuario, cuota real contra tamaño verificado, resumabilidad vía `ListParts` real), antivirus
@@ -714,8 +744,7 @@ Gaps que siguen abiertos:
 - ~~`SUPER_ADMIN` con email `.local` queda bloqueado para login~~ — corregido en la Ronda 10:
   el script ahora rechaza el email antes de insertar. La cuenta `audit-test@wolfgrimm.local`
   del stack de prueba sigue existiendo y bloqueada (dato de prueba, se va con `down -v`).
-- El modo claro del tema (`<html>` pierde `dark` pero la página se sigue viendo oscura) sigue
-  sin investigar.
+- ~~Modo claro del tema~~ — no reproducible en el build actual (2026-09-25), ver Ronda 10.
 
 ### Notas operativas
 
@@ -727,7 +756,7 @@ Gaps que siguen abiertos:
   cuando se quiera.
 - Rondas 1 (`d91a47f`), 2 (`61ca9f1`), 3 (`9b08c35`), 4 (`7e9feba`), 5 (`a1c2680`), 6
   (`d833b83`), 7 (`05bd75f`) y 8 (`e76e197`) commiteadas, 2026-09-20/22. Ronda 9 (subida de
-  archivos grandes) commiteada (`bcc90e0`). Ronda 10 (endurecimiento) commiteada el 2026-09-24.
+  archivos grandes) commiteada (`bcc90e0`). Ronda 10 (endurecimiento) commiteada `3ac8187` (2026-09-24), cierre y fix del Dropdown el 2026-09-25.
   Recordatorio operativo real (no solo de código): antes de considerar el permiso `backups.view`
   activo en cualquier entorno nuevo, hay que correr `scripts/seed_permissions.py` — agregar un
   permiso al dict de `permissions.py` no lo propaga solo a las tablas reales (bug real de la
@@ -759,7 +788,7 @@ Aprobado con el usuario el 2026-09-20. Cada ronda se diseña en detalle recién 
 | 7 (hecho) | Antivirus (ClamAV) en upload + backups automáticos de Postgres/MinIO — **completa** (MinIO condicional a config externa, ver Ronda 7 arriba) |
 | 8 (hecho) | UI de administración de tenants — **completa**, roadmap original cerrado |
 | 9 (hecho) | Post-roadmap, pedido explícito del usuario 2026-09-22: subida de archivos grandes (10-20GB) sin saturar el servidor, resumable — **completa** |
-| 10 (hecho, verificación pendiente) | Endurecimiento: `Retry-After`, PyJWT, pin por digest, CSP, headers de `/assets/`, `/health/detailed`, validación de email del super admin, portal del Dropdown, tests de Ronda 9 |
+| 10 (hecho y verificado en vivo) | Endurecimiento: `Retry-After`, PyJWT, pin por digest, CSP, headers de `/assets/`, `/health/detailed`, validación de email del super admin, portal del Dropdown, tests de Ronda 9 |
 
 Fuera de alcance por decisión de producto (no construir sin pedido explícito nuevo): cliente
 de escritorio, app móvil, sincronización selectiva, acceso offline real, edición colaborativa
