@@ -29,7 +29,7 @@ import pyotp
 import qrcode
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
-from jose import jwt, JWTError
+import jwt  # PyJWT (Ronda 10: migrado desde python-jose, sin mantenimiento activo)
 from passlib.context import CryptContext
 from sqlalchemy.orm import Session, joinedload
 
@@ -589,7 +589,8 @@ class SessionService:
 # JWT PARA RESET DE CONTRASEÑA (antes app/services/jwt_reset_service.py)
 # ============================================================
 # Genera y valida reset_token con scope password_reset. TTL corto (5-10 min)
-# y uso único. Usa python-jose (igual que AuthService de acá arriba).
+# y uso único. Usa PyJWT (igual que AuthService de acá arriba -- Ronda 10:
+# migrado desde python-jose).
 
 class JWTResetService:
     """Manejo de JWT para password reset."""
@@ -661,8 +662,11 @@ class JWTResetService:
 
             return payload
 
-        except JWTError:
-            # Token expirado o inválido
+        except jwt.PyJWTError:
+            # Token expirado o inválido. PyJWTError es la base de TODAS las
+            # excepciones de PyJWT -- equivalente exacto al JWTError de
+            # python-jose que capturaba esto mismo antes de la migración
+            # (Ronda 10).
             return None
 
 

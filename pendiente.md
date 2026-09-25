@@ -539,40 +539,66 @@ en fases separadas (implementación, auditor final, pruebas), todas coincidiendo
   práctica: EICAR puro no sirve para probar/simular un archivo infectado por el camino grande en
   el futuro, hace falta una firma de prueba sin restricción de tamaño.
 
+**Hecho (2026-09-22/24) — Ronda 10: cierre de deuda de la Ronda 9 y de la auditoría.** Ronda de
+endurecimiento, sin features nuevas de producto. Cambios:
+
+- **`Retry-After` ahora llega al cliente.** El 503 de admission control perdía sus headers
+  porque `typed_exception_handler` (`app/api/v1/exception_handlers.py`) reconstruía la respuesta
+  descartando `exc.headers`; el handler de `main.py` tenía el mismo defecto. Ambos fusionan ahora
+  `exc.headers` con los headers CORS (CORS siempre gana). Hallazgo clave: el handler que gana
+  para `fastapi.HTTPException` es el de `exception_handlers.py` (despacho por el tipo más
+  específico del MRO), arreglar solo `main.py` no alcanzaba. Test: `test_upload_admission_retry_after.py`.
+- **`python-jose` reemplazado por PyJWT 2.14.0** (`auth/service.py`, `core/security.py`);
+  `cryptography` pasa a ser dependencia explícita (antes llegaba transitiva). Cierra
+  CVE-2024-33663/33664.
+- **Imágenes Docker fijadas por digest**: `postgres:15.19-alpine`, `redis:7.4.11-alpine`,
+  `clamav/clamav:stable`, `python:3.11-slim`, `node:22-alpine`, `nginx:alpine`. Las tags ya no
+  pueden re-apuntarse solas. **Costo operativo:** hay que actualizar los digests a mano para
+  recibir parches de seguridad (ver el punto de rebuild periódico de la Ronda 5).
+- **CSP del frontend endurecida** (`nginx.conf`): `default-src 'self'`, `script-src 'self'` +
+  hash SHA-256 del único script inline (tema antes de pintar), `object-src 'none'`,
+  `base-uri`/`form-action 'self'`, `connect-src 'self'`. `style-src 'unsafe-inline'` se mantiene
+  a propósito (estilos inline dinámicos de React). **Si cambia el script inline de
+  `index.html`, hay que recalcular el hash** (comando en el comentario de `nginx.conf`) o el
+  tema se rompe en silencio.
+- **`/assets/` recupera los 4 headers de seguridad** (bug de herencia de `add_header`).
+- **`/health/detailed` reducido** a conectividad de BD + versión de la app: ya no expone versión
+  de Postgres/Python/OS ni el flag `debug`.
+- **`create_super_admin.py` valida el email** con `email_validator` (la misma librería del
+  login) antes de insertar. Corrección al diagnóstico original: no era un chequeo de
+  deliverability DNS (`EmailStr` lo tiene apagado), sino el rechazo incondicional de dominios
+  especiales (`.local`, `.test`, `.invalid`, `.localhost`, `.onion`, `.arpa`). Test:
+  `test_create_super_admin_email_validation.py`.
+- **Menú ⋮ ya no se recorta** en la última fila: `Dropdown.tsx` renderiza el menú en un portal
+  con `position: fixed`, reposicionado en scroll/resize.
+- **Gaps de cobertura de la Ronda 9 cerrados**: fail-closed end-to-end de la tarea de escaneo,
+  streaming con memoria acotada (assert programático) y tope global de admisión en aislamiento
+  (`test_av_scan_async.py`, `test_large_upload_multipart.py`).
+
+**Verificación pendiente de esta ronda:** la suite completa y la verificación en navegador no
+se re-ejecutaron al momento de documentar y commitear (el stack estaba parcialmente caído).
+Antes de dar la ronda por desplegada: reconstruir `backend` Y `celery_worker` (comparten
+código, ver lección de la Ronda 4), correr la suite y navegar login/preview con la consola
+abierta para confirmar que la CSP nueva no bloquea nada.
+
 ### 🟠 Seguridad — importante pero no bloqueante
 
 - `SECRET_KEY` con default hardcodeado en `core/config.py:32` — mitigado por una guarda que
   aborta el arranque si `ENVIRONMENT` no es development/local, pero sigue siendo un secreto de
   valor conocido en el código versionado.
-- Imágenes Docker sin pin de versión/digest (`postgres:15-alpine`, `redis:7-alpine`,
-  `node:22-alpine`, `python:3.11-slim`) — riesgo de reproducibilidad y de traer CVEs sin aviso.
-- CSP del frontend (`filemeshy_front/nginx.conf`) mucho más laxa que la del backend — solo
-  `frame-ancestors 'none'`, sin `default-src`/`script-src` restrictivo.
-- `nginx.conf` — el location `/assets/` pierde 3 de los 4 headers de seguridad
-  (`X-Frame-Options`, `Referrer-Policy`, `Content-Security-Policy`) por un bug de herencia de
-  `add_header` por location; confirmado en vivo con curl. Contradice la intención documentada
-  en el propio comentario del archivo.
-- `python-jose==3.3.0` sin mantenimiento activo, con CVE-2024-33663/33664 — mitigado porque se
-  fuerza `algorithms=["HS256"]` explícito al decodificar, pero conviene migrar a `pyjwt`/`authlib`.
+- ~~Imágenes Docker sin pin~~, ~~CSP laxa del frontend~~, ~~`/assets/` sin headers~~,
+  ~~`python-jose`~~ y ~~`/health/detailed`~~: resueltos en la Ronda 10 (ver arriba).
 - Cifrado en reposo solo cubre secretos puntuales (TOTP, password SMTP vía Fernet) — el
   contenido de archivos de usuario en MinIO no tiene SSE aplicado por la aplicación.
 - `AuditLog` solo cubre POST/PUT/PATCH/DELETE — lecturas y descargas de archivos no dejan
   rastro; un acceso indebido de solo lectura no es detectable vía auditoría.
-- `/health/detailed` (bien gateado a rol admin) expone versión detallada de Postgres/Python y
-  el flag `debug:true` — innecesario para un healthcheck, reducir el payload.
 - Consola de MinIO de dev expuesta en `0.0.0.0:58103` con credenciales de desarrollo en texto
   plano en el compose — aceptable solo si la máquina no es alcanzable desde LAN/internet.
 - Rate-limit de shares públicos (`files/router.py:719-732`) usa `request.client.host` directo
   — detrás de nginx en prod es un balde único compartido por todo el tráfico público, no limita
   por visitante real.
-- **Bug de UI preexistente** (encontrado incidentalmente en la revisión de Ronda 4, no
-  introducido por ninguna ronda de construcción): el menú de acciones (⋮) de la tabla de
-  Archivos queda clippeado/invisible cuando se abre sobre la última fila visible de un listado
-  corto — el wrapper `overflow-x-auto` de `DataTable.tsx` recorta el dropdown verticalmente sin
-  scroll perceptible (confirmado con `getComputedStyle`: el menú mide 335px de alto contra un
-  `clientHeight` visible de 71px). Afecta a TODAS las acciones del menú (Renombrar, Compartir,
-  Ver versiones, etc.), no solo a una feature puntual. Fix típico: portal para el dropdown, o
-  `overflow: visible` en el wrapper mientras el menú está abierto.
+- ~~Menú ⋮ de la tabla de Archivos clippeado en la última fila~~ — corregido en la Ronda 10
+  con un portal (`Dropdown.tsx`). Falta reverificarlo visualmente en navegador.
 
 ### 🧪 Testing — antes no existía nada
 
@@ -685,11 +711,11 @@ Gaps que siguen abiertos:
 
 ### 🐛 Bugs puntuales confirmados en vivo
 
-- Un `SUPER_ADMIN` creado con un email de dominio no resoluble en DNS real (ej. `.local`)
-  queda **permanentemente bloqueado para loguearse** — `EmailStr` de Pydantic hace
-  deliverability check en `/auth/login`, pero `scripts/create_super_admin.py` no valida esto
-  al crear la cuenta (inserta directo en la BD). Documentar en el script/README que el email
-  debe ser de un dominio con DNS real, o relajar esa validación para login.
+- ~~`SUPER_ADMIN` con email `.local` queda bloqueado para login~~ — corregido en la Ronda 10:
+  el script ahora rechaza el email antes de insertar. La cuenta `audit-test@wolfgrimm.local`
+  del stack de prueba sigue existiendo y bloqueada (dato de prueba, se va con `down -v`).
+- El modo claro del tema (`<html>` pierde `dark` pero la página se sigue viendo oscura) sigue
+  sin investigar.
 
 ### Notas operativas
 
@@ -701,7 +727,7 @@ Gaps que siguen abiertos:
   cuando se quiera.
 - Rondas 1 (`d91a47f`), 2 (`61ca9f1`), 3 (`9b08c35`), 4 (`7e9feba`), 5 (`a1c2680`), 6
   (`d833b83`), 7 (`05bd75f`) y 8 (`e76e197`) commiteadas, 2026-09-20/22. Ronda 9 (subida de
-  archivos grandes) en working tree al momento de escribir esto, commit pendiente inmediato.
+  archivos grandes) commiteada (`bcc90e0`). Ronda 10 (endurecimiento) commiteada el 2026-09-24.
   Recordatorio operativo real (no solo de código): antes de considerar el permiso `backups.view`
   activo en cualquier entorno nuevo, hay que correr `scripts/seed_permissions.py` — agregar un
   permiso al dict de `permissions.py` no lo propaga solo a las tablas reales (bug real de la
@@ -733,6 +759,7 @@ Aprobado con el usuario el 2026-09-20. Cada ronda se diseña en detalle recién 
 | 7 (hecho) | Antivirus (ClamAV) en upload + backups automáticos de Postgres/MinIO — **completa** (MinIO condicional a config externa, ver Ronda 7 arriba) |
 | 8 (hecho) | UI de administración de tenants — **completa**, roadmap original cerrado |
 | 9 (hecho) | Post-roadmap, pedido explícito del usuario 2026-09-22: subida de archivos grandes (10-20GB) sin saturar el servidor, resumable — **completa** |
+| 10 (hecho, verificación pendiente) | Endurecimiento: `Retry-After`, PyJWT, pin por digest, CSP, headers de `/assets/`, `/health/detailed`, validación de email del super admin, portal del Dropdown, tests de Ronda 9 |
 
 Fuera de alcance por decisión de producto (no construir sin pedido explícito nuevo): cliente
 de escritorio, app móvil, sincronización selectiva, acceso offline real, edición colaborativa

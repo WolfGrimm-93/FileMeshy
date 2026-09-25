@@ -3,7 +3,7 @@ import logging
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
-from jose import JWTError, jwt
+import jwt  # PyJWT (Ronda 10: migrado desde python-jose, sin mantenimiento activo)
 from passlib.context import CryptContext
 from app.core.config import settings
 from cryptography.fernet import Fernet
@@ -222,5 +222,11 @@ def decode_token(token: str) -> Optional[dict]:
             algorithms=[settings.ALGORITHM]
         )
         return payload
-    except JWTError:
+    except jwt.PyJWTError:
+        # PyJWTError es la base de TODAS las excepciones de PyJWT (firma
+        # inválida, expirado, malformado, algoritmo no permitido, etc.) --
+        # equivalente exacto al JWTError de python-jose que capturaba esto
+        # mismo antes de la migración (Ronda 10). Catch amplio a propósito:
+        # cualquier excepción no capturada acá se propagaría como 500 en vez
+        # del 401 esperado en app/auth/service.py::get_current_user.
         return None

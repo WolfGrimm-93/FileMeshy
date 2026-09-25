@@ -307,6 +307,188 @@ def test_clamd_unreachable_retries_then_fails_closed_without_ever_marking_clean(
     assert notif.severity == "error"
 
 
+# ==================== Ronda 10 -- pendiente de Ronda 9: fail-closed end-to-end ====================
+
+def test_scan_uploaded_file_task_end_to_end_with_real_unreachable_clamd_fails_closed(client, db_session, monkeypatch):
+    """`test_clamd_unreachable_retries_then_fails_closed_without_ever_marking_clean`
+    (arriba) llama `_handle_scan_infra_error` DIRECTO -- una regresión en
+    cómo `scan_uploaded_file` la invoca de verdad (ej. qué excepciones
+    captura el `except (ConnectionError, RuntimeError)`, o si deja de
+    llamarla) pasaría en verde sin que ese test lo note. Este test ejercita
+    la tarea COMPLETA de punta a punta, contra `clamd` REAL inalcanzable
+    (host/puerto reales, conexión rechazada de verdad -- ni un mock del
+    resultado del escaneo ni un doble de la tarea).
+
+    Cómo se consigue el loop de reintentos REAL sin depender de sleeps
+    reales de minutos (backoff `AV_SCAN_ERROR_RETRY_BASE_SECONDS * 2**n`):
+    se invoca con `scan_uploaded_file.apply(...)` (no `scan_uploaded_file(...)`
+    directo, y no `.delay()`). Confirmado contra el código fuente de Celery
+    5.3.6 instalado en este contenedor (`celery/app/task.py`):
+
+    - Llamar la tarea como función directa (`scan_uploaded_file(file_id)`,
+      el patrón que usan el resto de los tests de este archivo) deja
+      `self.request.called_directly = True` -- con eso, `Task.retry()`
+      simplemente RE-LANZA la excepción original en vez de programar un
+      reintento, y `self.request.retries` nunca avanza entre llamadas. Por
+      eso el test existente necesita `_FakeTask`: no hay forma de llegar al
+      camino "reintentos agotados" invocando la tarea real así.
+    - `Task.apply()` (SIEMPRE eager, sin importar `task_always_eager`)
+      construye un `request` real con `called_directly=False` --
+      `self.retry()` entonces sí construye la señal de reintento real, y
+      `Task.apply()` la vuelve a invocar automáticamente (`retval.sig.apply
+      (retries=retries + 1)`, ver su código fuente) incrementando
+      `request.retries` en cada vuelta, TODO sincrónico -- nunca duerme el
+      countdown real, así que el test corre en milisegundos aunque el
+      backoff configurado sea de minutos.
+
+    Confirma que `file.scan_status` termina en `'scan_failed'` (nunca
+    `'clean'`) usando el código de producción real de la tarea, no un
+    helper interno aislado."""
+    import socket as socket_module
+
+    from app.core.config import settings
+    import app.worker.tasks.av_scan as av_scan
+
+    # Puerto real sin nada escuchando -- se abre y cierra un socket para
+    # conseguir un puerto libre del sistema operativo, así la conexión se
+    # rechaza de inmediato (ECONNREFUSED real) en vez de esperar un timeout
+    # de red que alargaría el test sin necesidad.
+    probe = socket_module.socket(socket_module.AF_INET, socket_module.SOCK_STREAM)
+    probe.bind(("127.0.0.1", 0))
+    dead_port = probe.getsockname()[1]
+    probe.close()
+
+    monkeypatch.setattr(settings, "CLAMAV_HOST", "127.0.0.1")
+    monkeypatch.setattr(settings, "CLAMAV_PORT", dead_port)
+
+    owner_id = _owner_id(client, db_session)
+    file_obj = _make_pending_file(
+        db_session, owner_id, b"contenido cualquiera, no importa para este test",
+        name=f"pytest_e2e_clamdown_{uuid.uuid4().hex[:8]}.bin",
+    )
+
+    result = av_scan.scan_uploaded_file.apply(args=[str(file_obj.id)])
+    # La tarea en sí "tuvo éxito" (terminó el camino de fail-closed sin una
+    # excepción sin manejar) -- el fail-closed real está en el scan_status,
+    # no en que la tarea "falle" como resultado de Celery.
+    assert result.successful(), f"la tarea no debería terminar en excepción sin manejar: {result.traceback}"
+
+    db_session.expire_all()
+    db_session.refresh(file_obj)
+    assert file_obj.scan_status == "scan_failed"
+    assert file_obj.scan_status != "clean"
+
+    notif = _latest_notification(db_session, owner_id)
+    assert notif is not None
+    assert notif.severity == "error"
+
+
+# ==================== Ronda 10 -- pendiente de Ronda 9: streaming real (memoria acotada) ====================
+
+def test_scan_minio_object_for_malware_reads_in_fixed_chunks_never_the_whole_body_at_once():
+    """Ronda 9 existe para resolver un problema de memoria: escanear un
+    archivo de 10-20GB completo en memoria tumbaba el servidor. La
+    verificación original de esa propiedad fue manual (`docker stats`
+    mientras se escaneaba un blob de 6GB) -- este test la automatiza,
+    confirmando PROGRAMÁTICAMENTE la propiedad central: `scan_minio_object_
+    for_malware` nunca hace un solo `.read()` del tamaño total, siempre
+    múltiples lecturas de `chunk_size` fijo.
+
+    Mockea el cliente MinIO (`_get_client`) y el `Body`/`StreamingBody` de
+    `get_object` -- captura cada llamada a `.read(n)` para poder afirmar
+    sobre los argumentos reales, en vez de solo observar el resultado
+    final (que sería igual de verde con una implementación que lee todo de
+    una vez). No mockea `_run_instream_scan` ni el protocolo INSTREAM en
+    sí -- eso ya lo cubre `test_antivirus_scan.py`; acá el foco es
+    exclusivamente el patrón de lectura del stream de MinIO."""
+    from app.files import service as files_service
+
+    total_size = 10 * 1024 * 1024  # 10MB simulados -- de sobra para varias vueltas de chunk_size real
+    chunk_size = files_service._CLAMAV_CHUNK_SIZE
+    assert total_size > chunk_size * 2, "el tamaño simulado tiene que forzar VARIAS lecturas, no una sola"
+
+    remaining = bytearray(b"x" * total_size)
+    read_calls: list[tuple] = []  # (args, kwargs) reales de cada .read(...)
+
+    class _FakeStreamingBody:
+        def read(self, *args, **kwargs):
+            read_calls.append((args, kwargs))
+            if not args and not kwargs:
+                # Un `.read()` sin argumento (o sin tamaño) leería TODO de
+                # una sola vez -- exactamente el bug que Ronda 9 previene.
+                # El fake reproduce ese comportamiento real de
+                # StreamingBody (leer todo lo que quede) para que, si el
+                # código de producción alguna vez llamara así, el chunk
+                # devuelto sea sospechosamente grande Y quede registrado
+                # en `read_calls` para la assert de abajo.
+                n = len(remaining)
+            else:
+                n = args[0] if args else kwargs.get("amt")
+            chunk = bytes(remaining[:n])
+            del remaining[:n]
+            return chunk
+
+        def close(self):
+            pass
+
+    class _FakeMinioClient:
+        def get_object(self, Bucket, Key):
+            return {"Body": _FakeStreamingBody()}
+
+    original_get_client = files_service._get_client
+    original_run_instream_scan = files_service._run_instream_scan
+
+    # `_run_instream_scan` habla el protocolo INSTREAM real contra un
+    # `clamd` real -- no hay uno en este test unitario (a propósito, ver
+    # docstring), así que se reemplaza por un doble mínimo que simplemente
+    # CONSUME el generador de chunks (fuerza a que el `while` de
+    # `_chunks_from_minio_stream` corra hasta el final, ejercitando TODAS
+    # las llamadas a `.read()`) y devuelve "limpio".
+    consumed_chunk_sizes: list[int] = []
+
+    def _fake_run_instream_scan(chunks, *, host, port, timeout):
+        for chunk in chunks:
+            consumed_chunk_sizes.append(len(chunk))
+        return True, None
+
+    files_service._get_client = lambda: _FakeMinioClient()
+    files_service._run_instream_scan = _fake_run_instream_scan
+    try:
+        is_clean, threat = files_service.scan_minio_object_for_malware(
+            bucket="cualquier-bucket", key="cualquier-key", timeout_seconds=5,
+        )
+    finally:
+        files_service._get_client = original_get_client
+        files_service._run_instream_scan = original_run_instream_scan
+
+    assert is_clean is True
+    assert threat is None
+
+    # ---- La propiedad central de toda la Ronda 9, confirmada programáticamente ----
+
+    # (a) Nunca se llamó `.read()` sin argumento -- cada llamada real pasó
+    # un tamaño explícito y ese tamaño es SIEMPRE `chunk_size`, nunca el
+    # tamaño total simulado (eso sería releer todo de una vez).
+    assert len(read_calls) > 0
+    for args, kwargs in read_calls:
+        assert args or kwargs, ".read() se llamó SIN argumento -- leería el stream completo de una vez"
+        n = args[0] if args else kwargs.get("amt")
+        assert n == chunk_size, f".read({n}) -- se esperaba siempre chunk_size fijo ({chunk_size})"
+        assert n < total_size, ".read() pidió el tamaño total de una sola vez"
+
+    # (b) Múltiples llamadas de tamaño fijo, no una sola lectura grande --
+    # con 10MB y chunk_size real, tienen que hacer falta varias vueltas.
+    assert len(read_calls) >= 2, "se esperaban VARIAS llamadas a .read(), no una sola lectura del total"
+
+    # (c) El generador realmente entregó esos mismos chunks (de a
+    # chunk_size, con el último posiblemente más chico) al escaneo --
+    # confirma que no hay un buffer intermedio que junte todo antes de
+    # pasarlo a `_run_instream_scan`.
+    assert sum(consumed_chunk_sizes) == total_size
+    assert all(size <= chunk_size for size in consumed_chunk_sizes)
+    assert consumed_chunk_sizes[-1] > 0
+
+
 # ==================== Límite de concurrencia (semáforo Redis) ====================
 
 def test_concurrency_semaphore_enforces_limit_and_requeues(client, db_session, monkeypatch):

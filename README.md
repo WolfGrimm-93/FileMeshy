@@ -1,45 +1,63 @@
+[English](README.md) | [Español](README.es.md)
+
 # FileMeshy
 
-Almacenamiento y gestión de archivos personal, tipo Google Drive: explorador de archivos y
-carpetas anidadas, papelera con restauración, compartir por link con expiración/revocación,
-preview inline de imágenes y PDF, cuota de almacenamiento por usuario, y autenticación con
-roles y permisos (RBAC) completa (2FA, sesiones múltiples, rotación de tokens).
+Personal file storage and management, Google Drive style: nested folders and file explorer,
+trash with restore, share links with expiry/revocation and optional password, per-user sharing
+with read/write permissions, tags, favorites, file versioning, inline preview (images, PDF,
+video, audio, Office documents), full-text search with OCR, per-user storage quota, resumable
+uploads of very large files (10-20 GB), antivirus scanning (ClamAV), automatic database
+backups, multi-tenant administration, and complete role/permission (RBAC) authentication
+(2FA, multiple sessions, token rotation).
 
-Backend en FastAPI + PostgreSQL, frontend en React + Vite + TypeScript, almacenamiento de
-archivos vía MinIO (compatible con S3).
+Backend in FastAPI + PostgreSQL, frontend in React + Vite + TypeScript, file storage through
+MinIO (S3-compatible), background jobs with Celery + Redis.
 
-## Instalación
+## Installation
 
-Requisito: [Docker](https://docs.docker.com/get-docker/) y Docker Compose.
+Requirement: [Docker](https://docs.docker.com/get-docker/) and Docker Compose.
 
 ```bash
-git clone <url-de-este-repo>
+git clone <this-repo-url>
 cd FileMeshy
 docker compose up --build -d
 ```
 
-Levanta todo el stack (backend, frontend, PostgreSQL, Redis, MinIO) con credenciales de
-desarrollo ya configuradas — no hace falta crear ningún `.env`.
+This starts the whole stack (backend, frontend, PostgreSQL, Redis, MinIO, ClamAV, Office
+converter, Celery worker) with development credentials already configured — no `.env` needed.
 
-| Servicio | URL |
+| Service | URL |
 |---|---|
 | Frontend | http://localhost:58100 |
-| Backend / API | http://localhost:58101/api/v1 (docs interactivas en `/docs`) |
-| Consola MinIO | http://localhost:58103 |
+| Backend / API | http://localhost:58101/api/v1 (interactive docs at `/docs`, only when `DEBUG=True`) |
+| MinIO console | http://localhost:58103 |
 
-Las migraciones corren solas al iniciar el backend. Falta sembrar roles/permisos y crear el
-primer usuario:
+Migrations run automatically when the backend starts. You still need to seed roles/permissions
+and create the first user:
 
 ```bash
 docker compose exec backend python scripts/seed_permissions.py
-printf '%s' 'tu-contraseña' | docker compose exec -T backend python scripts/create_super_admin.py tu-email@ejemplo.com
+printf '%s' 'your-password' | docker compose exec -T backend python scripts/create_super_admin.py your-email@example.com
 ```
 
-Listo — entrá a http://localhost:58100 con ese usuario.
+The email must be valid for login: reserved domains (`.local`, `.test`, `.invalid`,
+`.localhost`, `.onion`, `.arpa`) are rejected. Then open http://localhost:58100 with that user.
 
-## Documentación
+## Operational notes
 
-- [Guía de marca](docs/brand-guidelines.md) — paleta, tipografía, uso del logo.
-- [Checklist de funcionalidades](docs/checklist-funcionalidades.md) — alcance de producto tipo Google Drive.
-- [Módulos](docs/modulos/index.md) — el checklist anterior desglosado por módulo de producto.
-- [Estándares Cliente-Servidor 2026](docs/estandares-cliente-servidor-2026/index.md) — checklist de calidad técnica (arquitectura, seguridad, frontend, etc.), no funcionalidades de producto.
+- Any change to shared code (`app/files`, `app/worker`, ...) requires rebuilding **every**
+  service that imports it (`backend` **and** `celery_worker`), not just one.
+- Docker base images are pinned by digest; update the digests by hand periodically to receive
+  security patches.
+- The frontend CSP allows one inline script by SHA-256 hash (see `filemeshy_front/nginx.conf`);
+  if the inline script in `index.html` changes, recompute the hash.
+- File contents in MinIO are **not** backed up unless an external S3-compatible destination is
+  configured (`BACKUP_S3_*` variables). Only the PostgreSQL database is backed up by default.
+
+## Documentation
+
+- [Backlog and project log](pendiente.md) — round-by-round history, known debt and open items (Spanish).
+- [Brand guidelines](docs/brand-guidelines.md) — palette, typography, logo usage.
+- [Feature checklist](docs/checklist-funcionalidades.md) — Google Drive-like product scope.
+- [Modules](docs/modulos/index.md) — the checklist above broken down by product module.
+- [Client-Server Standards 2026](docs/estandares-cliente-servidor-2026/index.md) — technical quality checklist (architecture, security, frontend, etc.), not product features.

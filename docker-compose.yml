@@ -46,7 +46,13 @@ x-backend-env: &backend-env
 
 services:
   postgres:
-    image: postgres:15-alpine
+    # Pin de versión + digest (Ronda 10) -- mismo criterio que MinIO (Ronda 1):
+    # sin esto, "15-alpine" es una tag flotante que puede traer un patch nuevo
+    # (con CVEs corregidos o, peor, regresiones) sin aviso en cualquier rebuild.
+    # 15.19-alpine es la build vigente al 2026-09-22 (confirmado con
+    # `postgres --version` corriendo la imagen real); el digest fija ESE
+    # binario exacto para siempre, sin depender de que la tag no se re-apunte.
+    image: postgres:15.19-alpine@sha256:f7d23353e1b15400d22ebe31189f4d314b87a4c129cc400c8c2d8d4ca127bf81
     environment:
       POSTGRES_USER: filemeshy
       POSTGRES_PASSWORD: filemeshy_dev_only
@@ -62,7 +68,10 @@ services:
       retries: 10
 
   redis:
-    image: redis:7-alpine
+    # Pin de versión + digest (Ronda 10) -- mismo criterio que postgres arriba.
+    # 7.4.11-alpine vigente al 2026-09-22 (confirmado con `redis-server
+    # --version` corriendo la imagen real).
+    image: redis:7.4.11-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
     ports:
       - "58105:6379"
     healthcheck:
@@ -228,7 +237,17 @@ services:
   # este sí lo necesita brevemente al arrancar para preparar un volumen
   # persistente.
   clamav:
-    image: clamav/clamav:stable
+    # Pin por DIGEST (Ronda 10) -- a diferencia de postgres/redis, "stable"
+    # no tiene un esquema de versión propio confiable como tag (a la fecha
+    # resuelve a ClamAV 1.5.4/28129, confirmado con `clamscan --version`
+    # corriendo la imagen real, pero "stable" es una tag flotante por
+    # diseño -- freshclam actualiza firmas, y la imagen en sí puede saltar
+    # de versión sin aviso). El digest fija el binario+base exactos
+    # vigentes al 2026-09-22; se mantiene la tag "stable" en la referencia
+    # (en vez de una tag numerada) porque el propósito de "stable" sigue
+    # siendo válido como documentación de intención, el digest es lo que
+    # realmente ancla la reproducibilidad.
+    image: clamav/clamav:stable@sha256:0e31ce089574268aefa0b543767d66b70240ab51ed49eec53e07f18d5629d817
     volumes:
       - clamav_data:/var/lib/clamav
     # Ronda 9: escaneo asíncrono de archivos grandes -- por defecto la imagen

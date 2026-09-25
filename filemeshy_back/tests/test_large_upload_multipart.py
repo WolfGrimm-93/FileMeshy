@@ -498,3 +498,100 @@ def test_refresh_part_urls_renews_admission_lease(client, db_session, presign_vi
     assert user_score_after is not None and user_score_after > user_score_before
 
     abort_upload(db_session, user, session_id)
+
+
+# ---------------------------------------------------------------------------
+# Ronda 10 -- pendiente de Ronda 9: el tope GLOBAL en aislamiento real.
+# ---------------------------------------------------------------------------
+# `test_per_user_admission_cap_isolated_from_other_users` y
+# `test_admission_slot_self_heals_via_short_lease_before_periodic_cleanup`
+# (arriba) fijan `MAX_CONCURRENT_LARGE_UPLOADS=50` A PROPÓSITO para que el
+# tope GLOBAL nunca sea el factor limitante mientras prueban el tope
+# POR-USUARIO -- ninguno de los dos ejercita el camino inverso: varios
+# usuarios DISTINTOS, cada uno bien por debajo de SU propio cupo individual,
+# que en conjunto agotan el cupo GLOBAL. El script Lua atómico
+# (`_ADMISSION_LUA`) chequea AMBOS topes en la misma llamada -- sin un test
+# que fije el global bajo, una regresión que rompiera SOLO esa rama (ej. el
+# global_count comparado contra la constante equivocada) pasaría en verde
+# para siempre, porque los dos tests existentes literalmente desactivan esa
+# rama con 50.
+def test_global_admission_cap_blocks_new_user_even_with_free_per_user_quota(client, db_session, monkeypatch):
+    """Inverso de `test_per_user_admission_cap_isolated_from_other_users`:
+    acá el por-usuario se fija ALTO (50, cada usuario individual queda MUY
+    por debajo de su propio cupo) y el GLOBAL se fija BAJO a propósito.
+    Varios usuarios DISTINTOS, cada uno con UNA sola sesión propia (ninguno
+    se acerca a su tope individual), llenan el cupo GLOBAL entre todos. Un
+    usuario NUEVO, con su cupo propio 100% libre (0 de 50), tiene que
+    recibir 503 igual -- si esto pasara, confirmaría que el límite que
+    importó fue el global, no el suyo (que ni se acercó a agotarse).
+
+    El cupo GLOBAL se fija RELATIVO a la ocupación real actual del ZSET
+    compartido (`baseline + GLOBAL_CAP_DELTA`), no a un número absoluto fijo
+    -- confirmado EN VIVO durante el desarrollo de este test que un número
+    absoluto (3) es flaky de verdad en este stack compartido: otro test de
+    admisión de otro agente de esta misma ronda (`test_upload_admission_
+    retry_after.py`) deja sesiones reservadas en el ZSET GLOBAL sin abortar
+    cuando falla a mitad de camino (antes de su propio cleanup), y esas
+    reservas siguen VIGENTES (lease de varias horas, no vencido) -- con un
+    cupo absoluto de 3 y 4+ reservas ajenas ya ocupando el global, el
+    PRIMER `_initiate_direct` de este test ya recibía 503, antes de abrir
+    ninguna sesión propia. Medir la ocupación real (después de podar SOLO
+    lo ya vencido, exactamente lo que hace `_ADMISSION_LUA`) y sumarle el
+    delta hace que este test sea correcto sin importar cuánta basura ajena
+    haya en el ZSET compartido en el momento en que corre."""
+    import time as time_module
+
+    import app.worker.celery_app  # noqa: F401 -- fuerza _register_all_orm_models antes de la primera query ORM
+
+    monkeypatch.setattr(settings, "MAX_CONCURRENT_LARGE_UPLOADS_PER_USER", 50)  # el por-usuario NUNCA debe ser el factor limitante acá
+
+    GLOBAL_CAP_DELTA = 3
+    redis_client = uploads_service.cache.client
+    if redis_client is not None:
+        # Poda defensiva de miembros YA vencidos -- lo MISMO que hace el
+        # script Lua antes de contar (ver _ADMISSION_LUA), para no contar
+        # basura de leases YA vencidos de corridas anteriores.
+        redis_client.zremrangebyscore(uploads_service._ADMISSION_KEY, "-inf", time_module.time())
+        baseline = redis_client.zcard(uploads_service._ADMISSION_KEY)
+    else:
+        from app.uploads.repository import upload_session_repo
+
+        baseline = upload_session_repo.count_in_progress(db_session)
+
+    GLOBAL_CAP = baseline + GLOBAL_CAP_DELTA
+    monkeypatch.setattr(settings, "MAX_CONCURRENT_LARGE_UPLOADS", GLOBAL_CAP)
+
+    opened = []
+    try:
+        # GLOBAL_CAP_DELTA usuarios DISTINTOS, cada uno con una sola sesión
+        # propia -- sumados a `baseline` (lo que ya estuviera ocupando el
+        # global, ajeno a este test), llenan el cupo exactamente.
+        for i in range(GLOBAL_CAP_DELTA):
+            creds = register_user(client)
+            user = _get_orm_user(db_session, creds["email"])
+            resp = _initiate_direct(db_session, user, name_suffix=f"global{i}")
+            opened.append((user, resp.upload_session_id))
+
+        # Usuario NUEVO, sin ninguna relación con los anteriores -- su propio
+        # cupo (50) está intacto, pero el GLOBAL ya está lleno.
+        creds_new = register_user(client)
+        user_new = _get_orm_user(db_session, creds_new["email"])
+
+        from fastapi import HTTPException
+
+        with pytest.raises(HTTPException) as exc_info:
+            _initiate_direct(db_session, user_new, name_suffix="new-blocked-by-global")
+        assert exc_info.value.status_code == 503
+
+        # El script Lua nunca reserva "a medias" (ver su comentario en
+        # service.py) -- confirma que el 503 de arriba no dejó, de todos
+        # modos, una reserva colgada en el ZSET propio del usuario nuevo.
+        if redis_client is not None:
+            user_count = redis_client.zcard(uploads_service._user_admission_key(user_new.id))
+            assert user_count == 0
+    finally:
+        for user, session_id in opened:
+            try:
+                abort_upload(db_session, user, session_id)
+            except Exception:
+                pass

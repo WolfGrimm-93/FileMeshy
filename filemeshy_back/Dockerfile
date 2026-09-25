@@ -1,4 +1,8 @@
-FROM python:3.11-slim
+# Pin por DIGEST (Ronda 10) -- "3.11-slim" es una tag flotante (patches de
+# Python 3.11.x + base Debian que se actualizan sin aviso en cualquier
+# rebuild). Python 3.11.16 confirmado en vivo con `python3 --version`
+# corriendo la imagen real, digest vigente al 2026-09-22.
+FROM python:3.11-slim@sha256:da047cb8f9d1d98e5c070f5300ba9f7274e33b8fc0e5be5ed88740aed1b95ba9
 
 WORKDIR /app
 

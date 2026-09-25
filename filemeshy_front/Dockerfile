@@ -1,4 +1,8 @@
-FROM node:22-alpine AS build
+# Pin por DIGEST (Ronda 10) -- "22-alpine" es una tag flotante (Node 22.x +
+# base Alpine que se actualizan sin aviso en cualquier rebuild). v22.23.2
+# confirmado en vivo con `node --version` corriendo la imagen real,
+# digest vigente al 2026-09-22.
+FROM node:22-alpine@sha256:b6f26b36c8ff49624cfdac716b8ea1138d606df02586a77d364bb5536a634f85 AS build
 
 RUN corepack enable && corepack prepare pnpm@latest --activate
 
@@ -28,7 +32,10 @@ ENV VITE_ENABLE_TENANT_SELECTOR=$VITE_ENABLE_TENANT_SELECTOR
 RUN pnpm build:prod
 
 # --- Etapa de produccion ---
-FROM nginx:alpine
+# Pin por DIGEST (Ronda 10) -- mismo criterio que la etapa de build:
+# "alpine" es flotante. nginx/1.31.6 confirmado en vivo con `nginx -v`
+# corriendo la imagen real, digest vigente al 2026-09-22.
+FROM nginx:alpine@sha256:62ff2089abf5a9ed33bd232895bef5e22f7bb4b200675cec49a5ebc48e3d4ac8
 
 # Copiar config de nginx
 COPY nginx.conf /etc/nginx/conf.d/default.conf

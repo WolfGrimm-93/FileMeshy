@@ -245,11 +245,43 @@ def _cors_headers_for(request) -> dict:
 
 @app.exception_handler(StarletteHTTPException)
 async def http_exception_handler(request, exc):
-    """Manejar excepciones HTTP con CORS headers."""
+    """Manejar excepciones HTTP con CORS headers.
+
+    Ronda 10 -- bug encontrado: esto reconstruía la respuesta pasando SOLO
+    `_cors_headers_for(request)` como `headers`, descartando por completo
+    `exc.headers` -- cualquier endpoint que levante `HTTPException(...,
+    headers=...)` perdía esos headers en el camino (hoy al menos el 503 de
+    admisión de subidas grandes con `Retry-After`, ver
+    app/uploads/service.py::_try_reserve_admission_slot). Fusionamos ambos
+    dicts -- `_cors_headers_for(request)` último a propósito, así sus claves
+    (`Access-Control-*`) SIEMPRE ganan si algún día `exc.headers` trajera
+    por error una clave con ese mismo nombre (no debería pasar hoy, ninguna
+    HTTPException del código pone headers CORS a mano, pero así ninguna
+    HTTPException futura puede pisar el CORS validado de este handler).
+
+    OJO -- hallazgo importante de esta misma ronda, verificando el fix en
+    vivo: ESTE handler está registrado para `StarletteHTTPException` (la
+    clase PADRE), pero TODO el código de la app levanta
+    `fastapi.HTTPException` (la subclase, `from fastapi import
+    HTTPException`) -- y FastAPI/Starlette despachan por el tipo MÁS
+    ESPECÍFICO del MRO de la excepción real, no por orden de registro. Como
+    `app/api/v1/exception_handlers.py::register_exception_handlers` registra
+    un handler aparte específicamente para `fastapi.HTTPException`, ESE es
+    el que gana siempre en la práctica para cualquier `HTTPException` real
+    del código -- confirmado en vivo imprimiendo
+    `app.exception_handlers.keys()` (ambas clases quedan como entradas
+    separadas) y reproduciendo el bug de Retry-After contra el endpoint real
+    ANTES de arreglar TAMBIÉN `typed_exception_handler` en ese otro archivo
+    (el fix de acá solo, sin ese otro, no alcanzaba -- el 503 seguía sin el
+    header). Este handler de acá queda como defensa para el caso de que algo
+    levante un `starlette.exceptions.HTTPException` puro alguna vez (hoy no
+    pasa en este código), pero el fix que realmente importa para el bug
+    reportado está en `app/api/v1/exception_handlers.py::typed_exception_handler`."""
+    headers = {**(exc.headers or {}), **_cors_headers_for(request)}
     return JSONResponse(
         status_code=exc.status_code,
         content={"detail": exc.detail},
-        headers=_cors_headers_for(request),
+        headers=headers,
     )
 
 
@@ -331,54 +363,53 @@ def _check_db_sync():
 async def health_check_detailed(
     current_user: User = Depends(get_current_active_user)
 ):
-    """Health check detallado - Solo para usuarios autenticados.
-    
-    Requiere autenticación.
-    Muestra información detallada del sistema.
+    """Health check detallado - Solo para usuarios autenticados (ADMIN/SUPER_ADMIN).
+
+    Ronda 10 -- el payload anterior exponía de más para lo que es un
+    healthcheck real (hallazgo de la auditoría, ver pendiente.md): versión
+    completa de Postgres (`SELECT version()`, con el build string entero del
+    binario), `sys.version`/`platform.python_version()`/`platform.platform()`
+    (versión de Python y del OS del contenedor) y el flag `settings.DEBUG`.
+    Nada de eso es necesario para responder "¿está la app sana?" -- son
+    detalles de la pila interna que un endpoint autenticado no debería
+    seguir regalando de más (defensa en profundidad: aunque ya está bien
+    gateado a rol admin, un token robado o un admin malicioso no necesita
+    el fingerprint completo del stack para nada operativo). Criterio de
+    "esencial" que se dejó: si la DB responde sí/no (para diagnosticar un
+    problema real de conectividad) y qué versión de la APP corre (para
+    confirmar que un deploy se aplicó) -- nada de la versión de Python/
+    Postgres/OS ni el flag de debug.
     """
     from app.core.database import engine
     from sqlalchemy import text
-    import sys
-    import platform
     from datetime import datetime
-    
+
     # Verificar que el usuario tenga permisos de admin
     if not current_user.role_obj or current_user.role_obj.name not in ["SUPER_ADMIN", "ADMIN"]:
         raise HTTPException(
             status_code=403,
             detail="No tienes permisos para acceder a esta información"
         )
-    
-    # Verificar BD
+
+    # Verificar BD -- solo conectividad, sin exponer el version string completo.
     db_status = "disconnected"
-    db_error = None
-    db_version = None
     try:
         with engine.connect() as conn:
-            result = conn.execute(text("SELECT version()"))
-            db_version = result.scalar()
+            conn.execute(text("SELECT 1"))
             db_status = "connected"
-    except Exception as e:
-        db_error = str(e)
-    
+    except Exception:
+        pass
+
     return {
         "status": "healthy" if db_status == "connected" else "degraded",
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "database": {
             "status": db_status,
-            "version": db_version,
-            "error": db_error
         },
         "application": {
             "name": settings.PROJECT_NAME,
             "version": settings.PROJECT_VERSION,
-            "debug": settings.DEBUG,
-            "python_version": sys.version
         },
-        "system": {
-            "platform": platform.platform(),
-            "python": platform.python_version()
-        }
     }
 
 

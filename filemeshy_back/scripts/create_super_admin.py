@@ -23,6 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from email_validator import EmailNotValidError, validate_email
 from sqlalchemy import text
 
 from app.core.database import SessionLocal
@@ -35,6 +36,59 @@ class SuperAdminCreationError(Exception):
     al llamante (CLI o `app.tenants.service.sembrar_cliente_nuevo`)."""
 
 
+def _validate_email_or_raise(email: str) -> None:
+    """Falla ACÁ, antes de insertar nada, si el email no pasaría el login --
+    en vez de crear un SUPER_ADMIN que exista en la base pero nunca pueda
+    entrar (Ronda 10, bug reportado: dominios como "empresa.local").
+
+    Investigación de la causa real (no asumida, confirmada leyendo código
+    en vivo dentro del contenedor):
+      1. El LOGIN exige `EmailStr` (`app/users/schemas.py::LoginRequest`),
+         pero este script inserta con SQL crudo, sin pasar por ningún
+         schema -- puede crear un email que el login rechace.
+      2. `EmailStr` de pydantic (2.5.2 en este proyecto) llama a
+         `email_validator.validate_email(v, check_deliverability=False)`
+         -- ese `False` está HARDCODEADO adentro de pydantic, no es una
+         opción de este proyecto: NUNCA hace un lookup DNS real, ni para
+         registro ni para login, hoy.
+      3. Por eso ".local" NO se rechaza por deliverability (ya está
+         apagado). Se rechaza por OTRO chequeo, distinto e INCONDICIONAL,
+         de `email_validator` mismo: contra `SPECIAL_USE_DOMAIN_NAMES`
+         (`arpa`, `invalid`, `local`, `localhost`, `onion`, `test` --
+         confirmado en vivo imprimiendo la lista real de la versión
+         instalada; OJO que ".example" NO está ahí pese a estar "reservado"
+         por RFC 2606 -- esa RFC reserva los dominios puntuales
+         example.com/.net/.org, no el sufijo ".example" en general, así que
+         "cualquier-cosa.example" sí pasa esta librería). Ese chequeo corre
+         SIEMPRE, no está gateado por `check_deliverability` ni por ningún
+         otro parámetro que pydantic exponga (confirmado probando
+         `globally_deliverable=False` y `test_environment=True` directo
+         contra `email_validator`, ninguno lo evita).
+      4. Conclusión: no hay ninguna forma de "relajar el deliverability
+         check" para este caso puntual -- no es lo que está rechazando el
+         email. La única forma real de arreglarlo sin tocar
+         `LoginRequest`/`EmailStr` (fuera del alcance de este script) es
+         no dejar crear la cuenta rota en primer lugar.
+
+    Reutiliza `email_validator` directo (la misma librería que usa
+    `EmailStr` por debajo) para que "lo que este script acepta" y "lo que
+    el login acepta" sean EXACTAMENTE el mismo chequeo -- no una
+    reimplementación que podría desincronizarse.
+    """
+    try:
+        validate_email(email, check_deliverability=False)
+    except EmailNotValidError as exc:
+        raise SuperAdminCreationError(
+            f"Email inválido para login: {exc}. El login exige un email que "
+            "pase la misma validación (ver app/users/schemas.py::LoginRequest, "
+            "EmailStr) -- dominios especiales/reservados (.local, .test, "
+            ".invalid, .localhost, .onion, .arpa) SIEMPRE se rechazan, no solo "
+            "cuando no resuelven DNS real. Usá un dominio real (no hace falta "
+            "que resuelva DNS de verdad, pero no puede ser uno de esos "
+            "reservados)."
+        ) from exc
+
+
 def create_super_admin(email: str, password: str, first_name: str = "Admin", last_name: str = "") -> dict:
     """Crea el primer usuario SUPER_ADMIN de la base actual (schema activo en
     `tenant_schema_ctx`, si aplica). No es un no-op silencioso si ya existe --
@@ -42,8 +96,11 @@ def create_super_admin(email: str, password: str, first_name: str = "Admin", las
 
     Devuelve {"user_id": str, "email": str, "created": bool}.
     Lanza `SuperAdminCreationError` si todavía no existe el rol SUPER_ADMIN
-    (correr/sembrar roles y permisos primero -- ver scripts/seed_permissions.py).
+    (correr/sembrar roles y permisos primero -- ver scripts/seed_permissions.py)
+    o si el email no pasaría el login (ver `_validate_email_or_raise`).
     """
+    _validate_email_or_raise(email)
+
     db = SessionLocal()
     try:
         existing = db.execute(text("SELECT id FROM users WHERE email = :email"), {"email": email}).first()

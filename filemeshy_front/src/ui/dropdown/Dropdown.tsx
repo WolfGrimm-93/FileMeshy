@@ -1,4 +1,5 @@
-import { useState, useRef, useEffect, type ReactNode } from 'react'
+import { useState, useRef, useEffect, useCallback, useLayoutEffect, type ReactNode, type RefObject } from 'react'
+import { createPortal } from 'react-dom'
 import { ChevronDown } from 'lucide-react'
 
 export interface DropdownItem {
@@ -18,13 +19,80 @@ export interface DropdownProps {
   className?: string
 }
 
+// Ancho fijo del menú (coincide con la clase w-56 = 14rem de abajo). Se usa
+// para calcular el `left` cuando el menú cuelga del borde derecho del
+// trigger, ya que con position:fixed no hay forma de expresar "right-0"
+// relativo al trigger sin conocer su ancho de antemano.
+const MENU_WIDTH_PX = 224
+const VIEWPORT_MARGIN_PX = 8
+
+interface MenuCoords {
+  top: number
+  left: number
+}
+
+// Calcula la posición del menú en coordenadas de viewport (position: fixed)
+// a partir del trigger real, con un margen para no pisar los bordes de la
+// pantalla. Compartido entre Dropdown y SplitButton.
+function computeMenuCoords(triggerEl: HTMLElement, position: 'left' | 'right'): MenuCoords {
+  const rect = triggerEl.getBoundingClientRect()
+  const rawLeft = position === 'left' ? rect.left : rect.right - MENU_WIDTH_PX
+  const maxLeft = window.innerWidth - MENU_WIDTH_PX - VIEWPORT_MARGIN_PX
+  const left = Math.min(Math.max(rawLeft, VIEWPORT_MARGIN_PX), Math.max(maxLeft, VIEWPORT_MARGIN_PX))
+  return { top: rect.bottom + 8, left }
+}
+
+// Hook compartido: mientras el dropdown está abierto, mantiene la posición
+// del menú portaleado sincronizada con el trigger real -- recalcula en
+// scroll (capture:true para escuchar también el scroll de contenedores
+// internos como el overflow-x-auto de DataTable, que no burbujea) y en
+// resize de ventana.
+function useMenuCoords(
+  triggerRef: RefObject<HTMLElement | null>,
+  isOpen: boolean,
+  position: 'left' | 'right'
+) {
+  const [coords, setCoords] = useState<MenuCoords | null>(null)
+
+  const updateCoords = useCallback(() => {
+    if (!triggerRef.current) return
+    setCoords(computeMenuCoords(triggerRef.current, position))
+  }, [triggerRef, position])
+
+  useLayoutEffect(() => {
+    // Al cerrar no hace falta limpiar coords: el portal ya no se renderiza
+    // (gateado por `isOpen &&` del lado del caller), y la próxima apertura
+    // recalcula la posición acá mismo antes de pintar.
+    if (!isOpen) return
+    updateCoords()
+    window.addEventListener('resize', updateCoords)
+    // capture:true: el scroll de un contenedor interno (ej. overflow-x-auto
+    // de DataTable) no burbujea como evento, pero sí se puede capturar.
+    document.addEventListener('scroll', updateCoords, true)
+    return () => {
+      window.removeEventListener('resize', updateCoords)
+      document.removeEventListener('scroll', updateCoords, true)
+    }
+  }, [isOpen, updateCoords])
+
+  return coords
+}
+
 export function Dropdown({ trigger, items, position = 'right', className = '' }: DropdownProps) {
   const [isOpen, setIsOpen] = useState(false)
-  const dropdownRef = useRef<HTMLDivElement>(null)
+  const triggerRef = useRef<HTMLButtonElement>(null)
+  const menuRef = useRef<HTMLDivElement>(null)
+  const coords = useMenuCoords(triggerRef, isOpen, position)
 
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
-      if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
+      const target = event.target as Node
+      // El menú vive en un portal fuera de este árbol del DOM, así que un
+      // click adentro no lo detecta el contains() del trigger -- hay que
+      // chequear ambos refs por separado.
+      const clickedTrigger = triggerRef.current?.contains(target)
+      const clickedMenu = menuRef.current?.contains(target)
+      if (!clickedTrigger && !clickedMenu) {
         setIsOpen(false)
       }
     }
@@ -53,11 +121,10 @@ export function Dropdown({ trigger, items, position = 'right', className = '' }:
     setIsOpen(false)
   }
 
-  const positionClasses = position === 'left' ? 'left-0' : 'right-0'
-
   return (
-    <div ref={dropdownRef} className={`relative inline-flex ${className}`}>
+    <div className={`relative inline-flex ${className}`}>
       <button
+        ref={triggerRef}
         type="button"
         onClick={() => setIsOpen(!isOpen)}
         className="inline-flex items-center"
@@ -67,10 +134,12 @@ export function Dropdown({ trigger, items, position = 'right', className = '' }:
         {trigger}
       </button>
 
-      {isOpen && (
+      {isOpen && coords && createPortal(
         <div
+          ref={menuRef}
           role="menu"
-          className={`absolute top-full z-50 mt-2 w-56 overflow-hidden rounded-lg border border-gray-200 bg-white shadow-lg dark:border-gray-700 dark:bg-gray-800 ${positionClasses}`}
+          style={{ position: 'fixed', top: coords.top, left: coords.left }}
+          className="z-50 w-56 overflow-hidden rounded-lg border border-gray-200 bg-white shadow-lg dark:border-gray-700 dark:bg-gray-800"
         >
           {items.map((item, index) => {
             if (item.divider) {
@@ -117,7 +186,8 @@ export function Dropdown({ trigger, items, position = 'right', className = '' }:
               </button>
             )
           })}
-        </div>
+        </div>,
+        document.body
       )}
     </div>
   )
@@ -142,11 +212,16 @@ export function SplitButton({
   position = 'right',
 }: SplitButtonProps) {
   const [isOpen, setIsOpen] = useState(false)
-  const dropdownRef = useRef<HTMLDivElement>(null)
+  const groupRef = useRef<HTMLDivElement>(null)
+  const menuRef = useRef<HTMLDivElement>(null)
+  const coords = useMenuCoords(groupRef, isOpen, position)
 
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
-      if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
+      const target = event.target as Node
+      const clickedGroup = groupRef.current?.contains(target)
+      const clickedMenu = menuRef.current?.contains(target)
+      if (!clickedGroup && !clickedMenu) {
         setIsOpen(false)
       }
     }
@@ -175,10 +250,9 @@ export function SplitButton({
 
   const baseClasses = variantClasses[variant]
   const sizing = sizeClasses[size]
-  const positionClasses = position === 'left' ? 'left-0' : 'right-0'
 
   return (
-    <div ref={dropdownRef} className="relative inline-flex">
+    <div ref={groupRef} className="relative inline-flex">
       <span className="inline-flex divide-x divide-white/20 overflow-hidden rounded-lg shadow-xs">
         <button
           type="button"
@@ -200,10 +274,12 @@ export function SplitButton({
         </button>
       </span>
 
-      {isOpen && (
+      {isOpen && coords && createPortal(
         <div
+          ref={menuRef}
           role="menu"
-          className={`absolute top-full z-50 mt-2 w-56 overflow-hidden rounded-lg border border-gray-200 bg-white shadow-lg dark:border-gray-700 dark:bg-gray-800 ${positionClasses}`}
+          style={{ position: 'fixed', top: coords.top, left: coords.left }}
+          className="z-50 w-56 overflow-hidden rounded-lg border border-gray-200 bg-white shadow-lg dark:border-gray-700 dark:bg-gray-800"
         >
           {items.map((item, index) => {
             if (item.divider) {
@@ -240,7 +316,8 @@ export function SplitButton({
               </button>
             )
           })}
-        </div>
+        </div>,
+        document.body
       )}
     </div>
   )
