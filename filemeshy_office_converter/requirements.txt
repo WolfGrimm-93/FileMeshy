@@ -1,8 +1,8 @@
 # Mismas versiones que filemeshy_back/requirements.txt para consistencia
 # entre subproyectos (no hay razon para que este servicio quede en otra
 # rama de fastapi/uvicorn/python-multipart que el resto de FileMeshy).
-fastapi==0.135.3
-starlette==1.3.1
-pydantic==2.12.5
-uvicorn[standard]==0.32.1
+fastapi==0.141.1
+starlette==1.7.0
+pydantic==2.13.5
+uvicorn[standard]==0.53.0
 python-multipart==0.0.32
