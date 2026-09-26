@@ -43,6 +43,8 @@ export interface RoleCreate {
   display_name: string
   description?: string
   permissions: RolePermissions
+  /** ids de permisos reales (role_permissions); se persisten en la misma transacción del alta */
+  permission_ids?: string[]
   is_active?: boolean
 }
 

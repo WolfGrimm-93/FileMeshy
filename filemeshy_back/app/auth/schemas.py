@@ -12,48 +12,67 @@ import re
 # SESIONES
 # ========================================================================
 
+# Prefijos/fragmentos de UA de clientes que NO son navegadores (scripts, SDKs,
+# herramientas de prueba). "unknown" es el literal que se guarda cuando el
+# request no trajo User-Agent.
+_API_CLIENT_MARKERS = (
+    "curl/", "wget/", "python-httpx", "python-requests", "python-urllib", "aiohttp",
+    "postman", "insomnia", "okhttp", "go-http-client", "httpie", "node-fetch", "axios/",
+)
+
+
 def _parse_user_agent(ua: Optional[str]) -> tuple[str, str]:
     """
     Parsea el user_agent y retorna (device_type, device_name).
     device_type: 'mobile' | 'desktop'
-    device_name: nombre legible del navegador/SO
+    device_name: nombre legible del navegador/SO, o "Cliente API" si el UA es
+    de una herramienta/SDK (curl, httpx, Postman...) o no vino.
     """
-    if not ua:
-        return "desktop", "Dispositivo desconocido"
+    ua_lower = (ua or "").strip().lower()
 
-    ua_lower = ua.lower()
+    # Clientes API / sin UA -> no tiene sentido inventar navegador ni SO.
+    if not ua_lower or ua_lower == "unknown" or any(m in ua_lower for m in _API_CLIENT_MARKERS):
+        return "desktop", "Cliente API"
 
     # Detectar tipo de dispositivo
     is_mobile = any(k in ua_lower for k in ("mobile", "android", "iphone", "ipad", "ipod"))
     device_type = "mobile" if is_mobile else "desktop"
 
-    # Detectar navegador
-    if "firefox" in ua_lower:
-        browser = "Firefox"
-    elif "edg/" in ua_lower or "edge/" in ua_lower:
-        browser = "Edge"
-    elif "chrome" in ua_lower and "chromium" not in ua_lower:
-        browser = "Chrome"
-    elif "safari" in ua_lower and "chrome" not in ua_lower:
-        browser = "Safari"
-    elif "opera" in ua_lower or "opr/" in ua_lower:
-        browser = "Opera"
-    elif "tauri" in ua_lower:
+    # Detectar navegador. El ORDEN importa: casi todos los navegadores
+    # incluyen "Chrome" y "Safari" en su UA por compatibilidad, así que van
+    # primero los que se identifican con un token propio (Edge, Opera,
+    # Firefox, Chrome iOS) y al final los genéricos.
+    if "tauri" in ua_lower:
         browser = "App FileMeshy"
+    elif any(k in ua_lower for k in ("edg/", "edga/", "edgios/", "edge/")):
+        browser = "Edge"
+    elif "opr/" in ua_lower or "opera" in ua_lower:
+        browser = "Opera"
+    elif "firefox" in ua_lower or "fxios" in ua_lower:
+        browser = "Firefox"
+    elif "crios" in ua_lower:
+        browser = "Chrome"
+    elif "chromium" in ua_lower:
+        browser = "Chromium"
+    elif "chrome" in ua_lower:
+        browser = "Chrome"
+    elif "safari" in ua_lower:
+        browser = "Safari"
     else:
         browser = "Navegador desconocido"
 
-    # Detectar SO
+    # Detectar SO. iOS ANTES que macOS: los UA de iPhone/iPad dicen
+    # "like Mac OS X".
     if "windows nt 10" in ua_lower or "windows nt 11" in ua_lower:
         os_name = "Windows 10/11"
     elif "windows nt" in ua_lower:
         os_name = "Windows"
+    elif any(k in ua_lower for k in ("iphone", "ipad", "ipod")):
+        os_name = "iOS"
     elif "mac os x" in ua_lower or "macos" in ua_lower:
         os_name = "macOS"
     elif "android" in ua_lower:
         os_name = "Android"
-    elif "iphone" in ua_lower or "ipad" in ua_lower:
-        os_name = "iOS"
     elif "linux" in ua_lower:
         os_name = "Linux"
     else:

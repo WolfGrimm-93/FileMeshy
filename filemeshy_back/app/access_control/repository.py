@@ -12,6 +12,7 @@ automaticamente en 2 momentos:
 """
 from typing import List, Optional
 from uuid import UUID
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from fastapi import HTTPException, status
 
@@ -99,6 +100,25 @@ class CRUDRole:
                 detail=f"Ya existe un rol con el nombre '{obj_in.name}'"
             )
 
+        # Ronda 12: permission_ids (fuente real de permisos, tabla
+        # role_permissions). Se validan ANTES de crear nada -- un id
+        # inexistente aborta con 422 y no queda ningún rol a medias.
+        permission_ids = list(dict.fromkeys(obj_in.permission_ids or []))  # sin duplicados, conserva orden
+        if permission_ids:
+            active_by_id = {
+                row[0]: row[1]
+                for row in db.query(Permission.id, Permission.is_active).filter(Permission.id.in_(permission_ids)).all()
+            }
+            # Inexistentes o inactivos (el catálogo del GET solo muestra activos).
+            invalid = [str(pid) for pid in permission_ids if not active_by_id.get(pid)]
+            if invalid:
+                shown = ", ".join(invalid[:20])
+                extra = f" y {len(invalid) - 20} más" if len(invalid) > 20 else ""
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail=f"Permisos inexistentes o inactivos en permission_ids: {shown}{extra}"
+                )
+
         # Crear rol
         role = Role(
             name=obj_in.name.upper(),
@@ -110,8 +130,29 @@ class CRUDRole:
             created_by_id=created_by_id
         )
 
-        db.add(role)
-        db.commit()
+        # Alta atómica: rol + role_permissions en UNA sola transacción (un único
+        # commit al final). Si algo falla, rollback y no queda ni el rol.
+        try:
+            db.add(role)
+            db.flush()
+            if permission_ids:
+                set_permissions_for_role(db, role.id, permission_ids, commit=False)
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            # Carrera de nombre: otra alta simultánea ganó entre get_by_name y el
+            # INSERT (unique de roles.name) -> mismo 409 que el chequeo previo.
+            # Consulta directa (no get_by_name) para confirmar que fue eso y no
+            # otra violación de integridad.
+            if db.query(Role.id).filter(Role.name == obj_in.name.upper()).first() is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Ya existe un rol con el nombre '{obj_in.name}'"
+                )
+            raise
+        except Exception:
+            db.rollback()
+            raise
         db.refresh(role)
 
         return role
@@ -350,7 +391,9 @@ def get_permission_ids_for_role(db: Session, role_id: UUID) -> List[UUID]:
     return [r[0] for r in rows]
 
 
-def set_permissions_for_role(db: Session, role_id: UUID, permission_ids: List[UUID]) -> List[str]:
+def set_permissions_for_role(
+    db: Session, role_id: UUID, permission_ids: List[UUID], commit: bool = True
+) -> List[str]:
     """Reemplaza el set completo de permisos de un rol y recalcula User.permissions
     de TODOS los usuarios que tengan ese rol -- sin esto, cambiar los permisos de
     un rol desde la UI no afectaria a nadie que ya estuviera logueado con ese rol
@@ -359,7 +402,10 @@ def set_permissions_for_role(db: Session, role_id: UUID, permission_ids: List[UU
 
     El recalculo pasa por `apply_overrides` para cada usuario -- si alguien del rol
     tiene una excepcion individual cargada (user_permission_overrides), esta edicion
-    ya no se la borra (antes si lo hacia, sobreescribiendo directo con `normalized`)."""
+    ya no se la borra (antes si lo hacia, sobreescribiendo directo con `normalized`).
+
+    `commit=False` (Ronda 12): no commitea -- lo usa `CRUDRole.create` para que el alta
+    del rol y sus permisos vivan en la misma transacción."""
     from app.access_control.service import permission_mapper, recalculate_users_permissions_for_role
 
     db.query(RolePermission).filter(RolePermission.role_id == role_id).delete()
@@ -377,7 +423,8 @@ def set_permissions_for_role(db: Session, role_id: UUID, permission_ids: List[UU
     # vez llama a users.service), ver ADVERSARIAL_1_REPORTE.md Hallazgo 1.
     recalculate_users_permissions_for_role(db, role_id, normalized)
 
-    db.commit()
+    if commit:
+        db.commit()
     return normalized
 
 

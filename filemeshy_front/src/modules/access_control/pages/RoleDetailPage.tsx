@@ -27,8 +27,14 @@ import { useAuth } from '@/modules/auth/hooks/useAuth'
 import DeleteConfirmDialog from '../../../ui/dialogs/DeleteConfirmDialog'
 import { formatDateTime } from '../../../shared/utils/dates'
 
+// Wrapper: remonta el componente interno al cambiar el id, así el estado de carga
+// arranca en true sin resetearlo dentro de un efecto
 export default function RoleDetailPage() {
   const { id } = useParams<{ id: string }>()
+  return <RoleDetailContent key={id} id={id} />
+}
+
+function RoleDetailContent({ id }: { id: string | undefined }) {
   const navigate = useNavigate()
   const { user: authUser } = useAuth()
 
@@ -46,35 +52,33 @@ export default function RoleDetailPage() {
   const isSuperAdminRole = role?.name === 'SUPER_ADMIN'
 
 
-  const loadRole = async () => {
+  useEffect(() => {
     if (!id) return
 
-    try {
-      setIsLoading(true)
-      // El rol trae display_name/is_active/users_count/etc, pero sus permisos
-      // reales viven en la tabla role_permissions (role.permissions es el JSONB
-      // legacy, siempre vacío) -- se cargan aparte con el mismo endpoint que usa
-      // el editor de permisos (GET /roles/{id}/permissions).
-      const [roleData, permData] = await Promise.all([
-        rolesService.getById(id),
-        permissionsAssignmentService.getForRole(id),
-      ])
-      setRole(roleData)
-      const assignedIds = new Set(permData.assigned_permission_ids)
-      setAssignedPermissions(permData.catalog.filter((p) => assignedIds.has(p.id)))
-    } catch (error) {
-      console.error('Error al cargar rol:', error)
-      toast.error('Error al cargar el rol')
-      navigate('/roles')
-    } finally {
-      setIsLoading(false)
+    const loadRole = async () => {
+      try {
+        // El rol trae display_name/is_active/users_count/etc, pero sus permisos
+        // reales viven en la tabla role_permissions (role.permissions es el JSONB
+        // legacy, siempre vacío) -- se cargan aparte con el mismo endpoint que usa
+        // el editor de permisos (GET /roles/{id}/permissions).
+        const [roleData, permData] = await Promise.all([
+          rolesService.getById(id),
+          permissionsAssignmentService.getForRole(id),
+        ])
+        setRole(roleData)
+        const assignedIds = new Set(permData.assigned_permission_ids)
+        setAssignedPermissions(permData.catalog.filter((p) => assignedIds.has(p.id)))
+      } catch (error) {
+        console.error('Error al cargar rol:', error)
+        toast.error('Error al cargar el rol')
+        navigate('/roles')
+      } finally {
+        setIsLoading(false)
+      }
     }
-  }
 
-  useEffect(() => {
     loadRole()
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [id])
+  }, [id, navigate])
 
   const handleEdit = () => {
     if (!role) return
@@ -241,44 +245,44 @@ export default function RoleDetailPage() {
         <h2 className="text-lg font-semibold text-foreground mb-4">
           Información del Rol
         </h2>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <dl className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div>
-            <label className="text-sm font-medium text-muted-foreground">
+            <dt className="text-sm font-medium text-muted-foreground">
               Nombre Interno
-            </label>
-            <p className="text-foreground font-mono">{role.name}</p>
+            </dt>
+            <dd className="text-foreground font-mono">{role.name}</dd>
           </div>
           <div>
-            <label className="text-sm font-medium text-muted-foreground">
+            <dt className="text-sm font-medium text-muted-foreground">
               Nombre para Mostrar
-            </label>
-            <p className="text-foreground">{role.display_name}</p>
+            </dt>
+            <dd className="text-foreground">{role.display_name}</dd>
           </div>
           <div className="md:col-span-2">
-            <label className="text-sm font-medium text-muted-foreground">
+            <dt className="text-sm font-medium text-muted-foreground">
               Descripción
-            </label>
-            <p className="text-foreground">
+            </dt>
+            <dd className="text-foreground">
               {role.description || 'Sin descripción'}
-            </p>
+            </dd>
           </div>
           <div>
-            <label className="text-sm font-medium text-muted-foreground">
+            <dt className="text-sm font-medium text-muted-foreground">
               Creado
-            </label>
-            <p className="text-foreground">
+            </dt>
+            <dd className="text-foreground">
               {formatDateTime(role.created_at) ?? ''}
-            </p>
+            </dd>
           </div>
           <div>
-            <label className="text-sm font-medium text-muted-foreground">
+            <dt className="text-sm font-medium text-muted-foreground">
               Última Actualización
-            </label>
-            <p className="text-foreground">
+            </dt>
+            <dd className="text-foreground">
               {formatDateTime(role.updated_at) ?? ''}
-            </p>
+            </dd>
           </div>
-        </div>
+        </dl>
       </div>
 
       {/* Permisos */}

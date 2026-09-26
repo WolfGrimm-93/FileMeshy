@@ -62,20 +62,31 @@ export default function PlatformTenantsPage() {
   // doble click) y para mostrar un spinner puntual en su badge de Estado.
   const [togglingId, setTogglingId] = useState<string | null>(null)
 
-  const fetchTenants = useCallback(async () => {
+  // Núcleo del fetch (sin setState síncrono; `isLoading` ya arranca en true): lo usa el efecto de montaje.
+  const fetchTenants = useCallback(
+    () =>
+      tenantsService
+        .list()
+        .then((data) => {
+          setTenants(data)
+          setHasError(false)
+        })
+        .catch((err: unknown) => {
+          setHasError(true)
+          toast.error(getPlatformErrorMessage(err, 'Error al cargar los tenants'))
+        })
+        .finally(() => {
+          setIsLoading(false)
+          setIsFirstLoad(false)
+        }),
+    [],
+  )
+
+  // Recarga explícita (botones, tras crear): vuelve a mostrar el estado de carga.
+  const reloadTenants = useCallback(() => {
     setIsLoading(true)
-    try {
-      const data = await tenantsService.list()
-      setTenants(data)
-      setHasError(false)
-    } catch (err) {
-      setHasError(true)
-      toast.error(getPlatformErrorMessage(err, 'Error al cargar los tenants'))
-    } finally {
-      setIsLoading(false)
-      setIsFirstLoad(false)
-    }
-  }, [])
+    return fetchTenants()
+  }, [fetchTenants])
 
   useEffect(() => {
     fetchTenants()
@@ -92,13 +103,13 @@ export default function PlatformTenantsPage() {
       setIsCreateOpen(false)
       setCreatedResult(result)
       toast.success('Tenant creado exitosamente')
-      fetchTenants()
+      reloadTenants()
     } catch (err) {
       toast.error(getPlatformErrorMessage(err, 'Error al crear el tenant'))
       // No relanzar -- el modal ya queda abierto para que el operador corrija
       // y reintente, el toast ya comunicó el detalle del error del backend.
     }
-  }, [fetchTenants])
+  }, [reloadTenants])
 
   const handleConfirmToggle = useCallback(async () => {
     if (!toggleTarget) return
@@ -189,7 +200,7 @@ export default function PlatformTenantsPage() {
           </div>
 
           <div className="flex shrink-0 gap-2">
-            <Button variant="secondary" onClick={fetchTenants} leftIcon={<RefreshCw className="w-4 h-4" />}>
+            <Button variant="secondary" onClick={reloadTenants} leftIcon={<RefreshCw className="w-4 h-4" />}>
               Actualizar
             </Button>
             <Button variant="primary" onClick={() => setIsCreateOpen(true)} leftIcon={<Plus className="w-4 h-4" />}>
@@ -221,7 +232,7 @@ export default function PlatformTenantsPage() {
               icon={<AlertTriangle className="size-full" />}
               title="No se pudo cargar"
               description="Ocurrió un error al obtener la lista de tenants. Probá de nuevo."
-              primaryAction={{ label: 'Reintentar', onClick: fetchTenants }}
+              primaryAction={{ label: 'Reintentar', onClick: reloadTenants }}
             />
           </div>
         ) : tenants.length === 0 ? (

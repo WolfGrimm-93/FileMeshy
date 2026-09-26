@@ -22,7 +22,7 @@ import {
 } from 'lucide-react'
 import { useNotificationStore } from '../store/notificationStore'
 import { toast } from '@/ui/toast/CustomToast'
-import { formatDateMedium } from '@/shared/utils/dates'
+import { formatRelativeShort } from '@/shared/utils/dates'
 
 // Mapeo de tipos a iconos y colores -- solo tipos reales del dominio FileMeshy
 const TYPE_CONFIG: Record<string, { icon: typeof Bell; label: string; color: string }> = {
@@ -88,20 +88,7 @@ export default function NotificacionesPage() {
     }
   }
 
-  const formatDate = (dateStr: string) => {
-    const date = new Date(dateStr)
-    const now = new Date()
-    const diffMs = now.getTime() - date.getTime()
-    const diffMins = Math.floor(diffMs / 60000)
-    const diffHours = Math.floor(diffMs / 3600000)
-    const diffDays = Math.floor(diffMs / 86400000)
-
-    if (diffMins < 1) return 'Justo ahora'
-    if (diffMins < 60) return `Hace ${diffMins} min`
-    if (diffHours < 24) return `Hace ${diffHours}h`
-    if (diffDays < 7) return `Hace ${diffDays}d`
-    return formatDateMedium(dateStr) ?? ''
-  }
+  const formatDate = (dateStr: string) => formatRelativeShort(dateStr)
 
   return (
     <div className="space-y-6">

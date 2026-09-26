@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { Check } from 'lucide-react'
 import { Modal } from '@/ui/modals/Modal'
 import { Button } from '@/ui/buttons/Button'
@@ -20,13 +20,24 @@ interface RenameModalProps {
   onRenamed: (target: RenameTarget, newName: string) => void
 }
 
+/**
+ * Mount-gate: sin target no monta nada, y el interior se remonta por `target.id`,
+ * así cada apertura arranca con el nombre actual sin efectos de sincronización.
+ */
 export default function RenameModal({ target, onClose, onRenamed }: RenameModalProps) {
-  const [name, setName] = useState('')
-  const [saving, setSaving] = useState(false)
+  if (!target) return null
+  return <RenameModalInner key={target.id} target={target} onClose={onClose} onRenamed={onRenamed} />
+}
 
-  useEffect(() => {
-    setName(target?.name ?? '')
-  }, [target])
+interface RenameModalInnerProps {
+  target: RenameTarget
+  onClose: () => void
+  onRenamed: (target: RenameTarget, newName: string) => void
+}
+
+function RenameModalInner({ target, onClose, onRenamed }: RenameModalInnerProps) {
+  const [name, setName] = useState(target.name)
+  const [saving, setSaving] = useState(false)
 
   const handleClose = () => {
     if (saving) return
@@ -34,7 +45,6 @@ export default function RenameModal({ target, onClose, onRenamed }: RenameModalP
   }
 
   const handleSubmit = async () => {
-    if (!target) return
     const trimmed = name.trim()
     if (!trimmed) {
       toast.error('El nombre no puede estar vacío')
@@ -60,9 +70,9 @@ export default function RenameModal({ target, onClose, onRenamed }: RenameModalP
 
   return (
     <Modal
-      isOpen={!!target}
+      isOpen
       onClose={handleClose}
-      title={target?.type === 'folder' ? 'Renombrar carpeta' : 'Renombrar archivo'}
+      title={target.type === 'folder' ? 'Renombrar carpeta' : 'Renombrar archivo'}
       size="sm"
       footer={
         <div className="flex justify-end gap-2">

@@ -17,6 +17,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
 from starlette.responses import Response
 
+from app.shared.utils.datetime_iso import to_utc_iso
 from app.audit.repository import audit_log
 
 logger = logging.getLogger(__name__)
@@ -141,7 +142,7 @@ def get_model_data(model_instance, exclude_fields: list = None) -> Dict:
             value = getattr(model_instance, column.name)
             # Convertir tipos especiales a serializables
             if hasattr(value, 'isoformat'):  # datetime
-                data[column.name] = value.isoformat() + 'Z'
+                data[column.name] = to_utc_iso(value)
             elif isinstance(value, (int, float, str, bool)) or value is None:
                 data[column.name] = value
             else:

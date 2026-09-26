@@ -86,6 +86,10 @@ const router = createBrowserRouter([
   // ==================== MAIN APP ROUTES ====================
   {
     element: <RootLayout />,
+    // Fragmento vacío a propósito (null no cuenta para React Router): silencia el warning
+    // "No `HydrateFallback` element provided" durante la carga inicial con loaders, sin
+    // pintar nada -- el splash de index.html sigue visible hasta que RootLayout monta.
+    hydrateFallbackElement: <></>,
     errorElement: <RootErrorBoundary />,
     children: [
       // ==================== PUBLIC ROUTES ====================

@@ -44,7 +44,7 @@ from app.platform.schemas import (
 )
 # Reusa el rate limiter real (Redis con fallback en memoria) ya usado por
 # /auth/login y /auth/register -- no reimplementar rate limiting desde cero.
-from app.auth.service import RateLimiter
+from app.auth.service import RateLimiter, too_many_requests
 # Reusa la resolución de IP confiable (Ronda 1: no confía en headers
 # spoofeables como X-Real-IP/CF-Connecting-IP salvo que la conexión TCP real
 # venga de settings.TRUSTED_PROXY_IPS) -- mismo motivo que /auth, un secreto
@@ -89,7 +89,7 @@ def get_platform_admin(request: Request, api_key: Optional[str] = Depends(platfo
         lock_duration=PLATFORM_RATE_LIMIT_LOCK_DURATION,
     )
     if not is_allowed:
-        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=rl_message)
+        raise too_many_requests(rl_message)
 
     if not settings.PLATFORM_API_KEY or not api_key or not secrets.compare_digest(api_key, settings.PLATFORM_API_KEY):
         # window_seconds = mismo valor que lock_duration -- el contador de

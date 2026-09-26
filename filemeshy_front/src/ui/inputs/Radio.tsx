@@ -1,4 +1,4 @@
-import { forwardRef, type InputHTMLAttributes } from 'react'
+import { forwardRef, useId, type InputHTMLAttributes } from 'react'
 
 export interface RadioOption {
   value: string
@@ -16,7 +16,9 @@ export interface RadioProps extends Omit<InputHTMLAttributes<HTMLInputElement>, 
 
 export const Radio = forwardRef<HTMLInputElement, RadioProps>(
   ({ label, description, price, className = '', id, ...props }, ref) => {
-    const radioId = id || label?.toLowerCase().replace(/\s+/g, '-')
+    // useId: id único por instancia; derivarlo del label rompía htmlFor con etiquetas repetidas
+    const generatedId = useId()
+    const radioId = id || generatedId
 
     return (
       <label

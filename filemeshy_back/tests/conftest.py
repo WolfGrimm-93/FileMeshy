@@ -29,6 +29,13 @@ API_PREFIX = "/api/v1"
 DEFAULT_PASSWORD = "Pytest123!"
 
 
+# Fase 4 (Ronda 12): emails de usuarios pytest_* promovidos a ADMIN/SUPER_ADMIN
+# por los helpers de tests. La fixture autouse `_demote_privileged_users` los
+# baja a USER y los desactiva al terminar cada test, para que ninguna corrida
+# deje cuentas privilegiadas con contraseña conocida en la BD del stack.
+PRIVILEGED_EMAILS: list[str] = []
+
+
 def unique_email() -> str:
     """Email único con prefijo pytest_ -- nunca colisiona entre corridas ni
     con datos de pruebas manuales.
@@ -59,6 +66,31 @@ def api_base_url() -> str:
     return f"{BASE_URL}{API_PREFIX}"
 
 
+def _clear_rate_limit_keys() -> None:
+    """Borra los buckets de rate-limit que usan los tests para 127.0.0.1 (la IP real que
+    ve el backend cuando estos tests le pegan a localhost:8000 desde su propio contenedor)."""
+    try:
+        from app.core.cache import cache
+
+        if cache.enabled and cache.client:
+            names = (
+                "register:ip:127.0.0.1",
+                "public_share:127.0.0.1",
+                "password-reset:ip:127.0.0.1",
+                "password-reset-verify:ip:127.0.0.1",
+            )
+            for prefix in ("rl:", "rl_lock:", "rl_lockout_count:", "rlfw:"):
+                for name in names:
+                    cache.client.delete(f"{prefix}{name}")
+            # buckets por email / sesión falsa del reset (prefijos con comodín)
+            for pattern in ("*password-reset:email:*", "*pr_fake_session:*"):
+                for key in cache.client.scan_iter(match=pattern, count=200):
+                    cache.client.delete(key)
+    except Exception:
+        # Best-effort -- si Redis no está disponible por algún motivo, los tests igual corren.
+        pass
+
+
 @pytest.fixture(autouse=True)
 def _reset_own_rate_limit_bucket():
     """Limpia, ANTES DE CADA TEST, el bucket de rate-limit de `/auth/register`
@@ -81,19 +113,42 @@ def _reset_own_rate_limit_bucket():
     funcionales por curl/httpx desde el HOST llega por el puerto mapeado
     (58101), así que el backend lo ve con una IP de la red docker distinta a
     127.0.0.1, sin overlap con esto."""
-    try:
-        from app.core.cache import cache
-
-        if cache.enabled and cache.client:
-            for prefix in ("rl:", "rl_lock:", "rl_lockout_count:", "rlfw:"):
-                cache.client.delete(f"{prefix}register:ip:127.0.0.1")
-                cache.client.delete(f"{prefix}public_share:127.0.0.1")
-    except Exception:
-        # Best-effort -- si Redis no está disponible por algún motivo, los
-        # tests igual corren (probablemente contra el fallback en memoria,
-        # que arranca vacío en cada proceso nuevo de todos modos).
-        pass
+    _clear_rate_limit_keys()
     yield
+    # Ronda 12c: también AL TERMINAR -- tests que agotan a propósito un bucket (shares
+    # públicos, reset de contraseña) no pueden dejar bloqueados a los siguientes.
+    _clear_rate_limit_keys()
+
+
+@pytest.fixture(autouse=True)
+def _demote_privileged_users():
+    """Teardown: baja a rol USER y desactiva a los usuarios pytest_* que el
+    test promovió (ver PRIVILEGED_EMAILS). Solo toca emails `pytest_...`."""
+    yield
+    if not PRIVILEGED_EMAILS:
+        return
+    emails = [e for e in PRIVILEGED_EMAILS if e.startswith("pytest_")]
+    PRIVILEGED_EMAILS.clear()
+    if not emails:
+        return
+    from sqlalchemy import text
+
+    from app.core.database import SessionLocal
+
+    session = SessionLocal()
+    try:
+        session.execute(
+            text(
+                "UPDATE users SET role_id = (SELECT id FROM roles WHERE name = 'USER'), "
+                "is_active = false WHERE email = ANY(:emails)"
+            ),
+            {"emails": emails},
+        )
+        session.commit()
+    except Exception:
+        session.rollback()
+    finally:
+        session.close()
 
 
 @pytest.fixture
@@ -287,6 +342,7 @@ def make_real_admin(client: httpx.Client, db_session) -> tuple[dict, str]:
         {"role_id": admin_role_id, "email": creds["email"]},
     )
     db_session.commit()
+    PRIVILEGED_EMAILS.append(creds["email"])
 
     from app.users.repository import user as crud_user
     from app.users.service import user_service

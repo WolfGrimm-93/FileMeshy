@@ -44,6 +44,7 @@ import DeleteConfirmDialog from '@/ui/dialogs/DeleteConfirmDialog'
 import { toast } from '@/ui/toast/CustomToast'
 import { formatBytes } from '@/shared/utils/downloadFile'
 import { extractErrorMessage } from '@/shared/utils/errors'
+import { parseDate } from '@/shared/utils/dates'
 import { useAuth } from '@/modules/auth/hooks/useAuth'
 import { Permission } from '@/app/routes'
 import { filesService, type FilesSortBy, type FilesSortDir } from '../services/files.service'
@@ -93,8 +94,11 @@ export interface Row {
   raw: FolderOut | FileOut
 }
 
+// Parseo tolerante (shared/utils/dates): acepta "+00:00Z" y nunca devuelve "Invalid Date"
 function formatDate(iso: string): string {
-  return new Date(iso).toLocaleString('es-ES', {
+  const date = parseDate(iso)
+  if (!date) return '—'
+  return date.toLocaleString('es-ES', {
     day: '2-digit',
     month: 'short',
     year: 'numeric',
@@ -110,9 +114,11 @@ export default function FilesPage() {
   const folderParam = searchParams.get('folder')
   const currentFolderId: string | null = folderParam || null
 
-  const [listing, setListing] = useState<DirectoryListing | null>(null)
-  const [isFirstLoad, setIsFirstLoad] = useState(true)
-  const [loading, setLoading] = useState(true)
+  // Resultado del último fetch, atado a la clave de la petición que lo produjo: `loading` se
+  // deriva de que la clave actual todavía no tenga resultado (sin setState síncrono en efectos).
+  const [result, setResult] = useState<{ key: string; data: DirectoryListing | null } | null>(null)
+  // Contador para forzar recargas explícitas (tras crear, renombrar, mover, etc.)
+  const [refreshTick, setRefreshTick] = useState(0)
 
   const [searchTerm, setSearchTerm] = useState('')
   const [debouncedSearch, setDebouncedSearch] = useState('')
@@ -122,6 +128,7 @@ export default function FilesPage() {
   const [uploadOpen, setUploadOpen] = useState(false)
   const [renameTarget, setRenameTarget] = useState<RenameTarget | null>(null)
   const [moveTarget, setMoveTarget] = useState<MoveTarget | null>(null)
+  const [copyTarget, setCopyTarget] = useState<MoveTarget | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<Row | null>(null)
   const [shareTarget, setShareTarget] = useState<ShareTarget | null>(null)
   const [previewTarget, setPreviewTarget] = useState<PreviewTarget | null>(null)
@@ -169,29 +176,41 @@ export default function FilesPage() {
 
   const canModifyHere = !showTrash && !debouncedSearch
 
-  const loadListing = useCallback(async () => {
-    setLoading(true)
-    try {
-      const data = await filesService.list({
-        folderId: canModifyHere ? currentFolderId ?? undefined : undefined,
+  const listFolderId = canModifyHere ? currentFolderId ?? undefined : undefined
+  const requestKey = JSON.stringify([listFolderId, debouncedSearch, showTrash, sortBy, sortDir, favoritesOnly, refreshTick])
+  const loading = result?.key !== requestKey
+  const isFirstLoad = result === null
+  // Mientras carga se conservan los datos previos (overlay de carga sobre la tabla)
+  const listing = result?.data ?? null
+
+  useEffect(() => {
+    let cancelled = false
+    filesService
+      .list({
+        folderId: listFolderId,
         q: debouncedSearch || undefined,
         trash: showTrash,
         sortBy,
         sortDir,
         favoritesOnly: favoritesOnly || undefined,
       })
-      setListing(data)
-    } catch (error: unknown) {
-      toast.error(extractErrorMessage(error, 'Error al cargar archivos'))
-    } finally {
-      setLoading(false)
-      setIsFirstLoad(false)
+      .then((data) => {
+        if (!cancelled) setResult({ key: requestKey, data })
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return
+        toast.error(extractErrorMessage(error, 'Error al cargar archivos'))
+        setResult((prev) => ({ key: requestKey, data: prev?.data ?? null }))
+      })
+    return () => {
+      cancelled = true
     }
-  }, [currentFolderId, debouncedSearch, showTrash, canModifyHere, sortBy, sortDir, favoritesOnly])
+  }, [requestKey, listFolderId, debouncedSearch, showTrash, sortBy, sortDir, favoritesOnly])
 
-  useEffect(() => {
-    loadListing()
-  }, [loadListing])
+  // Recarga explícita: cambia la clave, por lo que `loading` vuelve a ser true hasta el nuevo resultado.
+  const loadListing = useCallback(() => {
+    setRefreshTick((t) => t + 1)
+  }, [setRefreshTick])
 
   const handleNavigate = (folderId: string | null) => {
     setSearchTerm('')
@@ -236,9 +255,6 @@ export default function FilesPage() {
   // dropzone burbujea igual hasta acá -- sin este gate, el mismo archivo se subiría dos veces
   // (una por la dropzone del modal, otra por este handler global).
   useEffect(() => {
-    dragCounterRef.current = 0
-    setIsDraggingFile(false)
-
     const isFileDrag = (e: DragEvent) => Array.from(e.dataTransfer?.types ?? []).includes('Files')
 
     const handleDragEnter = (e: DragEvent) => {
@@ -283,6 +299,9 @@ export default function FilesPage() {
       window.removeEventListener('dragenter', handleDragEnter)
       window.removeEventListener('dragleave', handleDragLeave)
       window.removeEventListener('drop', handleDrop)
+      // Reset al desmontar/re-registrar (en el cleanup, no en el cuerpo del efecto)
+      dragCounterRef.current = 0
+      setIsDraggingFile(false)
     }
   }, [canDropFiles, uploadOpen, uploadFilesFromDrop])
 
@@ -316,7 +335,7 @@ export default function FilesPage() {
   const handleDownload = async (row: Row) => {
     try {
       const url = await filesService.getDownloadUrl(row.id, { forceDownload: true })
-      window.location.href = url
+      window.location.assign(url)
     } catch (error: unknown) {
       toast.error(extractErrorMessage(error, 'Error al descargar el archivo'))
     }
@@ -340,23 +359,9 @@ export default function FilesPage() {
         await filesService.restore(row.id)
       }
       toast.success('Elemento restaurado correctamente')
-      await loadListing()
+      loadListing()
     } catch (error: unknown) {
       toast.error(extractErrorMessage(error, 'Error al restaurar'))
-    }
-  }
-
-  const handleCopy = async (row: Row) => {
-    try {
-      if (row.type === 'folder') {
-        await foldersService.copy(row.id)
-      } else {
-        await filesService.copy(row.id)
-      }
-      toast.success('Copia creada correctamente')
-      await loadListing()
-    } catch (error: unknown) {
-      toast.error(extractErrorMessage(error, 'Error al copiar'))
     }
   }
 
@@ -369,7 +374,7 @@ export default function FilesPage() {
         await filesService.setFavorite(row.id, !isFavorite)
       }
       toast.success(isFavorite ? 'Quitado de favoritos' : 'Marcado como favorito')
-      await loadListing()
+      loadListing()
     } catch (error: unknown) {
       toast.error(extractErrorMessage(error, 'Error al actualizar favorito'))
     }
@@ -384,7 +389,7 @@ export default function FilesPage() {
         await filesService.remove(deleteTarget.id)
       }
       toast.success('Elemento movido a la papelera')
-      await loadListing()
+      loadListing()
     } catch (error: unknown) {
       toast.error(extractErrorMessage(error, 'Error al eliminar'))
     } finally {
@@ -452,7 +457,14 @@ export default function FilesPage() {
       items.push({
         label: 'Copiar',
         icon: <Copy className="size-4" />,
-        onClick: () => handleCopy(row),
+        onClick: () =>
+          setCopyTarget({
+            id: row.id,
+            name: row.name,
+            type: row.type,
+            currentFolderId:
+              row.type === 'folder' ? (row.raw as FolderOut).parent_id : (row.raw as FileOut).folder_id,
+          }),
       })
     }
 
@@ -795,6 +807,8 @@ export default function FilesPage() {
       />
 
       <RenameModal target={renameTarget} onClose={() => setRenameTarget(null)} onRenamed={() => loadListing()} />
+
+      <MoveModal mode="copy" target={copyTarget} onClose={() => setCopyTarget(null)} onMoved={() => loadListing()} />
 
       <MoveModal target={moveTarget} onClose={() => setMoveTarget(null)} onMoved={() => loadListing()} />
 

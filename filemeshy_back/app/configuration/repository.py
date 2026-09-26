@@ -92,6 +92,20 @@ class CRUDSecurityPolicies:
 security_policies = CRUDSecurityPolicies()
 
 
+# Sufijos de config_key que delatan un secreto aunque la fila no tenga
+# is_encrypted=True (ver también configuration/router.py::_is_secret_config).
+SECRET_KEY_SUFFIXES = ("password", "secret", "secret_key", "api_key", "private_key", "token")
+
+# Subconjunto que además se CIFRA al guardar (sin "token": no hay consumidores
+# conocidos de claves *_token que esperen descifrarlas; solo se enmascaran en los GET).
+ENCRYPTED_KEY_SUFFIXES = ("password", "secret", "secret_key", "api_key", "private_key")
+
+
+def is_secret_key(config_key: str) -> bool:
+    """Clave cuyo valor debe guardarse cifrado."""
+    return (config_key or "").lower().endswith(ENCRYPTED_KEY_SUFFIXES)
+
+
 class CRUDSystemConfiguration:
     """CRUD para system_configuration"""
 
@@ -129,7 +143,16 @@ class CRUDSystemConfiguration:
         is_encrypted: bool = False,
         is_readonly: bool = False
     ) -> SystemConfiguration:
-        """Crear nueva configuración"""
+        """Crear nueva configuración. Si la fila es secreta (is_encrypted o clave
+        tipo password/secret/token) el value_string se CIFRA (Fernet) antes de
+        guardarlo -- idempotente si ya venía cifrado."""
+        if value_string == "****" and (is_encrypted or (config_key or "").lower().endswith(SECRET_KEY_SUFFIXES)):
+            value_string = None  # nunca se guarda la máscara como si fuera el secreto
+        if value_string and (is_encrypted or is_secret_key(config_key)):
+            from app.core.security import encrypt_secret_if_needed
+
+            value_string = encrypt_secret_if_needed(value_string)
+            is_encrypted = True
         db_config = SystemConfiguration(
             config_key=config_key,
             config_name=config_name,
@@ -163,7 +186,20 @@ class CRUDSystemConfiguration:
         if not db_config:
             return None
 
+        # La máscara reenviada nunca reemplaza un secreto real. Cubre TAMBIÉN las claves que solo
+        # se enmascaran (`*_token`, ver SECRET_KEY_SUFFIXES), no solo las que se cifran (Ronda 12d).
+        if value_string == "****" and (
+            db_config.is_encrypted or (config_key or "").lower().endswith(SECRET_KEY_SUFFIXES)
+        ):
+            value_string = None
         if value_string is not None:
+            if value_string and (db_config.is_encrypted or is_secret_key(config_key)):
+                # Secreto: se cifra al guardar (también marca legados en claro como
+                # cifrados al re-guardarse; ver docs/operacion.md).
+                from app.core.security import encrypt_secret_if_needed
+
+                value_string = encrypt_secret_if_needed(value_string)
+                db_config.is_encrypted = True
             db_config.value_string = value_string
         if value_number is not None:
             db_config.value_number = value_number

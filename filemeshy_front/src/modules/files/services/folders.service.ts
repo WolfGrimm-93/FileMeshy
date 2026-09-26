@@ -52,9 +52,9 @@ class FoldersService {
   }
 
   async copy(folderId: string, parentId?: string | null): Promise<FolderOut> {
-    const response = await axiosInstance.post<FolderOut>(`${this.basePath}/${folderId}/copy`, {
-      folder_id: parentId ?? null,
-    })
+    // Mismo contrato que files: ausente = misma carpeta, null = raíz, id = esa carpeta
+    const body = parentId === undefined ? {} : { folder_id: parentId }
+    const response = await axiosInstance.post<FolderOut>(`${this.basePath}/${folderId}/copy`, body)
     return response.data
   }
 

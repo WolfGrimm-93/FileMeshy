@@ -23,34 +23,52 @@ interface FileVersionsModalProps {
   onSaved: () => void
 }
 
+/**
+ * Mount-gate: sin target no monta nada, y el interior se remonta por `target.id`,
+ * así cada apertura arranca con el historial vacío y una sola carga.
+ */
 export default function FileVersionsModal({ target, onClose, onSaved }: FileVersionsModalProps) {
+  if (!target) return null
+  return <FileVersionsModalInner key={target.id} target={target} onClose={onClose} onSaved={onSaved} />
+}
+
+interface FileVersionsModalInnerProps {
+  target: FileVersionsTarget
+  onClose: () => void
+  onSaved: () => void
+}
+
+function FileVersionsModalInner({ target, onClose, onSaved }: FileVersionsModalInnerProps) {
   const [versions, setVersions] = useState<FileVersionOut[]>([])
-  const [loading, setLoading] = useState(false)
+  // Arranca en true: el efecto de montaje carga el historial sin setState síncrono
+  const [loading, setLoading] = useState(true)
   const [restoringId, setRestoringId] = useState<string | null>(null)
   const [uploading, setUploading] = useState(false)
   const [uploadProgress, setUploadProgress] = useState(0)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
-  const loadVersions = useCallback(async () => {
-    if (!target) return
-    setLoading(true)
-    try {
-      const data = await filesService.listVersions(target.id)
-      setVersions(data)
-    } catch (error: unknown) {
-      toast.error(extractErrorMessage(error, 'Error al cargar el historial de versiones'))
-    } finally {
-      setLoading(false)
-    }
-  }, [target])
+  // Núcleo del fetch (sin setState síncrono): lo usa el efecto de montaje.
+  const fetchVersions = useCallback(
+    () =>
+      filesService
+        .listVersions(target.id)
+        .then(setVersions)
+        .catch((error: unknown) => {
+          toast.error(extractErrorMessage(error, 'Error al cargar el historial de versiones'))
+        })
+        .finally(() => setLoading(false)),
+    [target.id],
+  )
 
-  // Al abrir (cambio de target): recargar el historial completo -- mismo patrón
-  // target-driven que TagsModal.
+  // Recarga explícita (handlers): vuelve a mostrar el estado de carga.
+  const loadVersions = useCallback(async () => {
+    setLoading(true)
+    await fetchVersions()
+  }, [fetchVersions])
+
   useEffect(() => {
-    if (!target) return
-    setVersions([])
-    loadVersions()
-  }, [target, loadVersions])
+    fetchVersions()
+  }, [fetchVersions])
 
   const handleClose = () => {
     if (uploading || restoringId) return
@@ -64,7 +82,7 @@ export default function FileVersionsModal({ target, onClose, onSaved }: FileVers
   const handleFileSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     e.target.value = ''
-    if (!file || !target) return
+    if (!file) return
 
     setUploading(true)
     setUploadProgress(0)
@@ -82,7 +100,6 @@ export default function FileVersionsModal({ target, onClose, onSaved }: FileVers
   }
 
   const handleRestore = async (version: FileVersionOut) => {
-    if (!target) return
     setRestoringId(version.id)
     try {
       await filesService.restoreVersion(target.id, version.id)
@@ -100,9 +117,9 @@ export default function FileVersionsModal({ target, onClose, onSaved }: FileVers
 
   return (
     <Modal
-      isOpen={!!target}
+      isOpen
       onClose={handleClose}
-      title={target ? `Versiones de "${target.name}"` : 'Versiones'}
+      title={`Versiones de "${target.name}"`}
       size="lg"
       closeOnOverlayClick={!uploading && !restoringId}
       showCloseButton={!uploading && !restoringId}

@@ -73,35 +73,44 @@ export default function PreviewModal({ target, onClose }: PreviewModalProps) {
   const isAudio = !!target && AUDIO_MIME_TYPES.has(target.mimeType)
   const isOffice = !!target && target.mimeType.startsWith(OFFICE_MIME_PREFIX) && !!target.fileId
 
-  const [officePreview, setOfficePreview] = useState<OfficePreviewState>({ status: 'idle' })
+  // Resultado del request de Office atado al fileId que lo produjo. El estado visible se
+  // deriva: mientras el resultado guardado no corresponda al archivo actual, es 'loading'
+  // (sin setState síncrono en el efecto). Fuera de Office queda inerte ('idle').
+  const officeFileId = target?.fileId
+  const [officeResult, setOfficeResult] = useState<
+    { fileId: string; state: { status: 'ready'; url: string } | { status: 'error' } } | null
+  >(null)
+  const officePreview: OfficePreviewState = !isOffice
+    ? { status: 'idle' }
+    : officeResult && officeResult.fileId === officeFileId
+      ? officeResult.state
+      : { status: 'loading' }
 
   useEffect(() => {
-    // No hace falta resetear explícitamente a 'idle' acá: `officePreviewUrl`
-    // y `showOfficeError` (más abajo) ya filtran por `isOffice`, así que un
-    // `officePreview` obsoleto de un archivo de Office anterior queda inerte
-    // en cuanto se abre un target que no es Office.
-    if (!isOffice || !target?.fileId) return
+    if (!isOffice || !officeFileId) return
 
     // Guard para descartar la respuesta si el modal se cerró o el target
     // cambió (usuario abrió otro archivo) antes de que resuelva el request --
     // evita pisar el estado de un preview distinto al que quedó en pantalla.
     let cancelled = false
-    setOfficePreview({ status: 'loading' })
 
-    withTimeout(filesService.getOfficePreviewUrl(target.fileId), OFFICE_PREVIEW_TIMEOUT_MS)
+    withTimeout(filesService.getOfficePreviewUrl(officeFileId), OFFICE_PREVIEW_TIMEOUT_MS)
       .then((url) => {
         if (cancelled) return
-        setOfficePreview({ status: 'ready', url })
+        setOfficeResult({ fileId: officeFileId, state: { status: 'ready', url } })
       })
       .catch(() => {
         if (cancelled) return
-        setOfficePreview({ status: 'error' })
+        setOfficeResult({ fileId: officeFileId, state: { status: 'error' } })
       })
 
     return () => {
       cancelled = true
+      // Al cerrar o cambiar de archivo se descarta el resultado, para que reabrir el
+      // mismo archivo vuelva a mostrar la carga (la URL presignada anterior puede haber vencido).
+      setOfficeResult(null)
     }
-  }, [target?.fileId, isOffice])
+  }, [officeFileId, isOffice])
 
   if (!target) return null
 
@@ -129,7 +138,7 @@ export default function PreviewModal({ target, onClose }: PreviewModalProps) {
     isOffice && (officePreview.status === 'error' || (officePreview.status === 'ready' && !officeReady))
 
   const handleDownload = () => {
-    window.location.href = target.downloadUrl
+    window.location.assign(target.downloadUrl)
   }
 
   return (

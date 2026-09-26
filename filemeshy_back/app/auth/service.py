@@ -13,6 +13,7 @@ la tabla `audit_log` (esa es responsabilidad de audit/service.py, un mecanismo
 distinto), por eso quedan acá y no en `audit`.
 """
 
+import re
 import base64
 import hashlib
 import hmac
@@ -33,10 +34,10 @@ import jwt  # PyJWT (Ronda 10: migrado desde python-jose, sin mantenimiento acti
 from passlib.context import CryptContext
 from sqlalchemy.orm import Session, joinedload
 
-from app.core.cache import cache
+from app.core.cache import cache, invalidate_users_cache
 from app.core.config import settings
 from app.core.database import get_db, tenant_schema_ctx
-from app.core.logging_config import app_logger
+from app.core.logging_config import app_logger, sanitize_for_log
 from app.core.security import (
     create_access_token,
     create_pre_auth_token,
@@ -248,6 +249,9 @@ class AuthService:
         if not user.is_active:
             raise ValueError("Tu cuenta ha sido desactivada. Contacta al administrador")
 
+        # Recorte del UA a la longitud real de la columna (ver SessionModel).
+        user_agent = SessionModel.clip_user_agent(user_agent)
+
         # Si el usuario tiene 2FA habilitado, pausar el login aquí para pedir el TOTP.
         if getattr(user, 'totp_enabled', False):
             pre_auth_token = create_pre_auth_token(user.email)
@@ -260,6 +264,15 @@ class AuthService:
         user.last_login = datetime.now(timezone.utc)
         db.commit()
         db.refresh(user)
+
+        # Invalidar la cache de listados de usuarios (GET /users, TTL de 5 min) --
+        # sin esto, un admin viendo la tabla de Usuarios veía "Último acceso: Nunca"
+        # hasta que la cache expirara sola, aunque el usuario ya se hubiera logueado
+        # (hallazgo de pruebas en navegador, Ronda 12). Solo en los caminos de LOGIN
+        # real (acá y en complete_login_after_2fa) -- NO en refresh_access_token, que
+        # también toca last_login pero corre en cada refresco silencioso de token
+        # (mucho más frecuente): invalidar ahí reventaría la cache constantemente.
+        invalidate_users_cache()
 
         # ✅ INVALIDAR SESIONES ANTERIORES DEL MISMO DISPOSITIVO
         # Permite múltiples sesiones (PC, móvil, tablet) pero una por dispositivo
@@ -334,9 +347,14 @@ class AuthService:
         if not user or not user.is_active:
             raise ValueError("Usuario no encontrado o inactivo")
 
+        user_agent = SessionModel.clip_user_agent(user_agent)
+
         user.last_login = datetime.now(timezone.utc)
         db.commit()
         db.refresh(user)
+
+        # Ver comentario equivalente en login() -- mismo motivo, mismo camino real de login.
+        invalidate_users_cache()
 
         if user_agent:
             db.query(SessionModel).filter(
@@ -784,10 +802,34 @@ def _format_lock_message(seconds: int) -> str:
     """Mensaje legible -- en minutos hasta 1h, en horas de ahí en adelante
     (1440 minutos es peor de leer que "24 horas")."""
     if seconds < 3600:
-        remaining = max(1, seconds // 60)
+        # ceil (no //): redondear a la baja subestimaba el Retry-After hasta 59 s
+        remaining = max(1, -(-seconds // 60))
         return f"Demasiados intentos. Intenta en {remaining} minutos"
-    remaining = max(1, seconds // 3600)
+    remaining = max(1, -(-seconds // 3600))
     return f"Demasiados intentos. Intenta en {remaining} horas"
+
+
+_RETRY_AFTER_RE = re.compile(r"(\d+)\s*(segundos?|minutos?|horas?)", re.IGNORECASE)
+
+
+def retry_after_seconds(message: str, default: int = 60) -> int:
+    """Segundos de espera que dicen los mensajes de RateLimiter ("Intenta en N
+    segundos|minutos|horas") -> para el header `Retry-After` del 429."""
+    m = _RETRY_AFTER_RE.search(message or "")
+    if not m:
+        return default
+    unit = m.group(2).lower()
+    factor = 1 if unit.startswith("seg") else 60 if unit.startswith("min") else 3600
+    return max(1, int(m.group(1)) * factor)
+
+
+def too_many_requests(message: str) -> HTTPException:
+    """429 con `Retry-After` (segundos restantes) derivado del mensaje del limitador."""
+    return HTTPException(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        detail=message,
+        headers={"Retry-After": str(retry_after_seconds(message))},
+    )
 
 
 class RateLimiter:
@@ -830,6 +872,31 @@ class RateLimiter:
             RateLimiter._record_redis(redis, identifier, window_seconds)
         else:
             RateLimiter._record_memory(identifier)
+
+    @staticmethod
+    def open_window(identifier: str, window_seconds: int) -> None:
+        """Abre (si no existe) una ventana con TTL fijo `window_seconds` (SET NX EX). No cuenta
+        nada: solo fija desde CUÁNDO corre el reloj. Se usa en /password-reset/verify para que el
+        `Retry-After` del 429 salga de la MISMA fuente en sesión real y falsa (Ronda 12d)."""
+        redis = RateLimiter._get_redis()
+        if redis:
+            try:
+                redis.set(f"rlwin:{identifier}", "1", nx=True, ex=window_seconds)
+            except Exception as exc:
+                _rl_logger.warning("open_window Redis falló: %s", exc)
+
+    @staticmethod
+    def window_remaining(identifier: str, default: int) -> int:
+        """Segundos restantes de una ventana abierta con `open_window` (`default` si no hay Redis)."""
+        redis = RateLimiter._get_redis()
+        if redis:
+            try:
+                ttl = redis.ttl(f"rlwin:{identifier}")
+                if ttl is not None and int(ttl) > 0:
+                    return int(ttl)
+            except Exception as exc:
+                _rl_logger.warning("window_remaining Redis falló: %s", exc)
+        return default
 
     @staticmethod
     def check_fixed_window(identifier: str, max_requests: int, window_seconds: int) -> Tuple[bool, str]:
@@ -1111,7 +1178,7 @@ class AuditService:
         """
         status_ = "SUCCESS" if user_exists else "NOT_FOUND"
         audit_logger.info(
-            f"PASSWORD_RESET_REQUEST | email={email} | ip={ip_address} | status={status_} | ua={user_agent}"
+            f"PASSWORD_RESET_REQUEST | email={sanitize_for_log(email)} | ip={sanitize_for_log(ip_address, 64)} | status={status_} | ua={sanitize_for_log(user_agent)}"
         )
 
     @staticmethod
@@ -1134,7 +1201,7 @@ class AuditService:
         """
         status_ = "SUCCESS" if success else f"FAILED({reason})"
         audit_logger.info(
-            f"PASSWORD_RESET_VERIFY | email={email} | ip={ip_address} | status={status_} | ua={user_agent}"
+            f"PASSWORD_RESET_VERIFY | email={sanitize_for_log(email)} | ip={sanitize_for_log(ip_address, 64)} | status={sanitize_for_log(status_)} | ua={sanitize_for_log(user_agent)}"
         )
 
     @staticmethod
@@ -1156,8 +1223,8 @@ class AuditService:
             method: Método de cambio
         """
         audit_logger.warning(
-            f"PASSWORD_CHANGED | user_id={user_id} | email={email} | ip={ip_address} | "
-            f"method={method} | ua={user_agent}"
+            f"PASSWORD_CHANGED | user_id={user_id} | email={sanitize_for_log(email)} | ip={sanitize_for_log(ip_address, 64)} | "
+            f"method={sanitize_for_log(method, 50)} | ua={sanitize_for_log(user_agent)}"
         )
 
     @staticmethod
@@ -1179,6 +1246,6 @@ class AuditService:
             user_agent: User agent del navegador
         """
         audit_logger.error(
-            f"SUSPICIOUS_ACTIVITY | email={email} | ip={ip_address} | type={activity_type} | "
-            f"details={details} | ua={user_agent}"
+            f"SUSPICIOUS_ACTIVITY | email={sanitize_for_log(email)} | ip={sanitize_for_log(ip_address, 64)} | type={sanitize_for_log(activity_type, 50)} | "
+            f"details={sanitize_for_log(details, 300)} | ua={sanitize_for_log(user_agent)}"
         )

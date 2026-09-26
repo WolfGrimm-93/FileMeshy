@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from typing import Optional
 from datetime import datetime
+from app.shared.utils.datetime_iso import to_utc_iso
 from app.core.database import get_db
 from app.access_control.service import has_permission
 from app.audit.repository import audit_log
@@ -81,7 +82,7 @@ async def list_audit_logs(
             "ip_address": log.ip_address,
             "endpoint": log.endpoint,
             "method": log.method,
-            "created_at": log.created_at.isoformat() + 'Z' if log.created_at else None,
+            "created_at": to_utc_iso(log.created_at),
         })
 
     response_data = {
@@ -152,7 +153,7 @@ async def get_record_history(
             "ip_address": log.ip_address,
             "endpoint": log.endpoint,
             "method": log.method,
-            "created_at": log.created_at.isoformat() + 'Z' if log.created_at else None,
+            "created_at": to_utc_iso(log.created_at),
         })
 
     response_data = {
@@ -200,7 +201,7 @@ async def get_user_activity(
             "ip_address": log.ip_address,
             "endpoint": log.endpoint,
             "method": log.method,
-            "created_at": log.created_at.isoformat() + 'Z' if log.created_at else None,
+            "created_at": to_utc_iso(log.created_at),
         })
 
     response_data = {

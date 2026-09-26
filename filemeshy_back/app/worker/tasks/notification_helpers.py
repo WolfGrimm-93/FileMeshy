@@ -106,11 +106,13 @@ def _is_duplicate(db: Session, user_id: UUID, notif_type: str, reference_id: UUI
 
 def create_notification(db: Session, user_id: UUID, title: str, message: str,
                          notif_type: str, severity: str, action_url: str = None,
-                         extra_data: dict = None) -> bool:
+                         extra_data: dict = None, send_email: bool = True) -> bool:
     """
     Crea una notificación en BD y despacha email al usuario si tiene
     email_notifications=True en sus preferencias Y el tipo tiene email habilitado.
     Retorna True si se creó, False si el tipo está deshabilitado o hubo error.
+    `send_email=False` (Ronda 12d): no despacha el email de la notificación (el caller manda
+    su propio email y no queremos dos).
 
     Pública (antes `_create_notification`) -- la llaman también módulos
     fuera de `worker/tasks` (ver app/storage_quota/service.py, notificación
@@ -137,7 +139,7 @@ def create_notification(db: Session, user_id: UUID, title: str, message: str,
 
         # Despachar email si el usuario quiere emails Y el tipo tiene email habilitado
         email_for_type = type_settings.get("email", True) if type_settings is not None else True
-        if email_for_type:
+        if email_for_type and send_email:
             try:
                 from app.configuration.repository import crud_user_preferences
                 from app.core.database import tenant_schema_ctx
@@ -154,4 +156,10 @@ def create_notification(db: Session, user_id: UUID, title: str, message: str,
         return True
     except Exception as e:
         logger.error(f"Error creando notificación tipo={notif_type} user={user_id}: {e}")
+        # Ronda 12d: sin rollback la sesión quedaba en estado "pending rollback" y el siguiente
+        # acceso ORM del caller (p. ej. `user.email`) lanzaba PendingRollbackError (500).
+        try:
+            db.rollback()
+        except Exception:
+            pass
         return False

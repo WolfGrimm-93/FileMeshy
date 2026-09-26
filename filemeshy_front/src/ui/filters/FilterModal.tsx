@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { Modal } from '@/ui/modals/Modal'
 import { Button } from '@/ui/buttons/Button'
 import type { FilterGroup, FilterValues } from './types'
@@ -43,10 +43,12 @@ export function FilterModal({
 
   // Re-sincronizar el borrador con el estado real cada vez que se abre --
   // así el modal siempre refleja los filtros ya aplicados, no un borrador viejo.
-  useEffect(() => {
+  // Se ajusta durante el render (con guard del valor previo) en vez de un efecto.
+  const [prevOpen, setPrevOpen] = useState(isOpen)
+  if (isOpen !== prevOpen) {
+    setPrevOpen(isOpen)
     if (isOpen) setDraft(values)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isOpen])
+  }
 
   const handleFieldChange = (key: string, value: unknown) => {
     setDraft((prev) => ({ ...prev, [key]: value }))

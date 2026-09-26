@@ -26,11 +26,51 @@ class UserBase(BaseModel):
     is_active: bool = True
 
 
+AVATAR_MAX_LENGTH = 500  # = longitud de la columna users.avatar
+
+
+def validate_avatar_reference(v: Optional[str]) -> Optional[str]:
+    """Un `avatar` entrante solo puede ser una CLAVE/URL de storage (lo que devuelve
+    POST /users/{id}/avatar), nunca contenido: rechaza data-URIs/base64 (antes
+    superaban VARCHAR(500) -> 500) con un mensaje que indica el endpoint correcto.
+    `None`/"" borra la foto."""
+    if v is None:
+        return None
+    v = v.strip()
+    if v == "":
+        return None
+    if v.lower().startswith("data:") or ";base64," in v[:100].lower():
+        raise ValueError(
+            "El avatar no puede enviarse como data-URI/base64. Subí la imagen con "
+            "POST /api/v1/users/{user_id}/avatar (multipart, campo 'file')."
+        )
+    if len(v) > AVATAR_MAX_LENGTH:
+        raise ValueError(f"El avatar no puede superar {AVATAR_MAX_LENGTH} caracteres (referencia a storage)")
+    if any(ch.isspace() or ord(ch) < 32 for ch in v):
+        raise ValueError("El avatar contiene caracteres no válidos")
+    from app.files.service import is_minio_url
+
+    # Clave de storage, URL de NUESTRO storage o ruta local /static/...
+    if not (is_minio_url(v) or v.startswith("/static/")):
+        raise ValueError("El avatar debe ser una referencia al storage; subí la imagen con POST /api/v1/users/{user_id}/avatar")
+    return v
+
+
 class UserCreate(UserBase):
     """Schema para crear usuarios."""
     password: str
     role_id: Optional[UUID] = None  # Si no se especifica, el CRUD asigna el rol USER por nombre
     turnstile_token: Optional[str] = None  # Solo lo usa POST /auth/register (ver auth/router.py)
+
+    @field_validator("avatar")
+    @classmethod
+    def _no_avatar_on_create(cls, v: Optional[str]) -> Optional[str]:
+        # Ronda 12c: al crear un usuario no puede existir aún un objeto de avatar propio;
+        # aceptar una referencia arbitraria abría un IDOR de storage. Se sube con
+        # POST /api/v1/users/{user_id}/avatar.
+        if v is not None and v.strip() != "":
+            raise ValueError("No se puede fijar el avatar al crear el usuario. Subí la imagen con POST /api/v1/users/{user_id}/avatar (multipart, campo 'file').")
+        return None
 
 
 class UserUpdate(BaseModel):
@@ -44,6 +84,11 @@ class UserUpdate(BaseModel):
     password: Optional[str] = None
     role_id: Optional[UUID] = None
     permissions: Optional[List[str]] = None
+
+    @field_validator("avatar")
+    @classmethod
+    def _check_avatar(cls, v: Optional[str]) -> Optional[str]:
+        return validate_avatar_reference(v)
 
 
 class User(UserBase):

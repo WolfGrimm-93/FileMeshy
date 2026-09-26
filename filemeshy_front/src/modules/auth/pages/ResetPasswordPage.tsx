@@ -24,7 +24,7 @@
  * - reset_token: SOLO en memoria (NO en cookies/localStorage)
  */
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { useNavigate, Link } from 'react-router-dom'
 import { ArrowLeft, CheckCircle2, Mail, Key, Lock } from 'lucide-react'
 import { Button } from '@/ui/buttons/Button'
@@ -87,6 +87,21 @@ export const ResetPassword = () => {
   const [newPassword, setNewPassword] = useState('')
   const [confirmPassword, setConfirmPassword] = useState('')
   
+  // Redirección diferida (expiración / errores de sesión): un único timer cancelable, para que
+  // no redirija si el usuario ya reinició el flujo o salió de la página
+  const redirectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const cancelRedirect = useCallback(() => {
+    if (redirectTimerRef.current) {
+      clearTimeout(redirectTimerRef.current)
+      redirectTimerRef.current = null
+    }
+  }, [])
+  const scheduleRedirect = useCallback((path: string, delayMs: number) => {
+    cancelRedirect()
+    redirectTimerRef.current = setTimeout(() => navigate(path), delayMs)
+  }, [cancelRedirect, navigate])
+  useEffect(() => cancelRedirect, [cancelRedirect])
+
   // Guardar email en localStorage
   useEffect(() => {
     saveEmailToStorage(email)
@@ -116,12 +131,10 @@ export const ResetPassword = () => {
         clearEmailStorage()
         
         // Redirigir a home después de 2 segundos
-        const timeout = setTimeout(() => {
-          navigate('/')
-        }, 2000)
-        
+        scheduleRedirect('/', 2000)
+
         clearInterval(interval)
-        return () => clearTimeout(timeout)
+        return
       }
 
       const minutes = Math.floor(diff / 60000)
@@ -130,12 +143,13 @@ export const ResetPassword = () => {
     }, 1000)
 
     return () => clearInterval(interval)
-  }, [expiresAt, step, navigate])
+  }, [expiresAt, step, scheduleRedirect])
   
   
   // ===== HANDLER PASO 1: Solicitar Código =====
   const handleRequestCode = async (e: React.FormEvent) => {
     e.preventDefault()
+    cancelRedirect()
     setError('')
     setIsLoading(true)
 
@@ -163,6 +177,7 @@ export const ResetPassword = () => {
 
       toast.success('Código enviado. Revisa tu correo electrónico')
       setCode('')  // Limpiar
+      setSessionExpired(false)  // Un código nuevo reactiva el auto-submit
       setStep('code')  // Avanzar a PASO 2
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : 'Error desconocido'
@@ -173,20 +188,21 @@ export const ResetPassword = () => {
   }
 
   // ===== HANDLER PASO 2: Verificar Código =====
-  const handleVerifyCode = async (e: React.FormEvent) => {
-    e.preventDefault()
+  // Verifica el código recibido por parámetro (así el auto-submit desde onChange no
+  // depende del estado `code` aún sin actualizar)
+  const verifyCode = async (codeToVerify: string) => {
     setError('')
     setIsLoading(true)
 
     try {
-      if (!passwordResetService.validateCode(code)) {
+      if (!passwordResetService.validateCode(codeToVerify)) {
         toast.error('El código debe contener exactamente 6 dígitos')
         setIsLoading(false)
         return
       }
 
       // PASO 2: POST /password-reset/verify (reset_token llega por cookie httpOnly)
-      await passwordResetService.verifyCode(code)
+      await passwordResetService.verifyCode(codeToVerify)
 
       toast.success('Código verificado. Establece tu nueva contraseña')
       setCode('')  // Limpiar código de memoria
@@ -230,23 +246,22 @@ export const ResetPassword = () => {
         clearEmailStorage()
         
         // Redirigir a home después de 2 segundos
-        setTimeout(() => {
-          navigate('/')
-        }, 2000)
+        scheduleRedirect('/', 2000)
       } else {
         toast.error(errorMessage)
+        // Limpiar el código: permite reintentar (incluso pegando el mismo valor) con auto-envío
+        setCode('')
       }
     } finally {
       setIsLoading(false)
     }
   }
 
-  // Auto-submit cuando el código tiene exactamente 6 dígitos
-  useEffect(() => {
-    if (step === 'code' && code.length === 6 && !isLoading && !sessionExpired) {
-      handleVerifyCode({ preventDefault: () => {} } as React.FormEvent)
-    }
-  }, [code]) // eslint-disable-line react-hooks/exhaustive-deps
+  // Submit manual del formulario del paso 2
+  const handleVerifyCode = (e: React.FormEvent) => {
+    e.preventDefault()
+    return verifyCode(code)
+  }
 
   // ===== HANDLER PASO 3: Confirmar Contraseña =====
   const handleConfirmPassword = async (e: React.FormEvent) => {
@@ -284,9 +299,7 @@ export const ResetPassword = () => {
       setStep('success')
 
       // Redirigir a login después de 3 segundos
-      setTimeout(() => {
-        navigate('/login')
-      }, 3000)
+      scheduleRedirect('/login', 3000)
     } catch (err) {
       // Extraer código y mensaje del error
       let errorCode = ''
@@ -326,9 +339,7 @@ export const ResetPassword = () => {
         clearEmailStorage()
 
         // Redirigir a home después de 2 segundos
-        setTimeout(() => {
-          navigate('/')
-        }, 2000)
+        scheduleRedirect('/', 2000)
       } else {
         toast.error(errorMessage)
       }
@@ -537,6 +548,10 @@ export const ResetPassword = () => {
                         const value = e.target.value.replace(/\D/g, '').slice(0, 6)
                         setCode(value)
                         setError('')
+                        // Auto-submit al completar los 6 dígitos (solo si el valor cambió)
+                        if (value.length === 6 && value !== code && !isLoading && !sessionExpired) {
+                          void verifyCode(value)
+                        }
                       }}
                       maxLength={6}
                       variant="outlined"
@@ -661,10 +676,10 @@ export const ResetPassword = () => {
                 <form onSubmit={handleConfirmPassword} className="space-y-6">
                   <div className="space-y-4">
                     <div>
-                      <label className="block text-sm font-medium text-foreground/80 mb-2">
+                      <label className="block text-sm font-medium text-foreground/80 mb-2" htmlFor="reset-pwd-1">
                         Nueva contraseña
                       </label>
-                      <PasswordInput
+                      <PasswordInput id="reset-pwd-1"
                         value={newPassword}
                         onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
                           setNewPassword(e.target.value)
@@ -701,10 +716,10 @@ export const ResetPassword = () => {
                     </div>
 
                     <div>
-                      <label className="block text-sm font-medium text-foreground/80 mb-2">
+                      <label className="block text-sm font-medium text-foreground/80 mb-2" htmlFor="reset-pwd-2">
                         Confirmar contraseña
                       </label>
-                      <PasswordInput
+                      <PasswordInput id="reset-pwd-2"
                         value={confirmPassword}
                         onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
                           setConfirmPassword(e.target.value)

@@ -1,4 +1,4 @@
-import { forwardRef, useState, type InputHTMLAttributes } from 'react'
+import { forwardRef, useId, useState, type InputHTMLAttributes } from 'react'
 import { Mail, Eye, EyeOff, Search, Phone, DollarSign, Lock } from 'lucide-react'
 
 export type InputVariant = 'default' | 'filled' | 'outlined' | 'underlined' | 'glass'
@@ -78,7 +78,9 @@ export const Input = forwardRef<HTMLInputElement, InputProps>(
     },
     ref
   ) => {
-    const inputId = id || label?.toLowerCase().replace(/\s+/g, '-')
+    // useId: id único por instancia; derivarlo del label rompía htmlFor con etiquetas repetidas
+    const generatedId = useId()
+    const inputId = id || generatedId
 
     const baseInputClasses =
       'shadow-xs transition-all duration-200 focus:outline-hidden focus:ring-2 focus:ring-offset-0 disabled:cursor-not-allowed disabled:opacity-50 caret-brand-500 dark:caret-brand-400'
@@ -186,7 +188,9 @@ export const PasswordInput = forwardRef<HTMLInputElement, Omit<InputProps, 'type
       ...rest
     } = props
 
-    const inputId = id || 'password'
+    // useId: id único por instancia; derivarlo del label rompía htmlFor con etiquetas repetidas
+    const generatedId = useId()
+    const inputId = id || generatedId
     const borderClasses = error
       ? 'border-red-500 focus:border-red-600'
       : 'border-gray-300 dark:border-gray-700 focus:border-brand-500'

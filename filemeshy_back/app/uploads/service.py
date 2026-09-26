@@ -627,7 +627,7 @@ def complete_upload(db: Session, current_user: User, session_id: UUID, payload: 
             db, session, client, bucket,
             reason=f"Tamaño real ({actual_size}) superó la cuota reservada ({session.quota_reserved_bytes})",
         )
-        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="El tamaño real subido superó el tamaño declarado -- la subida fue rechazada")
+        raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, detail="El tamaño real subido superó el tamaño declarado -- la subida fue rechazada")
 
     if actual_size < session.quota_reserved_bytes:
         # Libera la diferencia -- la cuota debe reflejar uso REAL, no el

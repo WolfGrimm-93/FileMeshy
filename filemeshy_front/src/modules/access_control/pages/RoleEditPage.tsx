@@ -22,8 +22,13 @@ import type { RoleResponse, RoleUpdate, RolePermissions } from '../types/role.ty
 import { useAuth } from '@/modules/auth/hooks/useAuth'
 import RolePermissionsEditor from '../components/RolePermissionsEditor'
 
+// Wrapper: remonta el componente interno al cambiar el id (estado limpio + loading en true)
 export default function RoleEditPage() {
   const { id } = useParams<{ id: string }>()
+  return <RoleEditContent key={id} id={id} />
+}
+
+function RoleEditContent({ id }: { id: string | undefined }) {
   const navigate = useNavigate()
   const { user: authUser } = useAuth()
 
@@ -41,45 +46,43 @@ export default function RoleEditPage() {
   const isSuperAdmin = authUser?.role === 'SUPER_ADMIN'
 
 
-  const loadRole = async () => {
+  useEffect(() => {
     if (!id) return
 
-    try {
-      setIsLoading(true)
-      const data = await rolesService.getById(id)
+    const loadRole = async () => {
+      try {
+        const data = await rolesService.getById(id)
 
-      if (!isSuperAdmin) {
-        toast.error('Solo SUPER_ADMIN puede modificar roles')
+        if (!isSuperAdmin) {
+          toast.error('Solo SUPER_ADMIN puede modificar roles')
+          navigate('/roles')
+          return
+        }
+
+        setRole(data)
+        setDisplayName(data.display_name)
+        setDescription(data.description || '')
+        setIsActive(data.is_active)
+
+        // Los permisos reales viven en role_permissions, no en el JSONB legacy
+        // `data.permissions` (bug real encontrado 2026-08-26: este formulario
+        // cargaba y guardaba contra ese campo muerto -- el editor siempre
+        // arrancaba vacío sin importar los permisos reales del rol, y guardar
+        // acá no tenía ningún efecto).
+        const permData = await permissionsAssignmentService.getForRole(id)
+        setCatalog(permData.catalog)
+        setPermissions(idsToPermissionsDict(permData.assigned_permission_ids, permData.catalog))
+      } catch (error) {
+        console.error('Error al cargar rol:', error)
+        toast.error('Error al cargar el rol')
         navigate('/roles')
-        return
+      } finally {
+        setIsLoading(false)
       }
-
-      setRole(data)
-      setDisplayName(data.display_name)
-      setDescription(data.description || '')
-      setIsActive(data.is_active)
-
-      // Los permisos reales viven en role_permissions, no en el JSONB legacy
-      // `data.permissions` (bug real encontrado 2026-08-26: este formulario
-      // cargaba y guardaba contra ese campo muerto -- el editor siempre
-      // arrancaba vacío sin importar los permisos reales del rol, y guardar
-      // acá no tenía ningún efecto).
-      const permData = await permissionsAssignmentService.getForRole(id)
-      setCatalog(permData.catalog)
-      setPermissions(idsToPermissionsDict(permData.assigned_permission_ids, permData.catalog))
-    } catch (error) {
-      console.error('Error al cargar rol:', error)
-      toast.error('Error al cargar el rol')
-      navigate('/roles')
-    } finally {
-      setIsLoading(false)
     }
-  }
 
-  useEffect(() => {
     loadRole()
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [id])
+  }, [id, isSuperAdmin, navigate])
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()

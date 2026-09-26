@@ -150,10 +150,10 @@ export default function UserEditPage() {
           </h2>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
-              <label className="block text-sm font-medium text-foreground/80 mb-2">
+              <label className="block text-sm font-medium text-foreground/80 mb-2" htmlFor="user-edit-1">
                 Nombre *
               </label>
-              <Input
+              <Input id="user-edit-1"
                 name="first_name"
                 value={formData.first_name}
                 onChange={handleChange}
@@ -163,10 +163,10 @@ export default function UserEditPage() {
             </div>
 
             <div>
-              <label className="block text-sm font-medium text-foreground/80 mb-2">
+              <label className="block text-sm font-medium text-foreground/80 mb-2" htmlFor="user-edit-2">
                 Apellido *
               </label>
-              <Input
+              <Input id="user-edit-2"
                 name="last_name"
                 value={formData.last_name}
                 onChange={handleChange}
@@ -176,10 +176,10 @@ export default function UserEditPage() {
             </div>
 
             <div>
-              <label className="block text-sm font-medium text-foreground/80 mb-2">
+              <label className="block text-sm font-medium text-foreground/80 mb-2" htmlFor="user-edit-3">
                 Email *
               </label>
-              <Input
+              <Input id="user-edit-3"
                 type="email"
                 name="email"
                 value={formData.email}
@@ -190,10 +190,10 @@ export default function UserEditPage() {
             </div>
 
             <div>
-              <label className="block text-sm font-medium text-foreground/80 mb-2">
+              <label className="block text-sm font-medium text-foreground/80 mb-2" htmlFor="user-edit-4">
                 Teléfono
               </label>
-              <Input
+              <Input id="user-edit-4"
                 name="phone"
                 value={formData.phone}
                 onChange={handleChange}
@@ -208,10 +208,10 @@ export default function UserEditPage() {
           <h2 className="text-lg font-semibold text-foreground mb-4">Rol y Permisos</h2>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
-              <label className="block text-sm font-medium text-foreground/80 mb-2">
+              <label className="block text-sm font-medium text-foreground/80 mb-2" htmlFor="user-edit-5">
                 Rol *
               </label>
-              <select
+              <select id="user-edit-5"
                 name="role_id"
                 value={formData.role_id}
                 onChange={handleChange}
@@ -239,10 +239,10 @@ export default function UserEditPage() {
             </div>
 
             <div>
-              <label className="block text-sm font-medium text-foreground/80 mb-2">
+              <label className="block text-sm font-medium text-foreground/80 mb-2" htmlFor="user-edit-6">
                 Estado *
               </label>
-              <select
+              <select id="user-edit-6"
                 name="is_active"
                 value={formData.is_active ? 'true' : 'false'}
                 onChange={(e) => setFormData({ ...formData, is_active: e.target.value === 'true' })}
@@ -274,11 +274,11 @@ export default function UserEditPage() {
           {cambiarPassword && (
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div>
-                <label className="block text-sm font-medium text-foreground/80 mb-2">
+                <label htmlFor="user-edit-7" className="block text-sm font-medium text-foreground/80 mb-2">
                   Nueva Contraseña *
                 </label>
                 <div className="relative">
-                  <Input
+                  <Input id="user-edit-7"
                     type={showPassword ? 'text' : 'password'}
                     name="password"
                     value={formData.password}
@@ -300,11 +300,11 @@ export default function UserEditPage() {
               </div>
 
               <div>
-                <label className="block text-sm font-medium text-foreground/80 mb-2">
+                <label className="block text-sm font-medium text-foreground/80 mb-2" htmlFor="user-edit-8">
                   Confirmar Contraseña *
                 </label>
                 <div className="relative">
-                  <Input
+                  <Input id="user-edit-8"
                     type={showConfirmPassword ? 'text' : 'password'}
                     name="confirmarPassword"
                     value={formData.confirmarPassword}

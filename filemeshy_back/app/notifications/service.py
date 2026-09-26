@@ -40,7 +40,7 @@ class EmailConfigService:
                 'email_from': str
             }
         """
-        from app.core.security import decrypt_sensitive_data
+        from app.core.security import decrypt_secret_tolerant
         from app.configuration import service as configuration_service
 
         config = {
@@ -82,26 +82,12 @@ class EmailConfigService:
         # Contraseña SMTP (desencriptar si está encriptada)
         smtp_password_config = configuration_service.get_system_config(db, 'email_smtp_password')
         if smtp_password_config:
-            try:
-                # Intentar desencriptar
-                if smtp_password_config.is_encrypted:
-                    config['smtp_password'] = decrypt_sensitive_data(smtp_password_config.value_string)
-                else:
-                    config['smtp_password'] = smtp_password_config.value_string
-            except Exception as e:
-                print(f"Error desencriptando contraseña SMTP: {e}")
-                config['smtp_password'] = None
+            # Descifra tolerando valores legados en claro (ver decrypt_secret_tolerant).
+            config['smtp_password'] = decrypt_secret_tolerant(smtp_password_config.value_string)
         else:
             smtp_password_config = configuration_service.get_system_config(db, 'SMTP_PASSWORD')
             if smtp_password_config:
-                try:
-                    if smtp_password_config.is_encrypted:
-                        config['smtp_password'] = decrypt_sensitive_data(smtp_password_config.value_string)
-                    else:
-                        config['smtp_password'] = smtp_password_config.value_string
-                except Exception as e:
-                    print(f"Error desencriptando contraseña SMTP: {e}")
-                    config['smtp_password'] = None
+                config['smtp_password'] = decrypt_secret_tolerant(smtp_password_config.value_string)
 
         # Email from (display email)
         email_from_config = configuration_service.get_system_config(db, 'email_account_email')
@@ -498,6 +484,34 @@ Este es un correo automático, por favor no respondas a este mensaje.
         return EmailService._send_email(
             to_email=email,
             subject=subject,
+            html_content=html_content,
+            text_content=text_content,
+            smtp_config=smtp_config,
+            db=db,
+        )
+
+    @staticmethod
+    def send_password_changed_notice(email: str, name: str = "", business_name: str = "FileMeshy", db: Session = None) -> bool:
+        """Aviso de que la contraseña de la cuenta fue cambiada (sin ningún secreto)."""
+        smtp_config = None
+        if db:
+            try:
+                smtp_config = email_config_service.get_smtp_config(db)
+            except Exception:
+                smtp_config = None
+        greeting = f"Hola {name}," if name else "Hola,"
+        text_content = (
+            f"{greeting}\n\nLa contraseña de tu cuenta de {business_name} fue restablecida. "
+            "Si no fuiste vos, contactá a un administrador de inmediato.\n\n"
+            f"{business_name} - Este es un correo automático, por favor no respondas."
+        )
+        html_content = (
+            f"<p>{greeting}</p><p>La contraseña de tu cuenta de {business_name} fue restablecida.</p>"
+            "<p>Si no fuiste vos, contactá a un administrador de inmediato.</p>"
+        )
+        return EmailService._send_email(
+            to_email=email,
+            subject=f"Tu contraseña fue cambiada - {business_name}",
             html_content=html_content,
             text_content=text_content,
             smtp_config=smtp_config,

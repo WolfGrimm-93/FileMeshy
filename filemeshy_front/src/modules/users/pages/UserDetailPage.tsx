@@ -21,7 +21,7 @@ import { rolesService } from '@/modules/access_control/services/roles.service'
 import { userPermissionOverridesService } from '@/modules/access_control/services/user-permission-overrides.service'
 import type { RoleSummary } from '@/modules/access_control/types/role.types'
 import { useAvailablePermissions } from '@/modules/access_control/hooks/useAvailablePermissions'
-import { formatDateLong, formatDateTime } from '@/shared/utils/dates'
+import { formatDateLong, formatDateTime, isPast } from '@/shared/utils/dates'
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -89,7 +89,8 @@ export default function UserDetailPage() {
 
   // Sesiones
   const [sessions, setSessions] = useState<UserSession[]>([])
-  const [loadingSessions, setLoadingSessions] = useState(false)
+  // Id del usuario cuyas sesiones ya se cargaron: `loading` se deriva (ver más abajo)
+  const [sessionsFor, setSessionsFor] = useState<string | null>(null)
 
   // Rol inline
   const [availableRoles, setAvailableRoles] = useState<RoleSummary[]>([])
@@ -106,7 +107,8 @@ export default function UserDetailPage() {
   // respecto de esa base -- ver handleSavePerms)
   const [roleBaseCodes, setRoleBaseCodes] = useState<Set<string>>(new Set())
   const [permCodeToId, setPermCodeToId] = useState<Map<string, string>>(new Map())
-  const [overridesLoaded, setOverridesLoaded] = useState(false)
+  // Clave (`id:role`) de los overrides ya cargados: `overridesLoaded` se deriva de compararla
+  const [overridesKey, setOverridesKey] = useState<string | null>(null)
   const canManagePerms = authUser?.role === 'SUPER_ADMIN'
 
   const TABS = useMemo(() => [
@@ -133,26 +135,42 @@ export default function UserDetailPage() {
     rolesService.getSummary(true).then(setAvailableRoles).catch(() => {})
   }, [])
 
+  const usuarioId = usuario?.id
+  const usuarioRole = usuario?.role
+  const currentOverridesKey = usuarioId ? `${usuarioId}:${usuarioRole}` : null
+  const overridesLoaded = currentOverridesKey !== null && overridesKey === currentOverridesKey
+
   useEffect(() => {
-    if (!usuario || !canManagePerms || usuario.role === 'SUPER_ADMIN') return
-    setOverridesLoaded(false)
-    userPermissionOverridesService.getForUser(usuario.id)
+    if (!usuarioId || !canManagePerms || usuarioRole === 'SUPER_ADMIN') return
+    let cancelled = false
+    const key = `${usuarioId}:${usuarioRole}`
+    userPermissionOverridesService.getForUser(usuarioId)
       .then(res => {
+        if (cancelled) return
         const byId = new Map(res.catalog.map(p => [p.id, p.permission_code]))
         setRoleBaseCodes(new Set(res.role_permission_ids.map(id => byId.get(id)).filter((c): c is string => !!c)))
         setPermCodeToId(new Map(res.catalog.map(p => [p.permission_code, p.id])))
-        setOverridesLoaded(true)
+        setOverridesKey(key)
       })
       .catch(() => {})
-  }, [usuario?.id, usuario?.role, canManagePerms])
+    return () => { cancelled = true }
+  }, [usuarioId, usuarioRole, canManagePerms])
+
+  // Las sesiones se consideran "cargando" mientras no coincida el usuario cargado con el actual
+  const loadingSessions = activeTab === 'sessions' && !!id && sessionsFor !== id
 
   useEffect(() => {
     if (activeTab !== 'sessions' || !id) return
-    setLoadingSessions(true)
+    let cancelled = false
     userService.getUserSessions(id)
-      .then(r => setSessions(r.items))
+      .then(r => { if (!cancelled) setSessions(r.items) })
       .catch(() => {})
-      .finally(() => setLoadingSessions(false))
+      .finally(() => { if (!cancelled) setSessionsFor(id) })
+    return () => {
+      cancelled = true
+      // Al salir de la pestaña (o cambiar de usuario) se descarta lo cargado: al volver se ve el spinner
+      setSessionsFor(null)
+    }
   }, [activeTab, id])
 
   const handleToggleActive = async () => {
@@ -316,7 +334,7 @@ export default function UserDetailPage() {
 
   const roleName = ROLE_NAMES[usuario.role] ?? usuario.role
   const roleColor = ROLE_COLORS[usuario.role] ?? ROLE_COLORS.USER
-  const activeSessions = sessions.filter(s => s.is_active && new Date(s.expires_at) > new Date()).length
+  const activeSessions = sessions.filter(s => s.is_active && !isPast(s.expires_at)).length
 
   return (
     <div className="pb-16">
@@ -736,12 +754,14 @@ export default function UserDetailPage() {
                 ) : (
                   <div className="space-y-3">
                     {sessions.map(session => {
-                      const isExpired = new Date(session.expires_at) < new Date()
+                      const isExpired = isPast(session.expires_at)
                       const isActive = session.is_active && !isExpired
                       const ua = session.user_agent || ''
                       const isMobile = /Mobile|Android|iPhone/i.test(ua)
                       const browser = ua.match(/Chrome|Safari|Firefox|Edge/)?.[0] ?? 'Navegador'
                       const os = ua.match(/Windows|Mac|Linux|Android|iOS/)?.[0] ?? 'Sistema'
+                      // Preferir el nombre de dispositivo que arma el backend; parseo local como respaldo
+                      const deviceLabel = session.device_name || `${browser} en ${os}`
 
                       return (
                         <div
@@ -764,7 +784,7 @@ export default function UserDetailPage() {
                               </div>
                               <div className="flex-1 min-w-0">
                                 <div className="flex items-center gap-2 mb-1 flex-wrap">
-                                  <p className="text-sm font-medium text-foreground">{browser} en {os}</p>
+                                  <p className="text-sm font-medium text-foreground">{deviceLabel}</p>
                                   {isActive
                                     ? <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300">
                                         <CheckCircle className="w-3 h-3" /> Activa

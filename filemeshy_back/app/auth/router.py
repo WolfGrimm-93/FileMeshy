@@ -1,10 +1,11 @@
 import re
-from fastapi import APIRouter, Depends, HTTPException, status, Request, Query
+from uuid import UUID
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status, Request, Query
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.config import settings
-from app.core.logging_config import app_logger
+from app.core.logging_config import app_logger, sanitize_for_log
 from app.users.schemas import (
     UserCreate,
     LoginRequest,
@@ -30,7 +31,7 @@ from app.users.service import user_service
 from app.auth.repository import CRUDPasswordResetSession
 from app.auth.service import AuthService
 from app.notifications.service import EmailService
-from app.auth.service import RateLimiter
+from app.auth.service import RateLimiter, too_many_requests
 from app.auth.service import AuditService
 from app.auth.service import CodeHashService
 from app.auth.service import JWTResetService
@@ -170,7 +171,13 @@ def _close_session_cookie(db: Session, request: Request, response: Response, coo
 
 
 from app.audit.service import log_audit
-from app.core.security import decode_token, encrypt_totp_secret, decrypt_totp_secret
+from app.core.security import decode_token, encrypt_totp_secret, decrypt_totp_secret, decrypt_secret_tolerant
+
+
+def _turnstile_secret_from_config(secret_cfg) -> str:
+    """Secret key de Turnstile lista para usar: se guarda CIFRADA (Fernet); se
+    tolera un valor legado en claro. Vacío si no hay fila/valor."""
+    return (decrypt_secret_tolerant(secret_cfg.value_string) or "") if secret_cfg else ""
 from app.auth.service import TOTPService
 from app.configuration.service import get_system_config
 import httpx
@@ -264,7 +271,7 @@ async def register(
         rl_key_ip, max_attempts=8, lock_duration=3600
     )
     if not is_allowed_ip:
-        raise HTTPException(status_code=429, detail=rl_message_ip)
+        raise too_many_requests(rl_message_ip)
     RateLimiter.record_attempt(rl_key_ip)
 
     # Validar Turnstile si está habilitado y la petición viene de IP pública
@@ -278,7 +285,7 @@ async def register(
                     detail="Se requiere verificación CAPTCHA para acceso externo",
                 )
             secret_cfg = get_system_config(db, "turnstile_secret_key")
-            secret_key = secret_cfg.value_string if secret_cfg else ""
+            secret_key = _turnstile_secret_from_config(secret_cfg)
             if not secret_key:
                 app_logger.error("Turnstile habilitado pero sin secret_key configurada")
                 raise HTTPException(
@@ -354,7 +361,7 @@ async def login(
                     detail="Se requiere verificación CAPTCHA para acceso externo",
                 )
             secret_cfg = get_system_config(db, "turnstile_secret_key")
-            secret_key = secret_cfg.value_string if secret_cfg else ""
+            secret_key = _turnstile_secret_from_config(secret_cfg)
             if not secret_key:
                 app_logger.error("Turnstile habilitado pero sin secret_key configurada")
                 raise HTTPException(
@@ -376,7 +383,7 @@ async def login(
     rl_key = f"login:{ip_address}:{login_request.email}"
     is_allowed, rl_message = RateLimiter.check_rate_limit(rl_key, progressive=True)
     if not is_allowed:
-        raise HTTPException(status_code=429, detail=rl_message)
+        raise too_many_requests(rl_message)
 
     # Rate limiting adicional SOLO por email, sin importar la IP de origen --
     # el límite de arriba (ip+email) es evadible rotando IP (proxies, VPN,
@@ -387,7 +394,7 @@ async def login(
         rl_key_email_only, max_attempts=20, lock_duration=3600, progressive=True
     )
     if not is_allowed_email:
-        raise HTTPException(status_code=429, detail=rl_message_email)
+        raise too_many_requests(rl_message_email)
 
     try:
         user_agent = request.headers.get("user-agent")
@@ -665,6 +672,7 @@ def request_password_reset(
     request_data: PasswordResetRequest,
     request: Request,
     response: Response,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db)
 ):
     """
@@ -677,7 +685,7 @@ def request_password_reset(
     4. Cookie session_id opaco (UUID) para identificar sesión
     5. Rate limiting y auditoría completa
     """
-    ip_address = request.client.host if request.client else None
+    ip_address = _get_real_ip(request)  # IP real detrás de proxies de confianza (no la del proxy)
     user_agent = request.headers.get("user-agent", "unknown")
 
     # Rate limiting por IP y por email -- mismo patrón que /login. Sin esto,
@@ -696,10 +704,10 @@ def request_password_reset(
         rl_key_ip, max_attempts=20, lock_duration=3600
     )
     if not is_allowed_ip:
-        raise HTTPException(status_code=429, detail=rl_message_ip)
+        raise too_many_requests(rl_message_ip)
     is_allowed_email, rl_message_email = RateLimiter.check_rate_limit(rl_key_email)
     if not is_allowed_email:
-        raise HTTPException(status_code=429, detail=rl_message_email)
+        raise too_many_requests(rl_message_email)
     RateLimiter.record_attempt(rl_key_ip)
     RateLimiter.record_attempt(rl_key_email)
 
@@ -715,29 +723,32 @@ def request_password_reset(
         user_exists=user_exists
     )
 
-    # Respuesta idéntica si usuario no existe (seguridad)
-    if not user:
-        return SuccessResponse(
-            message="Si el correo existe en nuestro sistema, recibirás un código de verificación",
-            data={"expires_in_minutes": 15}
-        )
-
-    # Generar código aleatorio (6 dígitos)
+    # Ronda 12c (ALTO-2): la respuesta es IDÉNTICA exista o no el usuario: mismo
+    # status, cuerpo y cookie `filemeshy_password_reset_session` (para un email
+    # inexistente se setea un session_id falso con el mismo formato y atributos), y
+    # el mismo trabajo costoso (hash del código). El envío del email sale del camino
+    # de la respuesta (BackgroundTasks) para que el tiempo tampoco delate nada.
     code = CodeHashService.generate_code()
 
-    # Crear sesión de reset (guarda HASH del código, no el plano)
-    reset_session = CRUDPasswordResetSession.create_session(
-        db=db,
-        user_id=user.id,
-        email=user.email,
-        code=code,
-        expires_in_minutes=15
-    )
+    if user:
+        # Crear sesión de reset (guarda HASH del código, no el plano)
+        reset_session = CRUDPasswordResetSession.create_session(
+            db=db,
+            user_id=user.id,
+            email=user.email,
+            code=code,
+            expires_in_minutes=15
+        )
+        cookie_session_id = reset_session.session_id
+        background_tasks.add_task(_send_reset_code_email, user.email, code)
+    else:
+        CodeHashService.hash_code(code)  # mismo costo de CPU que el camino real
+        cookie_session_id = CodeHashService.generate_session_id()  # falso, mismo formato
 
     # ✅ SEGURIDAD: Cookie con session_id opaco (no el código)
     response.set_cookie(
         key="filemeshy_password_reset_session",
-        value=reset_session.session_id,
+        value=cookie_session_id,
         max_age=15 * 60,  # 15 minutos
         httponly=True,
         secure=settings.COOKIE_SECURE,
@@ -745,25 +756,32 @@ def request_password_reset(
         path="/api/v1/auth/password-reset"
     )
 
-    # Enviar código por email
-    email_sent = EmailService.send_password_reset_code(
-        email=user.email,
-        code=code,
-        business_name="FileMeshy",
-        db=db
-    )
-
-    if email_sent:
-        app_logger.info(f"[EMAIL] Código enviado a {user.email}")
-    else:
-        # En desarrollo, mostrar SOLO en logs (no en respuesta)
-        app_logger.debug(f"[DEV] Código para {user.email}: {code}")
-
     # Respuesta: NUNCA incluir el código
     return SuccessResponse(
         message="Si el correo existe en nuestro sistema, recibirás un código de verificación",
         data={"expires_in_minutes": 15}
     )
+
+
+def _send_reset_code_email(email: str, code: str) -> None:
+    """Envío del código FUERA del ciclo de la request (BackgroundTasks): con su
+    propia sesión de BD (la de la request ya se cerró) y sin propagar errores."""
+    from app.core.database import SessionLocal
+
+    db = SessionLocal()
+    try:
+        email_sent = EmailService.send_password_reset_code(
+            email=email, code=code, business_name="FileMeshy", db=db
+        )
+        if email_sent:
+            app_logger.info(f"[EMAIL] Código enviado a {sanitize_for_log(email)}")
+        else:
+            # En desarrollo, mostrar SOLO en logs (no en respuesta)
+            app_logger.debug(f"[DEV] Código para {sanitize_for_log(email)}: {code}")
+    except Exception:
+        app_logger.exception("[EMAIL] Falló el envío del código de reset")
+    finally:
+        db.close()
 
 
 @router.post("/password-reset/verify", response_model=SuccessResponse)
@@ -783,7 +801,7 @@ def verify_password_reset_code(
     4. Genera JWT reset_token (TTL 5 min, scope password_reset)
     5. Session_id se invalida después (uso único)
     """
-    ip_address = request.client.host if request.client else None
+    ip_address = _get_real_ip(request)  # IP real detrás de proxies de confianza (no la del proxy)
     user_agent = request.headers.get("user-agent", "unknown")
 
     # Obtener session_id de cookie
@@ -795,30 +813,42 @@ def verify_password_reset_code(
             detail=PasswordResetErrorCode.SESSION_NOT_FOUND
         )
 
+    # Retry-After uniforme (Ronda 12d): ambos caminos (sesión real y falsa) lo calculan como los
+    # segundos restantes de la MISMA ventana de 15 min, abierta en el primer intento de /verify
+    # de ese session_id. Antes: real = expires_at - now (≈ 896) y falsa = "900" fijo -> distinguible.
+    verify_window_key = f"pr_verify_win:{session_id}"
+    RateLimiter.open_window(verify_window_key, 900)
+
+    # Tope por IP real en /verify (defensa adicional al tope por sesión): evita que una
+    # misma IP encadene sesiones nuevas para seguir probando códigos.
+    rl_key_ip = f"password-reset-verify:ip:{ip_address}"
+    is_allowed_ip, rl_message_ip = RateLimiter.check_rate_limit(rl_key_ip, max_attempts=100, lock_duration=900)
+    if not is_allowed_ip:
+        raise too_many_requests(rl_message_ip)
+    RateLimiter.record_attempt(rl_key_ip, window_seconds=900)
+
     # Obtener sesión
     reset_session = CRUDPasswordResetSession.get_by_session_id(db, session_id)
 
     if not reset_session:
+        # Ronda 12c (ALTO-2): una cookie con session_id inexistente (p. ej. la falsa que
+        # /request setea para emails que no existen) responde EXACTAMENTE igual que un
+        # código incorrecto de una sesión real: 400 INVALID_CODE, y a los 5 intentos el
+        # mismo 429 -- el contador de las falsas vive en Redis (ventana fija de 15 min).
+        allowed, _msg = RateLimiter.check_fixed_window(f"pr_fake_session:{session_id}", max_requests=5, window_seconds=900)
+        if not allowed:
+            raise HTTPException(
+                status_code=429,
+                detail=PasswordResetErrorCode.MAX_ATTEMPTS_EXCEEDED,
+                headers={"Retry-After": str(RateLimiter.window_remaining(verify_window_key, 900))},
+            )
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=PasswordResetErrorCode.SESSION_EXPIRED
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=PasswordResetErrorCode.INVALID_CODE
         )
 
-    # ===== RATE LIMITING: 5 intentos máximo =====
-    if reset_session.code_attempts >= 5:
-        AuditService.log_suspicious_activity(
-            email=reset_session.email,
-            ip_address=ip_address,
-            activity_type="max_attempts_exceeded",
-            details="5 intentos fallidos en /verify",
-            user_agent=user_agent
-        )
-        raise HTTPException(
-            status_code=429,
-            detail=PasswordResetErrorCode.MAX_ATTEMPTS_EXCEEDED
-        )
-
-    # Validar código contra hash
+    # Validar código contra hash. `verify_code` CONSUME el intento con un UPDATE
+    # atómico (ALTO-1): el tope de 5 no se puede superar con requests concurrentes.
     is_valid, message = CRUDPasswordResetSession.verify_code(
         db=db,
         session_id=session_id,
@@ -827,6 +857,7 @@ def verify_password_reset_code(
     )
 
     if not is_valid:
+        db.refresh(reset_session)
         AuditService.log_password_reset_attempt(
             email=reset_session.email,
             ip_address=ip_address,
@@ -834,6 +865,20 @@ def verify_password_reset_code(
             reason=message,
             user_agent=user_agent
         )
+        if "Máximo de intentos" in message:
+            AuditService.log_suspicious_activity(
+                email=reset_session.email,
+                ip_address=ip_address,
+                activity_type="max_attempts_exceeded",
+                details="5 intentos fallidos en /verify",
+                user_agent=user_agent
+            )
+            remaining = RateLimiter.window_remaining(verify_window_key, 900)
+            raise HTTPException(
+                status_code=429,
+                detail=PasswordResetErrorCode.MAX_ATTEMPTS_EXCEEDED,
+                headers={"Retry-After": str(remaining)},
+            )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=PasswordResetErrorCode.INVALID_CODE
@@ -872,11 +917,64 @@ def verify_password_reset_code(
     )
 
 
+def _should_notify_password_change(db: Session) -> bool:
+    """`notify_on_password_change` de la política de seguridad activa (True si no
+    hay política configurada o si la lectura falla)."""
+    try:
+        from app.configuration.repository import security_policies as crud_security_policies
+
+        policy = crud_security_policies.get_active(db)
+        return True if policy is None else bool(policy.notify_on_password_change)
+    except Exception:
+        return True
+
+
+def _notify_password_changed(db: Session, user_id, email: str, name: str, background_tasks: BackgroundTasks) -> None:
+    """Notificación in-app (best-effort) y email en background al cambiar la contraseña
+    por reset. El texto no lleva secretos."""
+    try:
+        from app.notifications.routes import ACTION_URL_PREFERENCES
+        from app.worker.tasks.notification_helpers import create_notification
+
+        create_notification(
+            db=db,
+            user_id=user_id,
+            title="Tu contraseña fue cambiada",
+            message="La contraseña de tu cuenta se restableció. Si no fuiste vos, contactá a un administrador de inmediato.",
+            notif_type="seguridad",
+            severity="warning",
+            action_url=ACTION_URL_PREFERENCES,
+            extra_data={"reason": "password_reset"},
+            send_email=False,  # un solo email: el aviso dedicado de abajo
+        )
+    except Exception:
+        app_logger.warning("No se pudo crear la notificación de cambio de contraseña", exc_info=True)
+        try:
+            db.rollback()  # la contraseña ya está commiteada: esto solo limpia la sesión
+        except Exception:
+            pass
+    background_tasks.add_task(_send_password_changed_email, email, name)
+
+
+def _send_password_changed_email(email: str, name: str) -> None:
+    """Email de aviso (si SMTP está configurado) con sesión de BD propia, fuera de la request."""
+    from app.core.database import SessionLocal
+
+    db = SessionLocal()
+    try:
+        EmailService.send_password_changed_notice(email=email, name=name or "", db=db)
+    except Exception:
+        app_logger.warning("No se pudo enviar el email de cambio de contraseña", exc_info=True)
+    finally:
+        db.close()
+
+
 @router.post("/password-reset/confirm", response_model=SuccessResponse)
 def confirm_password_reset(
     confirm_data: PasswordResetConfirm,
     request: Request,
     response: Response,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db)
 ):
     """
@@ -889,7 +987,7 @@ def confirm_password_reset(
     4. Invalida reset_token (uso único)
     5. Invalida todas las sesiones activas del usuario
     """
-    ip_address = request.client.host if request.client else None
+    ip_address = _get_real_ip(request)  # IP real detrás de proxies de confianza (no la del proxy)
     user_agent = request.headers.get("user-agent", "unknown")
 
     # Obtener reset_token: primero desde cookie httpOnly, fallback al body (legacy)
@@ -918,12 +1016,28 @@ def confirm_password_reset(
         )
 
     # Extraer datos del token
-    user_id = int(token_payload.get("sub"))  # JWT subject is a string, convert to int
+    # El `sub` es el UUID del usuario como string (ver JWTResetService). Antes se
+    # hacía int(...) y CADA confirmación reventaba con 500. Un `sub` malformado
+    # es un token inválido (401), nunca un 500.
+    try:
+        user_id = UUID(str(token_payload.get("sub")))
+    except (ValueError, TypeError, AttributeError):
+        AuditService.log_suspicious_activity(
+            email="unknown",
+            ip_address=ip_address,
+            activity_type="invalid_reset_token",
+            details="Token con subject malformado",
+            user_agent=user_agent
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=PasswordResetErrorCode.INVALID_TOKEN
+        )
     session_id = token_payload.get("session_id")
     email = token_payload.get("email")
 
-    # Obtener usuario
-    user = user_service.get(db, id=user_id)
+    # Obtener usuario (UserService.get recibe `user_id`, no `id`)
+    user = user_service.get(db, user_id=user_id)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -943,6 +1057,25 @@ def confirm_password_reset(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=PasswordResetErrorCode.TOKEN_ALREADY_USED
+        )
+
+    # La sesión tiene que ser del MISMO usuario del token, con el código ya
+    # verificado y sin expirar (el JWT solo prueba que /verify lo emitió).
+    if (
+        reset_session.user_id != user.id
+        or not reset_session.code_verified
+        or reset_session.is_expired()
+    ):
+        AuditService.log_suspicious_activity(
+            email=email,
+            ip_address=ip_address,
+            activity_type="invalid_reset_session",
+            details="Sesión de reset inconsistente, sin código verificado o expirada",
+            user_agent=user_agent
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=PasswordResetErrorCode.INVALID_TOKEN
         )
 
     # Validar nueva contraseña
@@ -974,6 +1107,21 @@ def confirm_password_reset(
     # ✅ Cambiar contraseña
     from app.core.security import get_password_hash
 
+    # Datos del usuario leídos ANTES de operar (Ronda 12d): tras el commit el objeto queda expirado
+    # y, si algo falla después, un acceso ORM lanzaría PendingRollbackError con la contraseña ya cambiada.
+    user_id_value, user_email_value, user_name_value = user.id, user.email, user.first_name
+
+    # Ronda 12c (MEDIO-3): reclamar el uso ÚNICO con un UPDATE condicional atómico
+    # ANTES de tocar nada más. Un /confirm concurrente con el mismo token espera el
+    # lock de fila y después ve is_used=true (0 filas) -> 400. De paso invalida TODAS
+    # las demás sesiones de reset pendientes del usuario.
+    if not CRUDPasswordResetSession.claim_for_confirm(db, session_id, user.id):
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=PasswordResetErrorCode.TOKEN_ALREADY_USED
+        )
+
     # Agregar contraseña actual al historial
     user.password_history = password_validator.add_to_history(
         current_hash=user.hashed_password,
@@ -983,11 +1131,19 @@ def confirm_password_reset(
     # Cambiar a nueva contraseña
     user.hashed_password = get_password_hash(confirm_data.new_password)
 
-    # Marcar sesión como usada (uso único)
-    CRUDPasswordResetSession.mark_used(db, session_id)
-
-    # Revocar todas las sesiones activas del usuario (forzar re-login)
+    # Revocar todas las sesiones activas del usuario (forzar re-login). Se recolectan
+    # antes los JTI de access token: `_is_session_jti_active` cachea True 30 s, así que
+    # hay que invalidar cada entrada o el access token viejo seguiría válido ese rato
+    # (MEDIO-2).
     from app.auth.models import Session as SessionModel
+    from app.auth.service import invalidate_session_active_cache
+
+    active_jtis = [
+        row[0] for row in db.query(SessionModel.access_token_jti).filter(
+            SessionModel.user_id == user.id,
+            SessionModel.is_active == True
+        ).all()
+    ]
     db.query(SessionModel).filter(
         SessionModel.user_id == user.id,
         SessionModel.is_active == True
@@ -995,10 +1151,18 @@ def confirm_password_reset(
 
     db.commit()
 
+    for jti in active_jtis:
+        invalidate_session_active_cache(jti)
+
+    # Aviso al dueño (MEDIO-5): notificación en la app + email, sin bloquear la request
+    # ni incluir ningún secreto. Respeta `notify_on_password_change` de la política activa.
+    if _should_notify_password_change(db):
+        _notify_password_changed(db, user_id_value, user_email_value, user_name_value, background_tasks)
+
     # ✅ Auditoría: Contraseña cambiada exitosamente
     AuditService.log_password_changed(
-        user_id=user.id,
-        email=user.email,
+        user_id=user_id_value,
+        email=user_email_value,
         ip_address=ip_address,
         user_agent=user_agent,
         method="reset"
@@ -1171,7 +1335,7 @@ def verify_2fa_login(
     Completa el login verificando el código TOTP.
     Recibe el pre_auth_token del paso anterior y retorna los tokens completos.
     """
-    ip_address = request.client.host if request.client else "unknown"
+    ip_address = _get_real_ip(request) or "unknown"
 
     # Validar pre_auth_token PRIMERO -- necesitamos su `jti` (único por sesión
     # de pre-autenticación, generado en /login) para poder armar una clave de
@@ -1197,7 +1361,7 @@ def verify_2fa_login(
     rl_key = f"totp:{jti}" if jti else f"totp:{ip_address}:{body.pre_auth_token}"
     is_allowed, rl_message = RateLimiter.check_rate_limit(rl_key)
     if not is_allowed:
-        raise HTTPException(status_code=429, detail=rl_message)
+        raise too_many_requests(rl_message)
 
     # Pre_auth_token de un solo uso — verificar que el JTI no haya sido consumido
     if jti:

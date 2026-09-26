@@ -55,8 +55,12 @@ export default function PublicSharePage() {
   const path = searchParams.get('path')
 
   const [data, setData] = useState<PublicShareResponse | null>(null)
-  const [loading, setLoading] = useState(true)
-  const [notFound, setNotFound] = useState(false)
+  // Resultado del último intento de carga, atado a la clave (token+path) que lo produjo:
+  // `loading` y `notFound` se derivan de él, sin setState síncrono dentro de efectos.
+  const [outcome, setOutcome] = useState<{ key: string; failed: boolean } | null>(null)
+  const requestKey = `${token ?? ''}|${path ?? ''}`
+  const loading = !!token && outcome?.key !== requestKey
+  const notFound = !token || (outcome?.key === requestKey && outcome.failed)
   const [previewTarget, setPreviewTarget] = useState<PreviewTarget | null>(null)
 
   // Contraseña del link (si aplica) -- ref (no state) para no forzar un
@@ -109,22 +113,16 @@ export default function PublicSharePage() {
     [token, path, applyResponse]
   )
 
-  const load = useCallback(async () => {
-    if (!token) {
-      setNotFound(true)
-      setLoading(false)
-      return
-    }
-    setLoading(true)
-    setNotFound(false)
-    const outcome = await attemptFetch(verifiedPasswordRef.current)
-    if (outcome === 'error') setNotFound(true)
-    setLoading(false)
-  }, [token, attemptFetch])
-
   useEffect(() => {
-    load()
-  }, [load])
+    if (!token) return
+    let cancelled = false
+    attemptFetch(verifiedPasswordRef.current).then((result) => {
+      if (!cancelled) setOutcome({ key: requestKey, failed: result === 'error' })
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [token, requestKey, attemptFetch])
 
   const handleNavigate = (folderId: string | null) => {
     if (folderId) setSearchParams({ path: folderId })
@@ -156,7 +154,7 @@ export default function PublicSharePage() {
       if (previewable) {
         setPreviewTarget({ name: file.name, mimeType: file.mime_type, downloadUrl: url })
       } else {
-        window.location.href = url
+        window.location.assign(url)
       }
     } catch (error: unknown) {
       toast.error(extractErrorMessage(error, 'Error al abrir el archivo'))
@@ -244,7 +242,7 @@ export default function PublicSharePage() {
                       password: verifiedPasswordRef.current,
                     })
                     if (forced.type === 'file') {
-                      window.location.href = forced.download_url
+                      window.location.assign(forced.download_url)
                     }
                   } catch (error: unknown) {
                     toast.error(extractErrorMessage(error, 'No se pudo descargar el archivo'))

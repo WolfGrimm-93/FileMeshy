@@ -2,9 +2,23 @@
 
 import logging
 import logging.handlers
+import re
 from pathlib import Path
 
 from app.core.config import settings
+
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+
+
+def sanitize_for_log(value, max_len: int = 200) -> str:
+    """Helper único para interpolar en logs valores controlados por el cliente
+    (User-Agent, email, IP reenviada...): reemplaza caracteres de control (CR/LF
+    incluidos, evita inyección de líneas falsas en el log) por un espacio y
+    trunca a `max_len` (con "..." si se cortó)."""
+    text = "" if value is None else str(value)
+    text = _CONTROL_CHARS.sub(" ", text)
+    return text if len(text) <= max_len else text[:max_len] + "..."
+
 
 # Crear directorio de logs si no existe
 LOG_DIR = Path("logs")

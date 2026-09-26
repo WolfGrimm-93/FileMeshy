@@ -29,12 +29,22 @@ export default function SwitchUserModal({ isOpen, onClose }: SwitchUserModalProp
   const [error, setError] = useState('')
   const emailInputRef = useRef<HTMLInputElement>(null)
 
+  // Ajuste de estado durante el render: al pasar a abierto se limpia el formulario
+  const [prevOpen, setPrevOpen] = useState(isOpen)
+  if (isOpen !== prevOpen) {
+    setPrevOpen(isOpen)
+    if (isOpen) {
+      setEmail('')
+      setPassword('')
+      setError('')
+    }
+  }
+
+  // Foco en el email al abrir
   useEffect(() => {
     if (!isOpen) return
-    setEmail('')
-    setPassword('')
-    setError('')
-    setTimeout(() => emailInputRef.current?.focus(), 50)
+    const timer = setTimeout(() => emailInputRef.current?.focus(), 50)
+    return () => clearTimeout(timer)
   }, [isOpen])
 
   if (!isOpen) return null
@@ -86,8 +96,8 @@ export default function SwitchUserModal({ isOpen, onClose }: SwitchUserModalProp
         </div>
         <form onSubmit={handleSubmit} className="p-5 flex flex-col gap-3">
           <div>
-            <label className="text-xs text-muted-foreground mb-1 block">Correo</label>
-            <EmailInput
+            <label className="text-xs text-muted-foreground mb-1 block" htmlFor="switch-user-1">Correo</label>
+            <EmailInput id="switch-user-1"
               ref={emailInputRef}
               value={email}
               onChange={e => { setEmail(e.target.value); setError('') }}
@@ -97,8 +107,8 @@ export default function SwitchUserModal({ isOpen, onClose }: SwitchUserModalProp
             />
           </div>
           <div>
-            <label className="text-xs text-muted-foreground mb-1 block">Contraseña</label>
-            <PasswordInput
+            <label className="text-xs text-muted-foreground mb-1 block" htmlFor="switch-user-2">Contraseña</label>
+            <PasswordInput id="switch-user-2"
               value={password}
               onChange={e => { setPassword(e.target.value); setError('') }}
               variant="outlined"

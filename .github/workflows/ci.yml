@@ -33,12 +33,40 @@ jobs:
       - name: ruff check (config en filemeshy_back/ruff.toml)
         run: ruff check filemeshy_back
 
-  # TODO: tests de backend (pytest) NO están en CI todavía: necesitan
-  # postgres, redis, minio y clamav reales. Propuesta: job que haga
-  # `docker compose up -d --wait` (los healthchecks del compose ya permiten
-  # esperar) y luego `docker compose exec backend pytest`; ClamAV tarda
-  # varios minutos la primera vez, cachear el volumen clamav_data o usar un
-  # clamd de prueba.
+  # Tests de backend contra el stack real del compose (postgres, redis,
+  # minio, clamav). NO VERIFICADO EN RUNNER: se escribió sin poder ejecutarlo,
+  # por eso `continue-on-error: true`. Quitarlo tras la primera corrida verde.
+  # Esperado: ~311 passed (Ronda 12; el número crece con cada ronda, no es un umbral) y 8 skipped (tests cloud-only, es normal).
+  # Los tests usan la BD viva del stack y crean datos pytest_*; en CI el stack
+  # es efímero, no importa. El primer arranque descarga firmas de ClamAV
+  # (hasta ~15 min), de ahí el timeout generoso.
+  backend-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Levantar el stack (build + esperar healthchecks)
+        run: docker compose up -d --build --wait --wait-timeout 1500
+      # El filesystem del contenedor backend es read-only: las dependencias de
+      # test se instalan con --target en /tmp (tmpfs).
+      - name: Instalar dependencias de test
+        run: docker compose exec -T backend sh -c 'pip install --target /tmp/pydeps -r requirements-dev.txt'
+      - name: pytest
+        run: docker compose exec -T -e PYTHONPATH=/tmp/pydeps backend python -m pytest tests -q -p no:cacheprovider
+      - name: Logs del stack (si falla)
+        if: failure()
+        run: docker compose logs --no-color > compose-logs.txt
+      - name: Publicar logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-logs
+          path: compose-logs.txt
+      # Solo en el runner de CI (efímero), nunca en local.
+      - name: Bajar el stack
+        if: always()
+        run: docker compose down -v
 
   frontend:
     runs-on: ubuntu-latest
@@ -57,17 +85,11 @@ jobs:
           cache: pnpm
           cache-dependency-path: filemeshy_front/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
-      # continue-on-error MIENTRAS el baseline de eslint no esté limpio (hay
-      # errores mecánicos en curso de corrección). QUITARLO cuando `eslint .`
-      # pase limpio, para que sea bloqueante.
+      # Baseline limpio (0 errores/0 warnings): bloqueante para frenar regresiones.
       - name: eslint
         run: pnpm exec eslint .
-        continue-on-error: true
-      # Estado de `tsc -b` incierto (el build de prod lo saltea a propósito).
-      # No bloqueante hasta medir el baseline; después quitar continue-on-error.
       - name: type-check (tsc -b)
         run: pnpm exec tsc -b
-        continue-on-error: true
       - name: tests
         run: pnpm test
       - name: build de producción
@@ -82,12 +104,13 @@ jobs:
       - name: docker compose build
         run: docker compose build
 
-  # SCA: dependencias con vulnerabilidades conocidas. continue-on-error porque
-  # hoy hay hallazgos conocidos (pillow, pypdf, python-multipart, starlette,
-  # react-router, etc.). Quitarlo cuando se actualicen.
+  # SCA: baseline en 0 vulnerabilidades, todo bloqueante.
+  # Limitación: el backend se audita con --no-deps --disable-pip (es lo que se
+  # midió localmente: 0 hallazgos); las dependencias transitivas del backend
+  # no están cubiertas. Pendiente: auditar con resolución completa cuando se
+  # verifique en un runner con Python 3.11.
   sca:
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -96,12 +119,15 @@ jobs:
       - name: Instalar pip-audit
         run: pip install pip-audit
       - name: pip-audit backend
-        run: pip-audit -r filemeshy_back/requirements.txt
+        run: pip-audit --no-deps --disable-pip -r filemeshy_back/requirements.txt
       - name: pip-audit office_converter
         run: pip-audit -r filemeshy_office_converter/requirements.txt
       - uses: pnpm/action-setup@v4
         with:
           package_json_file: filemeshy_front/package.json
-      - name: pnpm audit (solo prod)
+      - name: pnpm audit (prod)
         working-directory: filemeshy_front
         run: pnpm audit --prod
+      - name: pnpm audit (completo)
+        working-directory: filemeshy_front
+        run: pnpm audit

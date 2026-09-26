@@ -168,7 +168,11 @@ async def create_role(
     """
     Crear nuevo rol
 
-    Solo SUPER_ADMIN puede crear roles
+    Solo SUPER_ADMIN puede crear roles.
+
+    `permission_ids` (opcional) asigna permisos reales (tabla role_permissions) en la
+    misma transacción del alta; un id inexistente responde 422 y no crea el rol. El
+    campo legacy `permissions` (JSONB) no otorga ningún permiso efectivo.
     """
     # Solo SUPER_ADMIN puede crear roles
     if not current_user.role_obj or current_user.role_obj.name != 'SUPER_ADMIN':
@@ -185,6 +189,7 @@ async def create_role(
 
     # Agregar información computada
     role.users_count = 0
+    role.permissions_count = len(crud_role_permission.get_permission_ids_for_role(db, role.id))
     role.can_be_modified = True
     role.can_be_deleted = True
 

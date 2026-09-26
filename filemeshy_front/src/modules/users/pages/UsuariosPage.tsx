@@ -3,6 +3,7 @@
  * Gestión de usuarios del sistema
  */
 
+import { minutesSince } from '@/shared/utils/dates'
 import { useEffect, useState, useRef, useMemo, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Plus, Lock, ShieldAlert, RefreshCw, Users, UserCheck, UserX, ShieldCheck, KeyRound } from 'lucide-react'
@@ -77,9 +78,8 @@ const columns: Column<User>[] = [
         return <span className="text-sm text-muted-foreground italic">Nunca</span>
       }
       try {
-        const date = new Date(value as string)
-        if (isNaN(date.getTime())) return <span className="text-sm text-muted-foreground">-</span>
-        const diffMinutes = (Date.now() - date.getTime()) / (1000 * 60)
+        const diffMinutes = minutesSince(value as string)
+        if (diffMinutes === null) return <span className="text-sm text-muted-foreground">—</span>
 
         if (diffMinutes < 5) {
           return <span className="text-sm text-green-600 dark:text-green-400 font-semibold">Ahora</span>

@@ -1,5 +1,5 @@
 import { render, screen, fireEvent } from '@testing-library/react'
-import { Dropdown } from './Dropdown'
+import { Dropdown, SplitButton } from './Dropdown'
 
 describe('Dropdown (menú portaleado)', () => {
   const originalHeight = window.innerHeight
@@ -51,6 +51,16 @@ describe('Dropdown (menú portaleado)', () => {
     fireEvent.click(screen.getByText('Acciones'))
     fireEvent.click(screen.getByText('Editar'))
     expect(onClick).toHaveBeenCalledOnce()
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument()
+  })
+
+  it('SplitButton se cierra con Escape', () => {
+    Object.defineProperty(window, 'innerHeight', { value: 800, configurable: true })
+    mockTriggerRect({ top: 100, bottom: 140, left: 200, right: 300 })
+    render(<SplitButton label="Nuevo" onClick={() => {}} items={[{ label: 'Editar' }]} />)
+    fireEvent.click(screen.getByLabelText('Menu'))
+    expect(screen.getByRole('menu')).toBeInTheDocument()
+    fireEvent.keyDown(document, { key: 'Escape' })
     expect(screen.queryByRole('menu')).not.toBeInTheDocument()
   })
 })

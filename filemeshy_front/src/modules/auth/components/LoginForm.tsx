@@ -70,6 +70,7 @@ export function LoginForm() {
   const turnstileContainerRef = useRef<HTMLDivElement>(null)
   const widgetIdRef = useRef<string | null>(null)
   const showTurnstile = turnstileConfig?.enabled && !!turnstileConfig.site_key
+  const siteKey = turnstileConfig?.site_key
 
   // Cargar script de Turnstile y renderizar el widget cuando esté listo
   useEffect(() => {
@@ -83,7 +84,7 @@ export function LoginForm() {
         widgetIdRef.current = null
       }
       widgetIdRef.current = window.turnstile.render(turnstileContainerRef.current, {
-        sitekey: turnstileConfig!.site_key,
+        sitekey: siteKey!,
         callback: (token: unknown) => setTurnstileToken(token as string),
         'expired-callback': () => setTurnstileToken(null),
         'error-callback': () => setTurnstileToken(null),
@@ -121,7 +122,7 @@ export function LoginForm() {
         widgetIdRef.current = null
       }
     }
-  }, [showTurnstile, turnstileConfig?.site_key, setTurnstileToken])
+  }, [showTurnstile, siteKey, setTurnstileToken])
 
   // ===== PASO 2: Verificación TOTP =====
   if (loginStep === 'totp') {

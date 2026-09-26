@@ -6,7 +6,7 @@
  * el campo vacío equivale a "sin límite" (limit_bytes: null), tal como pide
  * el contrato del backend.
  */
-import { useState, useEffect } from 'react'
+import { useState } from 'react'
 import { Loader2, Save } from 'lucide-react'
 import { Modal } from '@/ui/modals/Modal'
 import { Button } from '@/ui/buttons/Button'
@@ -22,18 +22,26 @@ interface EditQuotaModalProps {
   onSave: (userId: string, limitBytes: number | null) => Promise<void>
 }
 
+/**
+ * Mount-gate: no monta nada si no hay cuota o está cerrado, y el interior se remonta por
+ * `user_id`, así cada apertura precarga el límite actual (en GB) sin efectos de sincronización.
+ */
 export function EditQuotaModal({ isOpen, onClose, quota, onSave }: EditQuotaModalProps) {
-  const [limitGb, setLimitGb] = useState('')
+  if (!quota || !isOpen) return null
+  return <EditQuotaModalInner key={quota.user_id} onClose={onClose} quota={quota} onSave={onSave} />
+}
+
+interface EditQuotaModalInnerProps {
+  onClose: () => void
+  quota: StorageQuotaItem
+  onSave: (userId: string, limitBytes: number | null) => Promise<void>
+}
+
+function EditQuotaModalInner({ onClose, quota, onSave }: EditQuotaModalInnerProps) {
+  const [limitGb, setLimitGb] = useState(() =>
+    quota.limit_bytes === null ? '' : String(quota.limit_bytes / GB),
+  )
   const [isSaving, setIsSaving] = useState(false)
-
-  // Precargar el valor actual (en GB) cada vez que se abre para un usuario distinto
-  useEffect(() => {
-    if (quota) {
-      setLimitGb(quota.limit_bytes === null ? '' : String(quota.limit_bytes / GB))
-    }
-  }, [quota])
-
-  if (!quota) return null
 
   const handleSave = async () => {
     const trimmed = limitGb.trim()
@@ -54,7 +62,7 @@ export function EditQuotaModal({ isOpen, onClose, quota, onSave }: EditQuotaModa
 
   return (
     <Modal
-      isOpen={isOpen}
+      isOpen
       onClose={onClose}
       title="Editar cuota de almacenamiento"
       size="sm"

@@ -137,6 +137,50 @@ def decrypt_sensitive_data(encrypted_data: str) -> str:
         raise
 
 
+def is_encrypted_token(value: Optional[str]) -> bool:
+    """True si `value` es un token Fernet válido para ESTA instalación (se
+    descifra con la clave derivada del SECRET_KEY)."""
+    if not value:
+        return False
+    try:
+        get_fernet_cipher().decrypt(value.encode())
+        return True
+    except Exception:
+        return False
+
+
+def encrypt_secret_if_needed(value: Optional[str]) -> Optional[str]:
+    """Cifra `value` con el mismo mecanismo Fernet de `encrypt_sensitive_data`,
+    salvo que ya sea un token válido (idempotente: evita el doble cifrado si
+    un camino ya cifró antes de llegar al repositorio). Vacío/None se devuelve tal cual."""
+    if not value or is_encrypted_token(value):
+        return value
+    return encrypt_sensitive_data(value)
+
+
+def decrypt_secret_tolerant(value: Optional[str]) -> Optional[str]:
+    """Descifra un secreto guardado en `system_configuration`. TOLERA valores
+    legados en CLARO: si no es un token Fernet válido, lo devuelve tal cual
+    (así no se rompen instalaciones cuyo secreto se guardó sin cifrar; se
+    cifra recién cuando se vuelve a guardar). Nunca loguea el valor."""
+    if not value:
+        return value
+    try:
+        return get_fernet_cipher().decrypt(value.encode()).decode()
+    except Exception:
+        # Ronda 12d: un valor con forma de token Fernet ("gAAAAA...") que NO se descifra
+        # (típico: cambió SECRET_KEY) no es una contraseña en claro; devolver el ciphertext
+        # hacía fallar el SMTP/CAPTCHA sin aviso. Se loguea un ERROR claro (sin el valor) y
+        # se devuelve None.
+        if value.startswith("gAAAAA"):
+            logger.error(
+                "No se pudo descifrar un secreto guardado (¿cambió SECRET_KEY?): hay que "
+                "volver a guardarlo desde la configuración. Se usa como si no estuviera configurado."
+            )
+            return None
+        return value
+
+
 # ===== JWT TOKENS =====
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None, jti: Optional[str] = None) -> Tuple[str, str]:
     """Crea un token JWT de acceso con JTI único.

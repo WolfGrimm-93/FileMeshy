@@ -3,6 +3,7 @@
  * Gestión de roles dinámicos del sistema
  */
 
+import { parseDate } from '@/shared/utils/dates'
 import { useMemo, useState, useEffect, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
@@ -50,33 +51,44 @@ export default function RolesManagementPage() {
   // Verificar si es SUPER_ADMIN
   const isSuperAdmin = authUser?.role === 'SUPER_ADMIN'
 
-  // Cargar roles
+  // Núcleo del fetch: sin setState síncrono (isLoading arranca en true y
+  // permissionError en false), así lo puede usar el efecto de montaje
+  const fetchRoles = useCallback(
+    () =>
+      rolesService
+        .list({
+          skip: 0,
+          limit: 100,
+          include_system: true
+        })
+        .then((response) => {
+          setRoles(response.items)
+        })
+        .catch((error: unknown) => {
+          console.error('Error al cargar roles:', error)
+          const err = error as { status?: number; response?: { status?: number }; message?: string }
+          if (err?.status === 403 || err?.response?.status === 403) {
+            setPermissionError(true)
+          }
+        })
+        .finally(() => {
+          setIsLoading(false)
+          setIsFirstLoad(false)
+        }),
+    []
+  )
+
+  // Recarga (handlers, intervalo): marca loading y limpia el error antes del fetch
   const loadRoles = useCallback(async () => {
-    try {
-      setIsLoading(true)
-      setPermissionError(false)
-      const response = await rolesService.list({
-        skip: 0,
-        limit: 100,
-        include_system: true
-      })
-      setRoles(response.items)
-    } catch (error: unknown) {
-      console.error('Error al cargar roles:', error)
-      const err = error as { status?: number; response?: { status?: number }; message?: string }
-      if (err?.status === 403 || err?.response?.status === 403) {
-        setPermissionError(true)
-      }
-    } finally {
-      setIsLoading(false)
-      setIsFirstLoad(false)
-    }
-  }, [])
+    setIsLoading(true)
+    setPermissionError(false)
+    await fetchRoles()
+  }, [fetchRoles])
 
   // Cargar al montar
   useEffect(() => {
-    loadRoles()
-  }, [loadRoles])
+    fetchRoles()
+  }, [fetchRoles])
 
   // Auto-refresh cada 30s
   useEffect(() => {
@@ -140,7 +152,7 @@ export default function RolesManagementPage() {
       permisos: role.permissions_count ?? 0,
       esModificable: role.can_be_modified ?? !role.is_system,
       esEliminable: role.can_be_deleted ?? !role.is_system,
-      fechaCreacion: new Date(role.created_at),
+      fechaCreacion: parseDate(role.created_at),
       rawRole: role
     }))
   }, [filteredRoles])

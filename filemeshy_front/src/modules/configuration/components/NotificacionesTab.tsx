@@ -189,10 +189,10 @@ export default function NotificacionesTab() {
               <div className="space-y-4">
                 {/* Email remitente */}
                 <div>
-                  <label className="block text-sm font-medium text-foreground/80 mb-1">
+                  <label className="block text-sm font-medium text-foreground/80 mb-1" htmlFor="notif-tab-1">
                     Email remitente <span className="text-red-500">*</span>
                   </label>
-                  <input
+                  <input id="notif-tab-1"
                     type="email"
                     value={smtp.account_email}
                     onChange={e => handleSmtpChange('account_email', e.target.value)}
@@ -208,10 +208,10 @@ export default function NotificacionesTab() {
 
                   <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                     <div className="md:col-span-2">
-                      <label className="block text-sm font-medium text-foreground/80 mb-1">
+                      <label className="block text-sm font-medium text-foreground/80 mb-1" htmlFor="notif-tab-2">
                         Host SMTP <span className="text-red-500">*</span>
                       </label>
-                      <input
+                      <input id="notif-tab-2"
                         type="text"
                         value={smtp.smtp_host}
                         onChange={e => handleSmtpChange('smtp_host', e.target.value)}
@@ -220,8 +220,8 @@ export default function NotificacionesTab() {
                       />
                     </div>
                     <div>
-                      <label className="block text-sm font-medium text-foreground/80 mb-1">Puerto</label>
-                      <input
+                      <label className="block text-sm font-medium text-foreground/80 mb-1" htmlFor="notif-tab-3">Puerto</label>
+                      <input id="notif-tab-3"
                         type="text"
                         inputMode="numeric"
                         pattern="[0-9]*"
@@ -237,10 +237,10 @@ export default function NotificacionesTab() {
 
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                     <div>
-                      <label className="block text-sm font-medium text-foreground/80 mb-1">
+                      <label className="block text-sm font-medium text-foreground/80 mb-1" htmlFor="notif-tab-4">
                         Usuario SMTP <span className="text-red-500">*</span>
                       </label>
-                      <input
+                      <input id="notif-tab-4"
                         type="text"
                         value={smtp.smtp_username}
                         onChange={e => handleSmtpChange('smtp_username', e.target.value)}
@@ -249,7 +249,7 @@ export default function NotificacionesTab() {
                       />
                     </div>
                     <div>
-                      <label className="block text-sm font-medium text-foreground/80 mb-1">
+                      <label className="block text-sm font-medium text-foreground/80 mb-1" htmlFor="notif-tab-5">
                         Contraseña SMTP
                         {passwordIsSet && (
                           <span className="ml-2 text-xs text-green-600 dark:text-green-400 font-normal">
@@ -257,7 +257,7 @@ export default function NotificacionesTab() {
                           </span>
                         )}
                       </label>
-                      <input
+                      <input id="notif-tab-5"
                         type="password"
                         value={smtp.smtp_password}
                         onChange={e => handleSmtpChange('smtp_password', e.target.value)}
@@ -268,8 +268,8 @@ export default function NotificacionesTab() {
                   </div>
 
                   <div className="w-full sm:w-64">
-                    <label className="block text-sm font-medium text-foreground/80 mb-1">Cifrado</label>
-                    <select
+                    <label className="block text-sm font-medium text-foreground/80 mb-1" htmlFor="notif-tab-6">Cifrado</label>
+                    <select id="notif-tab-6"
                       value={smtp.encryption}
                       onChange={e => {
                         const enc = e.target.value

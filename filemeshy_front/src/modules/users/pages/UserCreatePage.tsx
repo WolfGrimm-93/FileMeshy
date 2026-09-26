@@ -117,10 +117,10 @@ export default function UserCreatePage() {
           </h2>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
-              <label className="block text-sm font-medium text-foreground/80 mb-2">
+              <label className="block text-sm font-medium text-foreground/80 mb-2" htmlFor="user-create-1">
                 Nombre *
               </label>
-              <Input
+              <Input id="user-create-1"
                 name="first_name"
                 value={formData.first_name}
                 onChange={handleChange}
@@ -130,10 +130,10 @@ export default function UserCreatePage() {
             </div>
 
             <div>
-              <label className="block text-sm font-medium text-foreground/80 mb-2">
+              <label className="block text-sm font-medium text-foreground/80 mb-2" htmlFor="user-create-2">
                 Apellido *
               </label>
-              <Input
+              <Input id="user-create-2"
                 name="last_name"
                 value={formData.last_name}
                 onChange={handleChange}
@@ -143,10 +143,10 @@ export default function UserCreatePage() {
             </div>
 
             <div>
-              <label className="block text-sm font-medium text-foreground/80 mb-2">
+              <label className="block text-sm font-medium text-foreground/80 mb-2" htmlFor="user-create-3">
                 Email *
               </label>
-              <Input
+              <Input id="user-create-3"
                 type="email"
                 name="email"
                 value={formData.email}
@@ -157,10 +157,10 @@ export default function UserCreatePage() {
             </div>
 
             <div>
-              <label className="block text-sm font-medium text-foreground/80 mb-2">
+              <label className="block text-sm font-medium text-foreground/80 mb-2" htmlFor="user-create-4">
                 Teléfono
               </label>
-              <Input
+              <Input id="user-create-4"
                 name="phone"
                 value={formData.phone}
                 onChange={handleChange}
@@ -175,10 +175,10 @@ export default function UserCreatePage() {
           <h2 className="text-lg font-semibold text-foreground mb-4">Rol y Permisos</h2>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
-              <label className="block text-sm font-medium text-foreground/80 mb-2">
+              <label className="block text-sm font-medium text-foreground/80 mb-2" htmlFor="user-create-5">
                 Rol *
               </label>
-              <select
+              <select id="user-create-5"
                 name="role_id"
                 value={formData.role_id}
                 onChange={handleChange}
@@ -206,10 +206,10 @@ export default function UserCreatePage() {
             </div>
 
             <div>
-              <label className="block text-sm font-medium text-foreground/80 mb-2">
+              <label className="block text-sm font-medium text-foreground/80 mb-2" htmlFor="user-create-6">
                 Estado *
               </label>
-              <select
+              <select id="user-create-6"
                 name="is_active"
                 value={formData.is_active ? 'true' : 'false'}
                 onChange={(e) => setFormData({ ...formData, is_active: e.target.value === 'true' })}
@@ -228,11 +228,11 @@ export default function UserCreatePage() {
           <h2 className="text-lg font-semibold text-foreground mb-4">Credenciales de Acceso</h2>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
-              <label className="block text-sm font-medium text-foreground/80 mb-2">
+              <label className="block text-sm font-medium text-foreground/80 mb-2" htmlFor="user-create-7">
                 Contraseña *
               </label>
               <div className="relative">
-                <Input
+                <Input id="user-create-7"
                   type={showPassword ? 'text' : 'password'}
                   name="password"
                   value={formData.password}
@@ -254,11 +254,11 @@ export default function UserCreatePage() {
             </div>
 
             <div>
-              <label className="block text-sm font-medium text-foreground/80 mb-2">
+              <label className="block text-sm font-medium text-foreground/80 mb-2" htmlFor="user-create-8">
                 Confirmar Contraseña *
               </label>
               <div className="relative">
-                <Input
+                <Input id="user-create-8"
                   type={showConfirmPassword ? 'text' : 'password'}
                   name="confirmarPassword"
                   value={formData.confirmarPassword}

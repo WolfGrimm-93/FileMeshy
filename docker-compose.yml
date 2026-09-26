@@ -44,6 +44,17 @@ x-backend-env: &backend-env
   # app/core/config.py::TRUSTED_PROXY_IPS / app/auth/router.py::_get_real_ip.
   TRUSTED_PROXY_IPS: "[]"
 
+# Build y TAG compartidos por `backend` y `celery_worker` (mismo codigo, mismo Dockerfile).
+# Incidente de la Ronda 12: cada servicio tenia su propia imagen (filemeshy-backend y
+# filemeshy-celery_worker) y `docker compose build backend` NO reconstruia la del worker,
+# que estuvo corriendo con dependencias viejas (fastapi 0.115, pillow 11...) mientras los
+# informes decian lo contrario. Con un unico tag (`image: filemeshy-backend`) reconstruir
+# cualquiera de los dos deja ambos en la misma imagen y no pueden desfasarse.
+# Verificacion tras cada deploy (ver docs/operacion.md): los IDs deben ser identicos:
+#   docker inspect --format '{{.Image}}' filemeshy-backend-1 filemeshy-celery_worker-1
+x-backend-build: &backend-build
+  context: ./filemeshy_back
+
 services:
   postgres:
     # Pin de versión + digest (Ronda 10) -- mismo criterio que MinIO (Ronda 1):
@@ -105,8 +116,8 @@ services:
       start_period: 10s
 
   backend:
-    build:
-      context: ./filemeshy_back
+    build: *backend-build
+    image: filemeshy-backend
     environment:
       <<: *backend-env
     # Filesystem de solo lectura -- el proceso corre como `appuser` no-root
@@ -167,8 +178,8 @@ services:
       start_period: 60s
 
   celery_worker:
-    build:
-      context: ./filemeshy_back
+    build: *backend-build
+    image: filemeshy-backend
     command: celery -A app.worker.celery_app worker --loglevel=info
     environment:
       <<: *backend-env

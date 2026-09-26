@@ -71,10 +71,15 @@ export const ConfigProvider = ({ children }: ConfigProviderProps) => {
     if (userId !== previousUserId.current) {
       previousUserId.current = userId
       if (userId) {
-        refreshConfig()
+        // Mismo refresco que refreshConfig, inline para no invocar un callback con
+        // setState dentro del efecto (el setState ocurre al resolver la promesa)
+        configService.clearCache()
+        configService.getPublicConfig()
+          .then(setConfig)
+          .catch(() => { /* mantener config anterior si falla el refresh */ })
       }
     }
-  }, [userId, refreshConfig])
+  }, [userId])
 
   // R5: polling de la versión global de config -- detecta cambios hechos desde
   // OTRA terminal/computadora (el evento `storage` de localStorage solo avisa

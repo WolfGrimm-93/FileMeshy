@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import List, Literal, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, model_validator
 
 from app.tags.schemas import TagOut
 
@@ -132,6 +132,21 @@ class CopyRequest(BaseModel):
     (debe pertenecer al mismo dueño del original, ver `_get_target_parent_folder`
     en el router)."""
     folder_id: Optional[UUID] = None
+    # Ronda 12b: forma INEQUÍVOCA de pedir la raíz. `folder_id: null` sigue
+    # significando raíz (compatibilidad), pero un cliente que serializa "sin valor"
+    # como null no puede distinguirlo de "misma carpeta" -- con `to_root: true` la
+    # intención es explícita. Contrato:
+    #   * omitir `folder_id` y `to_root` (o body vacío/ausente) -> MISMA carpeta del original
+    #   * `folder_id: <uuid>` -> esa carpeta
+    #   * `to_root: true` (o `folder_id: null` explícito) -> raíz
+    # `to_root: true` junto con un `folder_id` no nulo es contradictorio -> 422.
+    to_root: bool = False
+
+    @model_validator(mode="after")
+    def _check_destination(self):
+        if self.to_root and self.folder_id is not None:
+            raise ValueError("to_root=true no se puede combinar con un folder_id")
+        return self
 
 
 # ==================== Tags (Ronda 2) ====================

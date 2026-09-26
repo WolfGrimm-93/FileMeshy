@@ -96,10 +96,10 @@ export default function SeguridadPage() {
               <div className="border-t border-border" />
 
               <div>
-                <label className="block text-sm font-medium text-foreground/80 mb-1.5">
+                <label className="block text-sm font-medium text-foreground/80 mb-1.5" htmlFor="seg-page-1">
                   Site Key <span className="text-xs text-muted-foreground">(pública)</span>
                 </label>
-                <input
+                <input id="seg-page-1"
                   type="text"
                   value={form.turnstileSiteKey}
                   onChange={e => set('turnstileSiteKey', e.target.value)}
@@ -113,11 +113,11 @@ export default function SeguridadPage() {
               </div>
 
               <div>
-                <label className="block text-sm font-medium text-foreground/80 mb-1.5">
+                <label className="block text-sm font-medium text-foreground/80 mb-1.5" htmlFor="seg-page-2">
                   Secret Key <span className="text-xs text-muted-foreground">(privada — solo escritura)</span>
                 </label>
                 <div className="relative">
-                  <input
+                  <input id="seg-page-2"
                     type={showSecret ? 'text' : 'password'}
                     value={form.turnstileSecretKey}
                     onChange={e => set('turnstileSecretKey', e.target.value)}
@@ -192,10 +192,10 @@ export default function SeguridadPage() {
               <>
                 <div className="border-t border-border" />
                 <div>
-                  <label className="block text-sm font-medium text-foreground/80 mb-1.5">
+                  <label className="block text-sm font-medium text-foreground/80 mb-1.5" htmlFor="seg-page-3">
                     Tiempo de inactividad
                   </label>
-                  <select
+                  <select id="seg-page-3"
                     value={sessionTimeout}
                     onChange={e => setSessionTimeout(e.target.value)}
                     className="w-full sm:w-64 px-3 py-2 text-sm border border-input rounded-lg bg-muted text-foreground focus:ring-2 focus:ring-brand-500 focus:border-transparent"

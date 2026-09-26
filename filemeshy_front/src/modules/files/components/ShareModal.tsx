@@ -9,7 +9,7 @@
  *
  * Ver contrato de API en filemeshy_back (implementado en paralelo).
  */
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useId, useState } from 'react'
 import { Ban, Copy, Link2, Lock, Mail, UserPlus } from 'lucide-react'
 import { Modal } from '@/ui/modals/Modal'
 import { Button } from '@/ui/buttons/Button'
@@ -18,6 +18,7 @@ import { EmailInput, Input, PasswordInput } from '@/ui/inputs/Input'
 import { Select } from '@/ui/inputs/Select'
 import { toast } from '@/ui/toast/CustomToast'
 import { extractErrorMessage } from '@/shared/utils/errors'
+import { parseDate } from '@/shared/utils/dates'
 import { useAuth } from '@/modules/auth/hooks/useAuth'
 import { Permission } from '@/app/routes'
 import { sharesService } from '../services/shares.service'
@@ -44,14 +45,26 @@ const PERMISSION_OPTIONS: { value: SharePermission; label: string }[] = [
 
 function getShareStatus(share: ShareOut): ShareStatus {
   if (share.revoked_at) return 'revoked'
-  if (share.expires_at && new Date(share.expires_at).getTime() <= Date.now()) return 'expired'
+  const expiresAt = parseDate(share.expires_at)
+  if (expiresAt && expiresAt.getTime() <= Date.now()) return 'expired'
   return share.is_active ? 'active' : 'expired'
 }
 
+/**
+ * Mount-gate: sin target no monta nada, y el interior se remonta por `target.id`,
+ * así cada apertura arranca con el formulario limpio y la lista vacía, sin efectos de reset.
+ */
 export default function ShareModal({ target, onClose }: ShareModalProps) {
+  if (!target) return null
+  return <ShareModalInner key={target.id} target={target} onClose={onClose} />
+}
+
+function ShareModalInner({ target, onClose }: { target: ShareTarget; onClose: () => void }) {
   const { hasPermission } = useAuth()
+  const passwordInputId = useId()
   const [shares, setShares] = useState<ShareOut[]>([])
-  const [loading, setLoading] = useState(false)
+  // Arranca en true: el efecto de montaje carga la lista sin setState síncrono
+  const [loading, setLoading] = useState(true)
   const [creating, setCreating] = useState(false)
   const [noExpiration, setNoExpiration] = useState(true)
   const [expiresAt, setExpiresAt] = useState('')
@@ -61,43 +74,38 @@ export default function ShareModal({ target, onClose }: ShareModalProps) {
   const [sharedWithEmail, setSharedWithEmail] = useState('')
   const [permission, setPermission] = useState<SharePermission>('view')
 
-  const resetForm = useCallback(() => {
+  const resetForm = () => {
     setNoExpiration(true)
     setExpiresAt('')
     setShareMode('link')
     setPassword('')
     setSharedWithEmail('')
     setPermission('view')
-  }, [])
+  }
 
+  // Núcleo del fetch (sin setState síncrono): lo usa el efecto de montaje.
+  const fetchShares = useCallback(
+    () =>
+      (target.type === 'file' ? sharesService.listForFile(target.id) : sharesService.listForFolder(target.id))
+        .then(setShares)
+        .catch((error: unknown) => {
+          toast.error(extractErrorMessage(error, 'Error al cargar los links de este elemento'))
+        })
+        .finally(() => setLoading(false)),
+    [target.id, target.type],
+  )
+
+  // Recarga explícita (handlers): vuelve a mostrar el estado de carga.
   const loadShares = useCallback(async () => {
-    if (!target) return
     setLoading(true)
-    try {
-      const data =
-        target.type === 'file'
-          ? await sharesService.listForFile(target.id)
-          : await sharesService.listForFolder(target.id)
-      setShares(data)
-    } catch (error: unknown) {
-      toast.error(extractErrorMessage(error, 'Error al cargar los links de este elemento'))
-    } finally {
-      setLoading(false)
-    }
-  }, [target])
+    await fetchShares()
+  }, [fetchShares])
 
   useEffect(() => {
-    if (target) {
-      resetForm()
-      loadShares()
-    } else {
-      setShares([])
-    }
-  }, [target, loadShares, resetForm])
+    fetchShares()
+  }, [fetchShares])
 
   const handleCreate = async () => {
-    if (!target) return
-
     const trimmedEmail = sharedWithEmail.trim()
     if (shareMode === 'user' && !trimmedEmail) {
       toast.error('Ingresá el email de la persona con quien compartir')
@@ -148,8 +156,6 @@ export default function ShareModal({ target, onClose }: ShareModalProps) {
     }
   }
 
-  if (!target) return null
-
   const statusBadge = (status: ShareStatus) => {
     if (status === 'active') return <Badge variant="success">Activo</Badge>
     if (status === 'revoked') return <Badge variant="danger">Revocado</Badge>
@@ -160,7 +166,7 @@ export default function ShareModal({ target, onClose }: ShareModalProps) {
     perm === 'edit' ? <Badge variant="info">Editor</Badge> : <Badge variant="gray">Lector</Badge>
 
   return (
-    <Modal isOpen={!!target} onClose={onClose} title={`Compartir "${target.name}"`} size="lg">
+    <Modal isOpen onClose={onClose} title={`Compartir "${target.name}"`} size="lg">
       <div className="space-y-6">
         {hasPermission(Permission.CREATE_SHARES) && (
           <div className="space-y-3 rounded-lg border border-gray-200 p-4 dark:border-gray-700">
@@ -217,10 +223,14 @@ export default function ShareModal({ target, onClose }: ShareModalProps) {
 
             {shareMode === 'link' ? (
               <div>
-                <label className="mb-2 block text-sm font-medium text-gray-700 dark:text-gray-300">
+                <label
+                  htmlFor={passwordInputId}
+                  className="mb-2 block text-sm font-medium text-gray-700 dark:text-gray-300"
+                >
                   Contraseña (opcional)
                 </label>
                 <PasswordInput
+                  id={passwordInputId}
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   placeholder="Dejar vacío para no proteger el link"
@@ -300,7 +310,7 @@ export default function ShareModal({ target, onClose }: ShareModalProps) {
                       </div>
                       <p className="text-xs text-gray-500 dark:text-gray-400">
                         {share.expires_at
-                          ? `Expira: ${new Date(share.expires_at).toLocaleString('es-ES')}`
+                          ? `Expira: ${parseDate(share.expires_at)?.toLocaleString('es-ES') ?? '—'}`
                           : 'No expira'}
                       </p>
                     </div>

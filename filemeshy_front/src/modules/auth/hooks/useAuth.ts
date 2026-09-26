@@ -4,7 +4,7 @@
  * Integra authService + authStore para una API simple y consistente
  * Maneja auto-refresh, sesión persistente y limpieza
  */
-import { useCallback, useRef } from 'react'
+import { useCallback } from 'react'
 import { useAuthStore, type AuthUser } from '../store/authStore'
 import { authService, MAX_SESSION_SLOTS, type LoginCredentials, type LoginResult, type LoginResponse } from '../services/auth.service'
 import { loadValidPermissionsFromAPI } from '@/modules/access_control/utils/permissions-mapper'
@@ -12,18 +12,6 @@ import { loadValidPermissionsFromAPI } from '@/modules/access_control/utils/perm
 export const useAuth = () => {
   const store = useAuthStore()
   const { user, isAuthenticated, hasPermission, hasRole, pausedUsers } = store
-
-  // Usar refs para las funciones del store (son estables)
-  const setLoginRef = useRef(store.login)
-  const setLogoutRef = useRef(store.logout)
-  const pushPausedUserRef = useRef(store.pushPausedUser)
-  const popPausedUserRef = useRef(store.popPausedUser)
-
-  // Actualizar refs si cambian (raro pero posible)
-  setLoginRef.current = store.login
-  setLogoutRef.current = store.logout
-  pushPausedUserRef.current = store.pushPausedUser
-  popPausedUserRef.current = store.popPausedUser
 
   /**
    * Iniciar sesión
@@ -58,14 +46,14 @@ export const useAuth = () => {
         avatar: response.user.avatar,
         theme: response.user.theme,
       }
-      setLoginRef.current(authUser)
+      useAuthStore.getState().login(authUser)
 
       return response
     } catch (error) {
       console.error('❌ Error en login:', error)
       throw error
     }
-  }, []) // Sin dependencias - usa refs
+  }, []) // Sin dependencias - usa useAuthStore.getState() (acciones estables del store)
 
   /**
    * Cerrar sesión
@@ -76,9 +64,9 @@ export const useAuth = () => {
       await authService.logout()
     } finally {
       // Limpiar store siempre
-      setLogoutRef.current()
+      useAuthStore.getState().logout()
     }
-  }, []) // Sin dependencias - usa refs
+  }, []) // Sin dependencias - usa useAuthStore.getState() (acciones estables del store)
 
   /**
    * Cambiar de usuario (temporal), sin cerrar la sesión actual.
@@ -110,7 +98,7 @@ export const useAuth = () => {
     // para que esa respuesta tardía no pise el token/cookie del usuario
     // nuevo cuando resuelva (hallazgo de auditoría, ver auth.service.ts).
     await authService.pauseCurrentSession()
-    pushPausedUserRef.current(previousUser)
+    useAuthStore.getState().pushPausedUser(previousUser)
     const epochAfterPause = authService.getSessionEpoch()
 
     // Antes de que authService.login() resuelva con éxito, todavía no se
@@ -125,7 +113,7 @@ export const useAuth = () => {
       // seguía en vuelo) ya movió la pila, no pisarla con un segundo resume.
       if (authService.getSessionEpoch() !== epochAfterPause) return
       authService.resumePreviousSession()
-      popPausedUserRef.current()
+      useAuthStore.getState().popPausedUser()
     }
 
     try {
@@ -169,7 +157,7 @@ export const useAuth = () => {
         avatar: response.user.avatar,
         theme: response.user.theme,
       }
-      setLoginRef.current(authUser)
+      useAuthStore.getState().login(authUser)
 
       return response
     } catch (error) {
@@ -177,49 +165,6 @@ export const useAuth = () => {
       throw error
     }
   }, [])
-
-  /**
-   * Volver a la sesión pausada más reciente (la que quedó debajo al usar
-   * switchUser). El usuario restaurado se toma del caché local (no hace
-   * falta pedirlo de nuevo), pero SÍ hay una llamada de red: cerrar la
-   * sesión temporal que se abandona en el backend antes de restaurar la
-   * pausada -- ver closeActiveSessionOnBackend en auth.service.ts para el
-   * motivo (evita que esa sesión quede viva y pueda "resucitar" sola vía
-   * un refresh futuro, en web).
-   */
-  const returnToPreviousUser = useCallback(async (): Promise<boolean> => {
-    if (!authService.hasPausedSession()) return false
-
-    await authService.closeActiveSessionOnBackend()
-
-    const restored = authService.resumePreviousSession()
-    if (!restored) return false
-
-    const previousUser = popPausedUserRef.current()
-    if (previousUser) {
-      setLoginRef.current(previousUser)
-    } else {
-      // No debería pasar (pause y push de usuario siempre van juntos), pero
-      // por las dudas: sin el usuario cacheado, pedirlo de nuevo al backend.
-      await fetchCurrentUser()
-    }
-    return true
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
-
-  /**
-   * Refrescar token manualmente (normalmente automático)
-   */
-  const refreshToken = useCallback(async () => {
-    try {
-      await authService.refreshToken()
-    } catch (error) {
-      console.error('Error al refrescar token:', error)
-      // Si falla, hacer logout
-      setLogoutRef.current()
-      throw error
-    }
-  }, []) // Sin dependencias - usa refs
 
   /**
    * Obtener usuario actual del backend
@@ -240,14 +185,56 @@ export const useAuth = () => {
         theme: user.theme,
       }
       
-      setLoginRef.current(authUser)
+      useAuthStore.getState().login(authUser)
       return user
     } catch (error) {
       console.error('Error al obtener usuario:', error)
-      setLogoutRef.current()
+      useAuthStore.getState().logout()
       throw error
     }
-  }, []) // Sin dependencias - usa refs
+  }, []) // Sin dependencias - usa useAuthStore.getState() (acciones estables del store)
+
+  /**
+   * Volver a la sesión pausada más reciente (la que quedó debajo al usar
+   * switchUser). El usuario restaurado se toma del caché local (no hace
+   * falta pedirlo de nuevo), pero SÍ hay una llamada de red: cerrar la
+   * sesión temporal que se abandona en el backend antes de restaurar la
+   * pausada -- ver closeActiveSessionOnBackend en auth.service.ts para el
+   * motivo (evita que esa sesión quede viva y pueda "resucitar" sola vía
+   * un refresh futuro, en web).
+   */
+  const returnToPreviousUser = useCallback(async (): Promise<boolean> => {
+    if (!authService.hasPausedSession()) return false
+
+    await authService.closeActiveSessionOnBackend()
+
+    const restored = authService.resumePreviousSession()
+    if (!restored) return false
+
+    const previousUser = useAuthStore.getState().popPausedUser()
+    if (previousUser) {
+      useAuthStore.getState().login(previousUser)
+    } else {
+      // No debería pasar (pause y push de usuario siempre van juntos), pero
+      // por las dudas: sin el usuario cacheado, pedirlo de nuevo al backend.
+      await fetchCurrentUser()
+    }
+    return true
+  }, [fetchCurrentUser])
+
+  /**
+   * Refrescar token manualmente (normalmente automático)
+   */
+  const refreshToken = useCallback(async () => {
+    try {
+      await authService.refreshToken()
+    } catch (error) {
+      console.error('Error al refrescar token:', error)
+      // Si falla, hacer logout
+      useAuthStore.getState().logout()
+      throw error
+    }
+  }, []) // Sin dependencias - usa useAuthStore.getState() (acciones estables del store)
 
   /**
    * Restaurar sesión al cargar la app
@@ -276,18 +263,18 @@ export const useAuth = () => {
           avatar: user.avatar,
           theme: user.theme,
         }
-        setLoginRef.current(authUser)
+        useAuthStore.getState().login(authUser)
 
         console.log('✅ Sesión restaurada y usuario cargado')
       } else {
         console.log('ℹ️ No hay sesión para restaurar')
-        setLogoutRef.current()
+        useAuthStore.getState().logout()
       }
     } catch (error) {
       console.log('❌ Error restaurando sesión:', error)
-      setLogoutRef.current()
+      useAuthStore.getState().logout()
     }
-  }, []) // Sin dependencias - usa refs e inlinea la lógica
+  }, []) // Sin dependencias - usa useAuthStore.getState()
 
   return {
     // Estado

@@ -240,6 +240,40 @@ def upload_private_file(
     return key
 
 
+def copy_private_object(src_key: str, dest_path: str, extension: str, content_type: str) -> str:
+    """Copia un objeto del bucket PRIVADO a otro objeto NUEVO del mismo bucket con una copia
+    SERVER-SIDE de S3/MinIO (`client.copy` -> CopyObject / UploadPartCopy para objetos grandes):
+    el contenido nunca pasa por la memoria del backend. Ronda 12d: antes la copia leía el
+    objeto entero a RAM (`get_object().read()`), un OOM seguro con archivos de 10-20 GB.
+
+    Devuelve la key nueva (`{dest_path}/{uuid7}{extension}`). Lanza RuntimeError si falla."""
+    from app.core.config import settings
+
+    client = _get_client()
+    if not client:
+        raise RuntimeError("El servicio de almacenamiento (MinIO) no está configurado")
+
+    bucket = settings.MINIO_PRIVATE_BUCKET
+    _ensure_private_bucket(bucket)
+
+    from app.shared.utils.uuid7 import uuid7
+    key = f"{dest_path.strip('/')}/{uuid7()}{extension}"
+
+    try:
+        client.copy(
+            CopySource={"Bucket": bucket, "Key": src_key.lstrip("/")},
+            Bucket=bucket,
+            Key=key,
+            ExtraArgs={"ContentType": content_type, "MetadataDirective": "REPLACE"},
+        )
+    except Exception as e:
+        logger.error(f"[Storage] Error copiando {bucket}/{src_key} -> {key}: {e}")
+        raise RuntimeError(f"Error al copiar archivo: {e}")
+
+    logger.info(f"[Storage] Copiado (server-side): {bucket}/{src_key} -> {key}")
+    return key
+
+
 def delete_private_file(key: str) -> None:
     """Elimina un archivo del bucket privado a partir de su key relativa.
     No lanza excepción si el archivo no existe o MinIO no está disponible.
@@ -397,21 +431,38 @@ def to_storage_key(url: str) -> str:
 def is_minio_url(path: str) -> bool:
     """Retorna True si el valor es una ruta almacenada en MinIO
     (key relativa o URL absoluta de MinIO), no una URL externa ni ruta local.
+
+    Ronda 12c (ALTO-3): la comparación de una URL absoluta es por ORIGEN exacto
+    (esquema + host + puerto vía urlparse), no `startswith`: antes
+    `http://host:9300.evil.com/x` pasaba como "nuestro storage". Una key relativa no
+    puede llevar esquema (`data:`, `javascript:`, `http:`...).
     """
+    from urllib.parse import urlparse
+
     if not path:
         return False
     # Ruta local del filesystem — no es MinIO
     if path.startswith("/"):
         return False
-    # URL absoluta — solo es MinIO si apunta a nuestro endpoint
-    if path.startswith("http"):
+    # URL absoluta — solo es MinIO si su ORIGEN es exactamente el de nuestro endpoint
+    if path.lower().startswith(("http://", "https://")):
         from app.core.config import settings
         base = settings.MINIO_PUBLIC_URL or settings.MINIO_ENDPOINT
         if not base:
             return False
-        return path.startswith(base.rstrip("/"))
+        try:
+            candidate, ours = urlparse(path), urlparse(base if "://" in base else f"http://{base}")
+            same_origin = (
+                candidate.scheme == ours.scheme
+                and candidate.hostname == ours.hostname
+                and (candidate.port or (443 if candidate.scheme == "https" else 80))
+                == (ours.port or (443 if ours.scheme == "https" else 80))
+            )
+        except ValueError:
+            return False
+        return same_origin
     # Key relativa sin esquema — pertenece a nuestro storage
-    return True
+    return ":" not in path.split("/", 1)[0]
 
 
 def get_public_url(stored_path: Optional[str]) -> Optional[str]:

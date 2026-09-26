@@ -3,7 +3,7 @@
  * Formulario para crear un nuevo rol
  */
 
-import { useState, useEffect } from 'react'
+import { useState, useMemo } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { ArrowLeft, Save, Shield } from 'lucide-react'
 import { Button } from '../../../ui/buttons/Button'
@@ -12,10 +12,36 @@ import { Textarea } from '../../../ui/inputs/Textarea'
 import { Switch } from '../../../ui/inputs/Switch'
 import { toast } from 'sonner'
 import { rolesService } from '../services/roles.service'
-import { permissionsAssignmentService, permissionsDictToIds } from '../services/permissions-assignment.service'
+import { permissionsAssignmentService, permissionsDictToIds, type PermissionCatalogItem } from '../services/permissions-assignment.service'
 import type { RoleCreate, RolePermissions } from '../types/role.types'
 import { useAuth } from '@/modules/auth/hooks/useAuth'
+import { extractErrorMessage } from '@/shared/utils/errors'
 import RolePermissionsEditor from '../components/RolePermissionsEditor'
+
+const MAX_ERROR_LENGTH = 200
+
+/** Mensaje útil para el alta: usa el `detail` del backend (409 nombre duplicado, 422 ids inválidos) truncado. */
+function buildCreateErrorMessage(error: unknown): string {
+  const status = (error as { response?: { status?: number } } | null)?.response?.status
+  const fallback = status === 409 ? 'Ya existe un rol con ese nombre' : 'Error al crear rol'
+  const message = extractErrorMessage(error, fallback)
+  // extractErrorMessage devuelve el mensaje genérico de axios si no hay detail: mejor el fallback
+  const isGeneric = /^Request failed with status code/.test(message)
+  const text = isGeneric ? fallback : message
+  return text.length > MAX_ERROR_LENGTH ? `${text.slice(0, MAX_ERROR_LENGTH)}…` : text
+}
+
+/**
+ * Catálogo de permisos con sus ids reales. Solo se expone vía
+ * GET /roles/{id}/permissions, y es global (no depende del rol), así que se
+ * consulta a través de cualquier rol existente.
+ */
+async function loadPermissionCatalog(): Promise<PermissionCatalogItem[]> {
+  const list = await rolesService.list({ limit: 1 })
+  const anyRole = list.items[0]
+  if (!anyRole) throw new Error('No se pudo obtener el catálogo de permisos')
+  return (await permissionsAssignmentService.getForRole(anyRole.id)).catalog
+}
 
 export default function RoleCreatePage() {
   const navigate = useNavigate()
@@ -30,20 +56,13 @@ export default function RoleCreatePage() {
   const [isActive, setIsActive] = useState(true)
   const [permissions, setPermissions] = useState<RolePermissions>({})
 
-  // Validation
-  const [nameError, setNameError] = useState('')
-
   const isSuperAdmin = authUser?.role === 'SUPER_ADMIN'
 
-  // Validar nombre cuando cambia
-  useEffect(() => {
-    if (!name) {
-      setNameError('')
-      return
-    }
-
+  // Validación del nombre derivada (sin estado ni efecto)
+  const nameError = useMemo(() => {
+    if (!name) return ''
     const validation = rolesService.validateRoleName(name)
-    setNameError(validation.valid ? '' : validation.error || '')
+    return validation.valid ? '' : validation.error || ''
   }, [name])
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -73,40 +92,42 @@ export default function RoleCreatePage() {
     try {
       setIsSubmitting(true)
 
+      // Resolver los permission_id reales ANTES de crear: el rol y sus permisos se
+      // persisten en un solo POST (atómico en el backend). Si algún código elegido
+      // no existe en el catálogo, no se descarta en silencio: se avisa y no se crea.
+      let permissionIds: string[] = []
+      if (Object.values(permissions).some((actions) => (actions || []).length > 0)) {
+        const catalog = await loadPermissionCatalog()
+        const known = new Set(catalog.map((p) => p.permission_code))
+        const missing = Object.entries(permissions).flatMap(([resource, actions]) =>
+          (actions || []).map((action) => `${resource}.${action}`).filter((code) => !known.has(code))
+        )
+        if (missing.length > 0) {
+          toast.error(`Hay permisos que ya no existen en el catálogo: ${missing.join(', ')}. Recarga la página e inténtalo de nuevo.`)
+          return
+        }
+        permissionIds = permissionsDictToIds(permissions, catalog)
+      }
+
       const createData: RoleCreate = {
         name: name.toUpperCase(),
         display_name: displayName,
         description: description || undefined,
         // Role.permissions (JSONB) no tiene ningún lector real en el backend --
-        // se manda igual porque el schema lo pide, pero el efecto real viene del
-        // PUT de abajo, contra la tabla role_permissions.
+        // se manda igual porque el schema lo pide; el efecto real viene de
+        // permission_ids (tabla role_permissions, misma transacción del alta).
         permissions,
+        permission_ids: permissionIds.length > 0 ? permissionIds : undefined,
         is_active: isActive
       }
 
       const newRole = await rolesService.create(createData)
 
-      // Asignar de verdad los permisos marcados en el checklist. El POST de
-      // arriba NO los aplica (bug real encontrado 2026-08-26: guardaba en
-      // Role.permissions, el JSONB legacy sin efecto -- el rol nuevo quedaba
-      // con 0 permisos reales hasta entrar aparte a "Gestión de Permisos").
-      // Se resuelve el permission_id real de cada elección contra el catálogo
-      // (que este endpoint ya devuelve) y se aplica con el mismo PUT que usa
-      // PermissionsManagementPage.
-      const permIds = permissionsDictToIds(
-        permissions,
-        (await permissionsAssignmentService.getForRole(newRole.id)).catalog
-      )
-      if (permIds.length > 0) {
-        await permissionsAssignmentService.updateForRole(newRole.id, permIds)
-      }
-
       toast.success('Rol creado correctamente')
       navigate(`/roles/${newRole.id}`)
     } catch (error: unknown) {
       console.error('Error al crear rol:', error)
-      const message = error instanceof Error ? error.message : 'Error al crear rol'
-      toast.error(message)
+      toast.error(buildCreateErrorMessage(error))
     } finally {
       setIsSubmitting(false)
     }
@@ -170,7 +191,7 @@ export default function RoleCreatePage() {
                 value={description}
                 onChange={(e) => setDescription(e.target.value)}
                 placeholder="Descripción del rol y sus responsabilidades"
-                rows={3}
+                rows={4}
               />
             </div>
 

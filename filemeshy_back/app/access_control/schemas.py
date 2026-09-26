@@ -42,8 +42,26 @@ class RoleBase(BaseModel):
 
 
 class RoleCreate(RoleBase):
-    """Schema para crear rol"""
-    pass
+    """Schema para crear rol.
+
+    `permission_ids` (Ronda 12) es la forma REAL de asignar permisos al crear:
+    se persisten en `role_permissions` dentro de la misma transacción del alta
+    (ids inexistentes -> 422 y no se crea el rol). Sin `permission_ids` el rol
+    nace con 0 permisos, como antes.
+
+    OJO: el campo heredado `permissions` (JSONB legacy) SIGUE sin efecto real --
+    se acepta solo por compatibilidad con clientes viejos; un cliente que envíe
+    únicamente `permissions` obtiene un rol con 0 permisos efectivos."""
+    permission_ids: Optional[List[UUID]] = Field(
+        None,
+        max_length=1000,
+        description=(
+            "IDs de permisos (tabla permissions) a asignar al rol al crearlo, atómicamente. "
+            "Máximo 1000; solo permisos existentes y ACTIVOS (422 si no). Nota: PUT "
+            "/roles/{id}/permissions no valida activos/existentes de esta forma (comportamiento "
+            "previo, sin cambios)."
+        ),
+    )
 
 
 class RoleUpdate(BaseModel):

@@ -58,13 +58,22 @@ class CRUDAuditLog(CRUDBase[AuditLog, AuditLogCreate, None]):
         Returns:
             AuditLog creado
         """
+        # Recorte a la longitud de cada columna String (Fase 4, Ronda 12): valores
+        # controlados por el cliente (path, IP reenviada) más largos que la
+        # columna hacían fallar el INSERT y se perdía el registro de auditoría.
+        action = action[:20] if action else action
+        table_name = table_name[:100] if table_name else table_name
+        ip_address = ip_address[:45] if ip_address else ip_address
+        endpoint = endpoint[:255] if endpoint else endpoint
+        method = method[:10] if method else method
+
         try:
             audit_log = AuditLog(
                 user_id=user_id,
                 user_email=user_email,
                 action=action,
                 table_name=table_name,
-                record_id=str(record_id),
+                record_id=str(record_id)[:100],
                 old_data=old_data,
                 new_data=new_data,
                 changes=changes,

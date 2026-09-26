@@ -60,7 +60,8 @@ export const rolesService = {
   },
 
   /**
-   * Crear nuevo rol (solo SUPER_ADMIN)
+   * Crear nuevo rol (solo SUPER_ADMIN). `permission_ids` (opcional) se persiste
+   * junto con el rol en la misma transacción del backend.
    */
   async create(roleData: RoleCreate): Promise<RoleResponse> {
     const response = await axiosInstance.post<RoleResponse>(BASE_URL, roleData)

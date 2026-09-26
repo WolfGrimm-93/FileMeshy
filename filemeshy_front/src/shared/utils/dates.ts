@@ -8,7 +8,8 @@
  *
  * REGLA:
  *   - Strings de fecha pura "YYYY-MM-DD"  → parsear como fecha LOCAL (sin UTC).
- *   - Strings de datetime con hora/zona   → `new Date()` maneja correctamente.
+ *   - Strings de datetime con zona        → `new Date()` maneja correctamente.
+ *   - Strings de datetime SIN zona        → se interpretan como UTC (se les agrega "Z").
  */
 
 const LOCALE = 'es-DO'
@@ -20,7 +21,7 @@ const LOCALE = 'es-DO'
  *
  * - `"2000-03-15"`             → Date local (evita desfase UTC)
  * - `"2000-03-15T10:30:00Z"`   → Date con timezone explícito (correcto)
- * - `"2000-03-15T10:30:00"`    → Date interpretado como local por el motor JS
+ * - `"2000-03-15T10:30:00"`    → sin zona: se interpreta como UTC (el backend guarda en UTC)
  */
 export function parseDate(dateStr: string | null | undefined): Date | null {
   if (!dateStr) return null
@@ -34,6 +35,10 @@ export function parseDate(dateStr: string | null | undefined): Date | null {
 
   // Datetime con hora — normalizar espacio a T y asumir UTC si no hay zona
   let normalized = dateStr.replace(' ', 'T')
+  // Tolerancia: "…+00:00Z" (offset + Z duplicada, formato inválido) -> se descarta la Z sobrante
+  normalized = normalized.replace(/([+-]\d{2}:\d{2})Z$/, '$1')
+  // Fracciones de segundo: normalizar a milisegundos (Firefox/Safari rechazan 6 dígitos)
+  normalized = normalized.replace(/(\.\d{3})\d+/, '$1').replace(/\.(\d{1,2})(?=Z|[+-]\d{2}:\d{2}|$)/, (_m, f: string) => `.${f.padEnd(3, '0')}`)
   if (/T\d{2}:\d{2}/.test(normalized) && !/Z$|[+-]\d{2}:\d{2}$/.test(normalized)) {
     normalized += 'Z'
   }
@@ -154,4 +159,36 @@ export function formatDateRelative(dateStr: string | null | undefined): string |
  */
 export function todayInputValue(): string {
   return toDateInputValue(new Date().toISOString())
+}
+
+
+/**
+ * Minutos transcurridos desde una fecha (null si no parsea).
+ */
+export function minutesSince(dateStr: string | null | undefined): number | null {
+  const d = parseDate(dateStr)
+  if (!d) return null
+  return (Date.now() - d.getTime()) / 60_000
+}
+
+/**
+ * True si la fecha ya pasó. Una fecha inválida se considera vencida.
+ */
+export function isPast(dateStr: string | null | undefined): boolean {
+  const d = parseDate(dateStr)
+  return !d || d.getTime() < Date.now()
+}
+
+/**
+ * Tiempo relativo corto para listados: "Justo ahora", "Hace 5 min", "Hace 3h", "Hace 2d";
+ * pasados 7 días, fecha media. "—" si no parsea (nunca "Invalid Date").
+ */
+export function formatRelativeShort(dateStr: string | null | undefined): string {
+  const mins = minutesSince(dateStr)
+  if (mins === null) return '—'
+  if (mins < 1) return 'Justo ahora'
+  if (mins < 60) return `Hace ${Math.floor(mins)} min`
+  if (mins < 60 * 24) return `Hace ${Math.floor(mins / 60)}h`
+  if (mins < 60 * 24 * 7) return `Hace ${Math.floor(mins / 1440)}d`
+  return formatDateMedium(dateStr) ?? '—'
 }

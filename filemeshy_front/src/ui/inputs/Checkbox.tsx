@@ -1,4 +1,4 @@
-import { forwardRef, type InputHTMLAttributes } from 'react'
+import { forwardRef, useId, type InputHTMLAttributes } from 'react'
 
 export interface CheckboxProps extends Omit<InputHTMLAttributes<HTMLInputElement>, 'type'> {
   label?: string
@@ -8,7 +8,10 @@ export interface CheckboxProps extends Omit<InputHTMLAttributes<HTMLInputElement
 
 export const Checkbox = forwardRef<HTMLInputElement, CheckboxProps>(
   ({ label, error, helperText, className = '', id, ...props }, ref) => {
-    const checkboxId = id || label?.toLowerCase().replace(/\s+/g, '-')
+    // useId garantiza un id único por instancia: derivarlo del label rompía el
+    // <label htmlFor> cuando el mismo texto se repite en la página.
+    const generatedId = useId()
+    const checkboxId = id || generatedId
 
     const baseCheckboxClasses =
       'size-5 rounded-sm border shadow-xs transition-colors duration-200 focus:outline-hidden focus:ring-2 focus:ring-offset-0 disabled:cursor-not-allowed disabled:opacity-50'

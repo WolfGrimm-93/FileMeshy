@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 from uuid import UUID
 from datetime import datetime, timedelta, timezone
 import random
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.auth.models import PasswordResetSession
@@ -163,41 +164,88 @@ class CRUDPasswordResetSession:
         Returns:
             (is_valid, message) - Tupla con resultado y descripción
         """
-        session = CRUDPasswordResetSession.get_by_session_id(db, session_id)
+        # Ronda 12c (ALTO-1): el intento se CONSUME con un UPDATE atómico condicional
+        # ANTES de comparar el código. Antes se leía code_attempts en Python y se
+        # incrementaba después: N requests concurrentes leían el mismo valor y
+        # todos comparaban (reproducido en vivo: 16 comparaciones con límite 5).
+        # Con el UPDATE ... WHERE code_attempts < :max, Postgres serializa por fila y
+        # el total de comparaciones efectivas por sesión nunca supera `max_attempts`.
+        claimed = db.execute(
+            text(
+                "UPDATE password_reset_sessions SET code_attempts = COALESCE(code_attempts, 0) + 1 "
+                "WHERE session_id = :s AND COALESCE(code_attempts, 0) < :m "
+                "AND COALESCE(code_verified, false) = false AND COALESCE(is_used, false) = false "
+                "AND expires_at > now() RETURNING code_attempts"
+            ),
+            {"s": session_id, "m": max_attempts},
+        ).first()
+        db.commit()
 
-        if not session:
-            return False, "Sesión no encontrada"
-
-        if session.is_expired():
-            return False, "Sesión expirada"
-
-        if session.code_verified:
-            return False, "Código ya fue verificado"
-
-        if session.is_used:
-            return False, "Sesión ya fue utilizada"
-
-        if session.code_attempts >= max_attempts:
+        if claimed is None:
+            session = CRUDPasswordResetSession.get_by_session_id(db, session_id)
+            if not session:
+                return False, "Sesión no encontrada"
+            if session.is_expired():
+                return False, "Sesión expirada"
+            if session.code_verified:
+                return False, "Código ya fue verificado"
+            if session.is_used:
+                return False, "Sesión ya fue utilizada"
             return False, f"Máximo de intentos alcanzado ({max_attempts})"
 
-        # Validar formato del código (6 dígitos)
+        attempts = int(claimed[0])
+        session = CRUDPasswordResetSession.get_by_session_id(db, session_id)
+        db.refresh(session)
+
+        # Validar formato del código (6 dígitos) -- el intento ya fue consumido
         if not code or not code.isdigit() or len(code) != 6:
-            session.code_attempts += 1
-            db.commit()
             return False, "Código inválido (debe ser 6 dígitos)"
 
         # Validar contra hash
         if not CodeHashService.verify_code(code, session.code_hash):
-            session.code_attempts += 1
-            db.commit()
-            return False, f"Código incorrecto ({max_attempts - session.code_attempts} intentos restantes)"
+            return False, f"Código incorrecto ({max(0, max_attempts - attempts)} intentos restantes)"
 
-        # ✅ Código válido: marcar como verificado
-        session.code_verified = True
+        # ✅ Código válido: marcar como verificado (condicional: una sola vez)
+        verified = db.execute(
+            text(
+                "UPDATE password_reset_sessions SET code_verified = true "
+                "WHERE session_id = :s AND COALESCE(code_verified, false) = false "
+                "AND COALESCE(is_used, false) = false RETURNING id"
+            ),
+            {"s": session_id},
+        ).first()
         db.commit()
-        db.refresh(session)
+        if verified is None:
+            return False, "Código ya fue verificado"
 
         return True, "Código verificado correctamente"
+
+    @staticmethod
+    def claim_for_confirm(db: Session, session_id: str, user_id: UUID) -> bool:
+        """Ronda 12c (MEDIO-3): reclama el uso ÚNICO de la sesión con un UPDATE
+        condicional atómico (sin commit: queda en la transacción del cambio de
+        contraseña; un /confirm concurrente espera el lock de fila y luego ve
+        is_used=true). Además marca como usadas TODAS las demás sesiones de reset
+        pendientes del mismo usuario (un token verificado en otra sesión ya no
+        sirve). Devuelve False si otro /confirm ya la consumió."""
+        row = db.execute(
+            text(
+                "UPDATE password_reset_sessions SET is_used = true "
+                "WHERE session_id = :s AND COALESCE(is_used, false) = false "
+                "AND COALESCE(code_verified, false) = true AND expires_at > now() RETURNING id"
+            ),
+            {"s": session_id},
+        ).first()
+        if row is None:
+            return False
+        db.execute(
+            text(
+                "UPDATE password_reset_sessions SET is_used = true "
+                "WHERE user_id = :u AND COALESCE(is_used, false) = false"
+            ),
+            {"u": user_id},
+        )
+        return True
 
     @staticmethod
     def mark_used(db: Session, session_id: str) -> None:

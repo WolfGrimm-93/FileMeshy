@@ -35,10 +35,27 @@ const TAG_COLOR_PALETTE = [
   '#ec4899', // pink
 ]
 
+/**
+ * Mount-gate: sin target no monta nada, y el interior se remonta por `target.id`,
+ * así cada apertura sincroniza la selección desde el target y recarga el catálogo
+ * (con spinner, sin mostrar etiquetas de la apertura anterior) sin efectos de reset.
+ */
 export default function TagsModal({ target, onClose, onSaved }: TagsModalProps) {
+  if (!target) return null
+  return <TagsModalInner key={target.id} target={target} onClose={onClose} onSaved={onSaved} />
+}
+
+interface TagsModalInnerProps {
+  target: TagsTarget
+  onClose: () => void
+  onSaved: () => void
+}
+
+function TagsModalInner({ target, onClose, onSaved }: TagsModalInnerProps) {
   const [allTags, setAllTags] = useState<TagOut[]>([])
-  const [selectedIds, setSelectedIds] = useState<string[]>([])
-  const [loadingTags, setLoadingTags] = useState(false)
+  const [selectedIds, setSelectedIds] = useState<string[]>(target.currentTagIds)
+  // Arranca en true: el efecto de montaje carga el catálogo sin setState síncrono
+  const [loadingTags, setLoadingTags] = useState(true)
   const [saving, setSaving] = useState(false)
 
   const [newTagName, setNewTagName] = useState('')
@@ -51,17 +68,9 @@ export default function TagsModal({ target, onClose, onSaved }: TagsModalProps) 
   // proyecto para acciones irreversibles (ver DeleteConfirmDialog en FilesPage).
   const [deleteConfirmTag, setDeleteConfirmTag] = useState<TagOut | null>(null)
 
-  // Al abrir (cambio de target): sincronizar selección con las tags actuales del elemento
-  // y recargar el catálogo completo de etiquetas del usuario -- mismo patrón target-driven
-  // que RenameModal/MoveModal.
+  // Recargar el catálogo completo de etiquetas del usuario en cada apertura (montaje).
   useEffect(() => {
-    if (!target) return
-    setSelectedIds(target.currentTagIds)
-    setNewTagName('')
-    setNewTagColor(TAG_COLOR_PALETTE[0])
-
     let cancelled = false
-    setLoadingTags(true)
     tagsService
       .list()
       .then((tags) => {
@@ -77,7 +86,7 @@ export default function TagsModal({ target, onClose, onSaved }: TagsModalProps) 
     return () => {
       cancelled = true
     }
-  }, [target])
+  }, [])
 
   const handleClose = () => {
     if (saving || creating) return
@@ -128,7 +137,6 @@ export default function TagsModal({ target, onClose, onSaved }: TagsModalProps) 
   }
 
   const handleSubmit = async () => {
-    if (!target) return
     setSaving(true)
     try {
       if (target.type === 'folder') {
@@ -149,7 +157,7 @@ export default function TagsModal({ target, onClose, onSaved }: TagsModalProps) 
   return (
     <>
       <Modal
-        isOpen={!!target}
+        isOpen
         onClose={handleClose}
         title="Etiquetas"
         size="sm"

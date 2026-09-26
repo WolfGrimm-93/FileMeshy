@@ -15,7 +15,7 @@ import { Badge, type BadgeVariant } from '@/ui/badges/Badge'
 import { EmptyState } from '@/ui/empty-states/EmptyState'
 import { Modal } from '@/ui/modals/Modal'
 import { toast } from '@/ui/toast/CustomToast'
-import { formatDateTime } from '@/shared/utils/dates'
+import { formatDateTime, parseDate } from '@/shared/utils/dates'
 import { formatBytes } from '@/shared/utils/downloadFile'
 import { backupsService, type BackupRun, type BackupType } from '../services/backups.service'
 
@@ -73,9 +73,12 @@ function StatusBadgeCell({ run }: { run: BackupRun }) {
 function formatDuration(startedAt: string, finishedAt: string | null): string {
   if (!finishedAt) return 'En curso'
 
-  const start = new Date(startedAt).getTime()
-  const end = new Date(finishedAt).getTime()
-  if (isNaN(start) || isNaN(end) || end < start) return '—'
+  const startDate = parseDate(startedAt)
+  const endDate = parseDate(finishedAt)
+  if (!startDate || !endDate) return '—'
+  const start = startDate.getTime()
+  const end = endDate.getTime()
+  if (end < start) return '—'
 
   const totalSeconds = Math.round((end - start) / 1000)
   const minutes = Math.floor(totalSeconds / 60)
@@ -101,18 +104,29 @@ export default function BackupsPage() {
 
   const autoRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  const fetchRuns = useCallback(async () => {
+  // Núcleo del fetch (sin setState síncrono; `isLoading` arranca en true)
+  const fetchRuns = useCallback(
+    () =>
+      backupsService
+        .list()
+        .then((data) => {
+          setRuns(data)
+        })
+        .catch(() => {
+          toast.error('Error al cargar el historial de backups')
+        })
+        .finally(() => {
+          setIsLoading(false)
+          setIsFirstLoad(false)
+        }),
+    []
+  )
+
+  // Refresco explícito (botón, timer tras disparar un backup): muestra el loading
+  const refreshRuns = useCallback(() => {
     setIsLoading(true)
-    try {
-      const data = await backupsService.list()
-      setRuns(data)
-    } catch {
-      toast.error('Error al cargar el historial de backups')
-    } finally {
-      setIsLoading(false)
-      setIsFirstLoad(false)
-    }
-  }, [])
+    return fetchRuns()
+  }, [fetchRuns])
 
   useEffect(() => {
     fetchRuns()
@@ -129,7 +143,7 @@ export default function BackupsPage() {
       if (response.queued) {
         toast.success(response.message || fallbackMessage)
         if (autoRefreshTimerRef.current) clearTimeout(autoRefreshTimerRef.current)
-        autoRefreshTimerRef.current = setTimeout(fetchRuns, AUTO_REFRESH_DELAY_MS)
+        autoRefreshTimerRef.current = setTimeout(refreshRuns, AUTO_REFRESH_DELAY_MS)
       } else {
         toast.warning(response.message || 'El backup no se pudo encolar')
       }
@@ -138,7 +152,7 @@ export default function BackupsPage() {
     } finally {
       setIsRunningBackup(false)
     }
-  }, [fetchRuns])
+  }, [refreshRuns])
 
   const columns: Column<BackupRun>[] = useMemo(() => [
     {
@@ -221,7 +235,7 @@ export default function BackupsPage() {
         </div>
 
         <div className="flex gap-2 shrink-0">
-          <Button variant="secondary" onClick={fetchRuns} leftIcon={<RefreshCw className="w-4 h-4" />}>
+          <Button variant="secondary" onClick={refreshRuns} leftIcon={<RefreshCw className="w-4 h-4" />}>
             Actualizar
           </Button>
           {canManage && (

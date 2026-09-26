@@ -19,6 +19,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
+from app.shared.utils.datetime_iso import to_utc_iso
 from app.core.database import get_db
 from app.auth.service import get_current_active_user
 from app.users.models import User
@@ -55,6 +56,37 @@ def require_admin(current_user: User = Depends(get_current_active_user)) -> User
             detail="Se requieren permisos de administrador",
         )
     return current_user
+
+
+# Sufijos de config_key que delatan un secreto aunque la fila NO tenga
+# is_encrypted=True (ej. creada por el POST genérico /create, o cualquier
+# otra vía). Fase 4 (Ronda 12): antes solo se enmascaraba por is_encrypted.
+# (sufijo, no substring: `password_min_length` es una política, no un secreto)
+from app.configuration.repository import SECRET_KEY_SUFFIXES as _SECRET_KEY_SUFFIXES  # noqa: E402
+
+
+def _is_secret_config(config) -> bool:
+    """True si el valor de la fila nunca debe salir en una respuesta: está
+    marcada como cifrada o su clave parece un secreto."""
+    key = (config.config_key or "").lower()
+    return bool(config.is_encrypted) or key.endswith(_SECRET_KEY_SUFFIXES)
+
+
+def _config_value(config):
+    """Valor de la fila para serializar: la primera columna NO nula en orden
+    string/number/boolean/json (a diferencia de `a or b or c`, un False o un 0
+    legítimos no se pierden como None). Los secretos salen como "****"."""
+    values = (config.value_string, config.value_number, config.value_boolean, config.value_json)
+    if _is_secret_config(config):
+        # "****" solo si HAY un valor guardado (no NULL ni vacío): así el
+        # frontend puede mostrar honestamente "contraseña sin configurar".
+        has_value = any(v is not None and v != "" for v in values)
+        return "****" if has_value else None
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
 
 
 # ========================================================================
@@ -289,7 +321,7 @@ def get_config_by_category(
             {
                 "key": c.config_key,
                 "name": c.config_name,
-                "value": c.value_string or c.value_number or c.value_boolean or c.value_json,
+                "value": _config_value(c),
                 "is_encrypted": c.is_encrypted
             }
             for c in configs
@@ -308,11 +340,8 @@ def get_all_configs(db: Session = Depends(get_db), current_user: User = Depends(
 
     result = []
     for c in configs:
-        if c.is_encrypted:
-            # No retornar datos encriptados
-            value = "****"
-        else:
-            value = c.value_string or c.value_number or c.value_boolean or c.value_json
+        # Secretos (cifrados o por nombre de clave) salen enmascarados.
+        value = _config_value(c)
 
         result.append({
             "key": c.config_key,
@@ -532,10 +561,16 @@ def get_email_config(db: Session = Depends(get_db), current_user: User = Depends
     configs = crud_system_configuration.get_by_category(db, "email")
 
     if not configs:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No hay configuración de email"
-        )
+        # Ronda 12: antes devolvía 404 (ruido de consola en el navegador para
+        # un estado perfectamente normal: instalación sin SMTP configurado).
+        # Único consumidor: filemeshy_front `getEmailConfig`
+        # (admin-configuration.service.ts, NotificacionesTab.tsx), que lee
+        # `response.data.data`.
+        return {
+            "message": "Sin configuración de email",
+            "configured": False,
+            "data": {},
+        }
 
     # Mapear a formato frontend-friendly
     data = {}
@@ -544,19 +579,17 @@ def get_email_config(db: Session = Depends(get_db), current_user: User = Depends
         # removeprefix solo quita el primer "email_", evitando doble reemplazo en "email_email_method"
         key = config.config_key.removeprefix("email_")
 
-        # Obtener valor según tipo
-        if config.is_encrypted and config.value_string:
-            value = "****"  # Nunca se muestra en la respuesta, sea cual sea el valor real
-        else:
-            value = config.value_string or config.value_number or config.value_boolean or config.value_json
-            # Los puertos se guardan como Numeric(12,2) — convertir a int
-            if config.data_type == 'number' and value is not None:
-                value = int(value)
+        # Obtener valor según tipo (secretos -> "****", ver _config_value)
+        value = _config_value(config)
+        # Los puertos se guardan como Numeric(12,2) — convertir a int
+        if config.data_type == 'number' and value is not None and not isinstance(value, (bool, str)):
+            value = int(value)
 
         data[key] = value
 
     return {
         "message": "Configuración de email",
+        "configured": True,
         "data": data
     }
 
@@ -617,6 +650,9 @@ def update_email_config(
         updated_count = 0
 
         for config_key, value in updates.items():
+            if config_key == 'email_smtp_password' and value == '****':
+                continue  # máscara reenviada por el cliente: no es un valor nuevo
+
             config = crud_system_configuration.get_by_key(db, config_key)
 
             if not config:
@@ -756,8 +792,8 @@ async def get_my_preferences(
         "email_notifications": preferences.email_notifications,
         "system_notifications": preferences.system_notifications,
         "rows_per_page": preferences.rows_per_page,
-        "created_at": preferences.created_at.isoformat() + 'Z' if preferences.created_at else None,
-        "updated_at": preferences.updated_at.isoformat() + 'Z' if preferences.updated_at else None,
+        "created_at": to_utc_iso(preferences.created_at),
+        "updated_at": to_utc_iso(preferences.updated_at),
     }
 
     cache.set(cache_key, pref_data, ttl=300)
@@ -830,8 +866,8 @@ async def get_user_preferences(
         "email_notifications": preferences.email_notifications,
         "system_notifications": preferences.system_notifications,
         "rows_per_page": preferences.rows_per_page,
-        "created_at": preferences.created_at.isoformat() + 'Z' if preferences.created_at else None,
-        "updated_at": preferences.updated_at.isoformat() + 'Z' if preferences.updated_at else None,
+        "created_at": to_utc_iso(preferences.created_at),
+        "updated_at": to_utc_iso(preferences.updated_at),
     }
 
     cache.set(cache_key, pref_data, ttl=300)

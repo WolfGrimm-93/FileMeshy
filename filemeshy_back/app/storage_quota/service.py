@@ -34,7 +34,7 @@ def reserve_upload_bytes(db: Session, user_id: UUID, additional_bytes: int) -> N
     la subida tuvo éxito."""
     if not user_storage_quota_repo.reserve_bytes_or_fail(db, user_id, additional_bytes):
         raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             detail="Se alcanzó el límite de almacenamiento asignado",
         )
 
@@ -66,6 +66,7 @@ def _notify_if_near_limit(db: Session, user_id: UUID) -> None:
         if usage_ratio < _QUOTA_WARNING_THRESHOLD:
             return
 
+        from app.notifications.routes import ACTION_URL_MY_FILES
         from app.worker.tasks.notification_helpers import _is_duplicate, create_notification
 
         if _is_duplicate(db, user_id, "almacenamiento", reference_id=user_id):
@@ -78,7 +79,7 @@ def _notify_if_near_limit(db: Session, user_id: UUID) -> None:
             message=f"Ya usaste el {round(usage_ratio * 100)}% de tu límite de almacenamiento asignado.",
             notif_type="almacenamiento",
             severity="warning",
-            action_url="/configuracion/almacenamiento",
+            action_url=ACTION_URL_MY_FILES,
             extra_data={"reference_id": str(user_id), "usage_ratio": usage_ratio},
         )
     except Exception as exc:

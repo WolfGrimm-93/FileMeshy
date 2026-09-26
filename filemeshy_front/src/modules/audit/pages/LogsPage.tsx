@@ -121,15 +121,28 @@ const LEVEL_ICONS: Record<string, React.ReactNode> = {
 // Componente
 // ===========================
 
+const EMPTY_LOGS: LogEntry[] = []
+const EMPTY_MODULES: string[] = []
+
 export default function LogsPage() {
-  const [logs, setLogs] = useState<LogEntry[]>([])
-  const [isLoading, setIsLoading] = useState(true)
+  // Resultado del último fetch, atado a la clave de la petición que lo produjo: `isLoading`
+  // se deriva de que la clave actual todavía no tenga resultado (sin setState síncrono en efectos).
+  const [result, setResult] = useState<{
+    key: string
+    logs: LogEntry[]
+    total: number
+    modules: string[]
+  } | null>(null)
+  // Contador para forzar recargas explícitas (botón Actualizar)
+  const [refreshTick, setRefreshTick] = useState(0)
+  // Mientras carga se conservan los datos previos (igual que antes)
+  const logs = result?.logs ?? EMPTY_LOGS
+  const total = result?.total ?? 0
+  const availableModules = result?.modules ?? EMPTY_MODULES
   const [searchTerm, setSearchTerm] = useState('')
   const [selectedLog, setSelectedLog] = useState<LogEntry | null>(null)
   const [selectedLogDetail, setSelectedLogDetail] = useState<AuditLogDetail | null>(null)
   const [isDetailOpen, setIsDetailOpen] = useState(false)
-  const [total, setTotal] = useState(0)
-  const [availableModules, setAvailableModules] = useState<string[]>([])
   const [isFilterModalOpen, setIsFilterModalOpen] = useState(false)
 
   // Paginación real (antes: limit fijo en 50, sin controles) -- mismo patrón que ProductosPage.
@@ -254,10 +267,13 @@ export default function LogsPage() {
     }, 300)
   }, [])
 
-  const loadLogs = useCallback(async () => {
-    setIsLoading(true)
-    try {
-      const data = await auditLogService.getLogs({
+  const requestKey = JSON.stringify([actionFilter, dateFrom, dateTo, moduleFilter, debouncedSearch, currentPage, pageSize, refreshTick])
+  const isLoading = result?.key !== requestKey
+
+  useEffect(() => {
+    let cancelled = false
+    auditLogService
+      .getLogs({
         action: actionFilter || undefined,
         table_name: moduleFilter || undefined,
         start_date: dateFrom ? dateBoundaryISO(dateFrom, 0) : undefined,
@@ -266,19 +282,30 @@ export default function LogsPage() {
         skip: (currentPage - 1) * pageSize,
         limit: pageSize,
       })
-
-      setLogs(data.logs.map(mapAuditLogToEntry))
-      setTotal(data.total)
-      const modules = [...new Set(data.logs.map((l: AuditLog) => l.table_name))].filter(Boolean).sort() as string[]
-      setAvailableModules(modules)
-    } catch {
-      toast.error('Error al cargar los logs de auditoría')
-    } finally {
-      setIsLoading(false)
+      .then((data) => {
+        if (cancelled) return
+        const modules = [...new Set(data.logs.map((l: AuditLog) => l.table_name))].filter(Boolean).sort() as string[]
+        setResult({ key: requestKey, logs: data.logs.map(mapAuditLogToEntry), total: data.total, modules })
+      })
+      .catch(() => {
+        if (cancelled) return
+        toast.error('Error al cargar los logs de auditoría')
+        setResult((prev) => ({
+          key: requestKey,
+          logs: prev?.logs ?? [],
+          total: prev?.total ?? 0,
+          modules: prev?.modules ?? [],
+        }))
+      })
+    return () => {
+      cancelled = true
     }
-  }, [actionFilter, dateFrom, dateTo, moduleFilter, debouncedSearch, currentPage, pageSize])
+  }, [requestKey, actionFilter, dateFrom, dateTo, moduleFilter, debouncedSearch, currentPage, pageSize])
 
-  useEffect(() => { loadLogs() }, [actionFilter, dateFrom, dateTo, moduleFilter, debouncedSearch, currentPage, pageSize])
+  // Recarga explícita: cambia la clave, por lo que `isLoading` vuelve a ser true hasta el nuevo resultado.
+  const loadLogs = useCallback(() => {
+    setRefreshTick((t) => t + 1)
+  }, [setRefreshTick])
 
   // Stats globales una sola vez al montar.
   useEffect(() => {
@@ -415,7 +442,7 @@ export default function LogsPage() {
                     <TableCell className="text-sm">
                       <div className="flex items-center gap-1.5 text-muted-foreground">
                         <Calendar className="h-3.5 w-3.5 shrink-0" />
-                        {formatDateTime(log.timestamp)}
+                        {formatDateTime(log.timestamp) ?? '—'}
                       </div>
                     </TableCell>
                     <TableCell>
@@ -465,7 +492,7 @@ export default function LogsPage() {
             <div className="grid grid-cols-2 gap-4">
               <div>
                 <p className="text-xs font-medium text-muted-foreground mb-1">Fecha/Hora</p>
-                <p className="text-sm text-foreground">{formatDateTime(selectedLog.timestamp) ?? ''}</p>
+                <p className="text-sm text-foreground">{formatDateTime(selectedLog.timestamp) ?? '—'}</p>
               </div>
               <div>
                 <p className="text-xs font-medium text-muted-foreground mb-1">Tipo</p>

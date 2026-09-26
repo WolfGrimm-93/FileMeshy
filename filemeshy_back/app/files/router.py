@@ -39,7 +39,7 @@ from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
 from app.access_control.service import has_permission
-from app.auth.service import RateLimiter, get_current_active_user
+from app.auth.service import RateLimiter, get_current_active_user, too_many_requests
 from app.audit.service import log_audit
 from app.core.config import settings
 from app.core.database import SessionLocal, get_db
@@ -76,6 +76,7 @@ from app.files.schemas import (
 )
 from app.files.service import (
     convert_office_to_pdf,
+    copy_private_object,
     delete_private_file,
     detect_audio_type,
     detect_image_type,
@@ -185,7 +186,7 @@ def _enforce_office_preview_rate_limit(current_user: User) -> None:
         lock_duration=OFFICE_PREVIEW_RATE_LIMIT_WINDOW_SECONDS,
     )
     if not is_allowed:
-        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=rl_message)
+        raise too_many_requests(rl_message)
     RateLimiter.record_attempt(rl_key, window_seconds=OFFICE_PREVIEW_RATE_LIMIT_WINDOW_SECONDS)
 
 
@@ -418,6 +419,7 @@ def _notify_share_recipient(db: Session, recipient_id: UUID, resource_name: str)
     import a nivel de módulo entre `files` y `worker.tasks`. `create_notification`
     ya es best-effort internamente (atrapa sus propias excepciones y devuelve
     False) -- no hace falta envolver esta llamada en otro try/except."""
+    from app.notifications.routes import ACTION_URL_SHARED_WITH_ME
     from app.worker.tasks.notification_helpers import create_notification
 
     create_notification(
@@ -427,7 +429,7 @@ def _notify_share_recipient(db: Session, recipient_id: UUID, resource_name: str)
         message=f"Te compartieron: {resource_name}",
         notif_type="compartido",
         severity="info",
-        action_url="/archivos/compartidos",
+        action_url=ACTION_URL_SHARED_WITH_ME,
         extra_data={},
     )
 
@@ -670,6 +672,8 @@ def _resolve_copy_destination(
     se respeta tal cual. `null` explícito = raíz. Un UUID puntual se valida
     con el mismo helper de ownership que usa el resto del router (404 si no
     existe o es de otro dueño)."""
+    if payload is not None and payload.to_root:
+        return None
     if payload is not None and "folder_id" in payload.model_fields_set:
         if payload.folder_id is None:
             return None
@@ -730,20 +734,29 @@ def _copy_file_object(
     name: str,
     reservations: List[tuple],
     uploaded_keys: List[str],
+    created_ids: Optional[List[UUID]] = None,
 ) -> FileModel:
     """Copia un único archivo (bytes + fila nueva), reservando cuota real
     igual que `upload_file`. No hace `commit` -- lo hace el caller una vez
     que terminó (todo el archivo, o todo el subárbol de una carpeta)."""
-    content = _read_private_object(source_file.storage_key)
-    size = len(content)
+    # Ronda 12d: la copia NO trae el contenido al proceso (copia server-side en MinIO) y no
+    # se debilita el escaneo antivirus: solo se copia un archivo 'clean' (los pending/
+    # infected/scan_failed ni siquiera son visibles por el CRUD, esto es defensa en profundidad)
+    # y la copia hereda el `scan_status` del origen, nunca queda "clean" por defecto.
+    if source_file.scan_status != "clean":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="El archivo todavía no pasó el análisis antivirus: no se puede copiar",
+        )
+    size = source_file.size_bytes or 0
 
     _reserve_copy_quota(owner_id, size)
     reservations.append((owner_id, size))
 
     try:
-        storage_key = upload_private_file(
-            path=f"files/{owner_id}",
-            content=content,
+        storage_key = copy_private_object(
+            source_file.storage_key,
+            dest_path=f"files/{owner_id}",
             extension=os.path.splitext(source_file.name)[1],
             content_type=source_file.mime_type,
         )
@@ -760,9 +773,24 @@ def _copy_file_object(
         storage_key=storage_key,
         size_bytes=size,
         mime_type=source_file.mime_type,
+        scan_status=source_file.scan_status,
     )
     db.add(new_file)
     db.flush()
+    # Versión inicial (igual que una subida normal): sin ella la copia no tenía historial.
+    db.add(
+        FileVersion(
+            file_id=new_file.id,
+            version_number=1,
+            storage_key=storage_key,
+            size_bytes=size,
+            mime_type=source_file.mime_type,
+            created_by_id=owner_id,
+        )
+    )
+    db.flush()
+    if created_ids is not None:
+        created_ids.append(new_file.id)
     return new_file
 
 
@@ -775,6 +803,7 @@ def _copy_folder_tree(
     name: str,
     reservations: List[tuple],
     uploaded_keys: List[str],
+    created_ids: Optional[List[UUID]] = None,
 ) -> Folder:
     """Copia recursiva de `source_folder` (la carpeta en sí + todo su
     subárbol de subcarpetas y archivos activos) bajo `parent_id`. La
@@ -793,6 +822,7 @@ def _copy_folder_tree(
             name=child_file.name,
             reservations=reservations,
             uploaded_keys=uploaded_keys,
+            created_ids=created_ids,
         )
 
     for child_folder in folder_repo.get_children(db, source_folder.owner_id, source_folder.id):
@@ -804,6 +834,7 @@ def _copy_folder_tree(
             name=child_folder.name,
             reservations=reservations,
             uploaded_keys=uploaded_keys,
+            created_ids=created_ids,
         )
 
     return new_folder
@@ -972,6 +1003,15 @@ def copy_folder(
         dest_parent = folder_repo.get(db, dest_parent_id)
         if not dest_parent:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Carpeta destino no encontrada")
+        # Ronda 12c (MEDIO-4): copiar una carpeta dentro de sí misma o de un descendiente
+        # es un ciclo (reproducido: 500 por recursión sobre la copia recién flusheada,
+        # con rollback dejando objetos de storage huérfanos). Se rechaza ANTES de copiar
+        # nada, con el mismo helper que usa mover.
+        if _would_create_cycle(db, source_folder.id, dest_parent_id):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No se puede copiar una carpeta dentro de sí misma ni de una de sus subcarpetas",
+            )
         dest_parent_depth = _folder_depth(db, dest_parent)
     else:
         dest_parent_depth = 0
@@ -991,6 +1031,7 @@ def copy_folder(
 
     reservations: List[tuple] = []
     uploaded_keys: List[str] = []
+    created_ids: List[UUID] = []
     try:
         new_folder = _copy_folder_tree(
             db,
@@ -1000,12 +1041,15 @@ def copy_folder(
             name=new_name,
             reservations=reservations,
             uploaded_keys=uploaded_keys,
+            created_ids=created_ids,
         )
         db.commit()
     except Exception:
         _rollback_copy(db, reservations, uploaded_keys)
         raise
     db.refresh(new_folder)
+    for new_id in created_ids:  # cada archivo copiado se re-indexa
+        _enqueue_content_indexing(new_id)
     return new_folder
 
 
@@ -1096,7 +1140,7 @@ async def _scan_for_malware_or_raise(content: bytes, *, original_name: str) -> N
             f"[Antivirus] Archivo '{original_name}' rechazado -- amenaza detectada: {threat_name}"
         )
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"Archivo rechazado: se detectó contenido malicioso ({threat_name})",
         )
 
@@ -1217,7 +1261,7 @@ async def upload_file(
     # un archivo que de entrada excede el límite).
     if file.size is not None and file.size > max_bytes:
         raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             detail=f"El archivo supera el tamaño máximo permitido ({settings.MAX_UPLOAD_SIZE_MB} MB)",
         )
 
@@ -1234,7 +1278,7 @@ async def upload_file(
     content = await file.read()
     if len(content) > max_bytes:
         raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             detail=f"El archivo supera el tamaño máximo permitido ({settings.MAX_UPLOAD_SIZE_MB} MB)",
         )
 
@@ -1330,7 +1374,7 @@ def get_file_preview(
         if file_obj.size_bytes > MAX_OFFICE_PREVIEW_SOURCE_BYTES:
             max_mb = MAX_OFFICE_PREVIEW_SOURCE_BYTES // (1024 * 1024)
             raise HTTPException(
-                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
                 detail=f"El archivo supera el tamaño máximo permitido para generar una vista previa ({max_mb} MB)",
             )
         _enforce_office_preview_rate_limit(current_user)
@@ -1462,6 +1506,7 @@ def copy_file(
 
     reservations: List[tuple] = []
     uploaded_keys: List[str] = []
+    created_ids: List[UUID] = []
     try:
         new_file = _copy_file_object(
             db,
@@ -1471,12 +1516,15 @@ def copy_file(
             name=new_name,
             reservations=reservations,
             uploaded_keys=uploaded_keys,
+            created_ids=created_ids,
         )
         db.commit()
     except Exception:
         _rollback_copy(db, reservations, uploaded_keys)
         raise
     db.refresh(new_file)
+    # La copia se re-indexa (contenido/OCR), igual que una subida.
+    _enqueue_content_indexing(new_file.id)
     return new_file
 
 
@@ -1606,14 +1654,14 @@ async def upload_file_version(
     max_bytes = settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024
     if file.size is not None and file.size > max_bytes:
         raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             detail=f"El archivo supera el tamaño máximo permitido ({settings.MAX_UPLOAD_SIZE_MB} MB)",
         )
 
     content = await file.read()
     if len(content) > max_bytes:
         raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             detail=f"El archivo supera el tamaño máximo permitido ({settings.MAX_UPLOAD_SIZE_MB} MB)",
         )
 
@@ -1934,7 +1982,7 @@ def _enforce_directed_share_rate_limit(current_user: User, bucket: str) -> None:
         rl_key, max_requests=max_attempts, window_seconds=DIRECTED_SHARE_RATE_LIMIT_WINDOW_SECONDS
     )
     if not is_allowed:
-        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=rl_message)
+        raise too_many_requests(rl_message)
 
 
 def _get_directed_share_for_viewer(db: Session, share_id: UUID, current_user: User) -> Share:
@@ -2061,14 +2109,14 @@ async def upload_file_via_share(
     max_bytes = settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024
     if file.size is not None and file.size > max_bytes:
         raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             detail=f"El archivo supera el tamaño máximo permitido ({settings.MAX_UPLOAD_SIZE_MB} MB)",
         )
 
     content = await file.read()
     if len(content) > max_bytes:
         raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             detail=f"El archivo supera el tamaño máximo permitido ({settings.MAX_UPLOAD_SIZE_MB} MB)",
         )
 
@@ -2116,14 +2164,14 @@ async def replace_file_via_share(
     max_bytes = settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024
     if file.size is not None and file.size > max_bytes:
         raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             detail=f"El archivo supera el tamaño máximo permitido ({settings.MAX_UPLOAD_SIZE_MB} MB)",
         )
 
     content = await file.read()
     if len(content) > max_bytes:
         raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             detail=f"El archivo supera el tamaño máximo permitido ({settings.MAX_UPLOAD_SIZE_MB} MB)",
         )
 
@@ -2167,7 +2215,7 @@ def _enforce_public_share_rate_limit(request: Request) -> None:
         window_seconds=PUBLIC_SHARE_RATE_LIMIT_WINDOW_SECONDS,
     )
     if not is_allowed:
-        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=rl_message)
+        raise too_many_requests(rl_message)
 
 
 def _get_valid_share(db: Session, token: str) -> Share:

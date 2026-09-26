@@ -81,7 +81,15 @@ def register_exception_handlers(app: FastAPI):
         # plano y el mensaje se resuelve contra ERROR_MESSAGES.
         if "/password-reset" in request.url.path:
             error_code = exc.detail
-            message = ERROR_MESSAGES.get(error_code, "Error desconocido")
+            if isinstance(error_code, str) and error_code in ERROR_MESSAGES:
+                message = ERROR_MESSAGES[error_code]
+            else:
+                # Ronda 12c: un detail que no es un código conocido (p. ej. el texto libre
+                # del limitador de /password-reset/*: "Demasiadas solicitudes. Intenta en
+                # N segundos") llegaba al usuario como "<texto>: Error desconocido". Se
+                # devuelve tal cual como mensaje; el `status`/`code` queda legible y estable.
+                message = str(exc.detail)
+                error_code = "rate_limited" if exc.status_code == 429 else "error"
             return JSONResponse(
                 status_code=exc.status_code,
                 content={

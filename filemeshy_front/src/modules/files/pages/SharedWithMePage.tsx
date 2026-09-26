@@ -11,7 +11,7 @@
  * 'edit', además se puede subir un archivo nuevo a la carpeta o reemplazar el
  * contenido de un archivo, según corresponda.
  */
-import { useCallback, useEffect, useRef, useState, type ChangeEvent } from 'react'
+import { useEffect, useRef, useState, type ChangeEvent } from 'react'
 import {
   ChevronRight,
   Download,
@@ -30,11 +30,15 @@ import { EmptyState } from '@/ui/empty-states/EmptyState'
 import { toast } from '@/ui/toast/CustomToast'
 import { formatBytes } from '@/shared/utils/downloadFile'
 import { extractErrorMessage } from '@/shared/utils/errors'
+import { parseDate } from '@/shared/utils/dates'
 import { sharesService } from '../services/shares.service'
 import type { FileOut, FolderOut, PublicShareResponse, SharedWithMeItem, SharePermission } from '../types'
 
+// Parseo tolerante (shared/utils/dates): acepta "+00:00Z" y nunca devuelve "Invalid Date"
 function formatDate(iso: string): string {
-  return new Date(iso).toLocaleString('es-ES', {
+  const date = parseDate(iso)
+  if (!date) return '—'
+  return date.toLocaleString('es-ES', {
     day: '2-digit',
     month: 'short',
     year: 'numeric',
@@ -52,54 +56,62 @@ function permissionBadge(permission: SharePermission) {
  * que la rama "folder" de PublicSharePage, pero autenticado (sin token en la
  * URL) y dentro de un Modal en vez de una página completa.
  */
+interface SharedFolderTarget {
+  shareId: string
+  name: string
+}
+
 interface SharedFolderModalProps {
-  target: { shareId: string; name: string } | null
+  target: SharedFolderTarget | null
   onClose: () => void
 }
 
+/**
+ * Mount-gate: no monta nada sin target, y el interior se remonta por shareId,
+ * así cada apertura arranca en la raíz sin efectos que reseteen estado.
+ */
 function SharedFolderModal({ target, onClose }: SharedFolderModalProps) {
+  if (!target) return null
+  return <SharedFolderModalInner key={target.shareId} target={target} onClose={onClose} />
+}
+
+function SharedFolderModalInner({ target, onClose }: { target: SharedFolderTarget; onClose: () => void }) {
   const [path, setPath] = useState<string | null>(null)
-  const [data, setData] = useState<PublicShareResponse | null>(null)
-  const [loading, setLoading] = useState(false)
-
-  const load = useCallback(async () => {
-    if (!target) return
-    setLoading(true)
-    try {
-      const response = await sharesService.getShared(target.shareId, path ?? undefined)
-      setData(response)
-    } catch (error: unknown) {
-      toast.error(extractErrorMessage(error, 'Error al cargar el contenido de la carpeta'))
-    } finally {
-      setLoading(false)
-    }
-  }, [target, path])
+  // Resultado atado a la ruta que lo produjo: `loading` se deriva de que la ruta actual
+  // todavía no tenga resultado.
+  const [result, setResult] = useState<{ key: string; data: PublicShareResponse | null } | null>(null)
+  const pathKey = path ?? ''
+  const loading = result?.key !== pathKey
+  const data = result?.data ?? null
 
   useEffect(() => {
-    if (target) {
-      setPath(null)
-      setData(null)
+    let cancelled = false
+    sharesService
+      .getShared(target.shareId, path ?? undefined)
+      .then((response) => {
+        if (!cancelled) setResult({ key: pathKey, data: response })
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return
+        toast.error(extractErrorMessage(error, 'Error al cargar el contenido de la carpeta'))
+        setResult((prev) => ({ key: pathKey, data: prev?.data ?? null }))
+      })
+    return () => {
+      cancelled = true
     }
-  }, [target])
-
-  useEffect(() => {
-    load()
-  }, [load])
+  }, [target.shareId, path, pathKey])
 
   const handleFileOpen = async (file: FileOut) => {
-    if (!target) return
     try {
       const url = await sharesService.getSharedDownloadUrl(target.shareId, file.id)
-      window.location.href = url
+      window.location.assign(url)
     } catch (error: unknown) {
       toast.error(extractErrorMessage(error, 'Error al descargar el archivo'))
     }
   }
 
-  if (!target) return null
-
   return (
-    <Modal isOpen={!!target} onClose={onClose} title={target.name} size="lg">
+    <Modal isOpen onClose={onClose} title={target.name} size="lg">
       <div className="flex items-center gap-2 border-b border-gray-200 pb-3 text-sm text-gray-600 dark:border-gray-700 dark:text-gray-400">
         <button
           type="button"
@@ -169,27 +181,32 @@ export default function SharedWithMePage() {
   const [isFirstLoad, setIsFirstLoad] = useState(true)
   const [loading, setLoading] = useState(true)
   const [busyShareId, setBusyShareId] = useState<string | null>(null)
-  const [folderTarget, setFolderTarget] = useState<{ shareId: string; name: string } | null>(null)
+  const [folderTarget, setFolderTarget] = useState<SharedFolderTarget | null>(null)
 
   const fileInputRef = useRef<HTMLInputElement>(null)
   const pendingActionRef = useRef<{ shareId: string; kind: 'upload' | 'replace' } | null>(null)
 
-  const loadItems = useCallback(async () => {
-    setLoading(true)
-    try {
-      const data = await sharesService.listSharedWithMe()
-      setItems(data)
-    } catch (error: unknown) {
-      toast.error(extractErrorMessage(error, 'Error al cargar lo compartido con vos'))
-    } finally {
-      setLoading(false)
-      setIsFirstLoad(false)
+  // `loading` ya arranca en true y esta carga solo ocurre al montar: no hace falta setLoading(true)
+  useEffect(() => {
+    let cancelled = false
+    sharesService
+      .listSharedWithMe()
+      .then((data) => {
+        if (!cancelled) setItems(data)
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) toast.error(extractErrorMessage(error, 'Error al cargar lo compartido con vos'))
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setLoading(false)
+          setIsFirstLoad(false)
+        }
+      })
+    return () => {
+      cancelled = true
     }
   }, [])
-
-  useEffect(() => {
-    loadItems()
-  }, [loadItems])
 
   const handleOpen = async (item: SharedWithMeItem) => {
     if (item.resource_type === 'folder') {
@@ -199,7 +216,7 @@ export default function SharedWithMePage() {
     try {
       const response = await sharesService.getShared(item.share_id)
       if (response.type === 'file') {
-        window.location.href = response.download_url
+        window.location.assign(response.download_url)
       }
     } catch (error: unknown) {
       toast.error(extractErrorMessage(error, 'Error al descargar el archivo'))

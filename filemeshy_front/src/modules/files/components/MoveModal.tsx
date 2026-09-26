@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState } from 'react'
 import { Folder, ChevronRight, Home, MoveRight } from 'lucide-react'
 import { Modal } from '@/ui/modals/Modal'
 import { Button } from '@/ui/buttons/Button'
@@ -17,47 +17,79 @@ export interface MoveTarget {
 }
 
 interface MoveModalProps {
+  /** 'move' (default) mueve el elemento; 'copy' lo copia a la carpeta elegida (raíz = null explícito). */
+  mode?: 'move' | 'copy'
   target: MoveTarget | null
   onClose: () => void
   onMoved: (target: MoveTarget, newFolderId: string | null) => void
 }
 
-export default function MoveModal({ target, onClose, onMoved }: MoveModalProps) {
-  const [browseFolderId, setBrowseFolderId] = useState<string | null>(null)
-  const [breadcrumb, setBreadcrumb] = useState<BreadcrumbItem[]>([])
-  const [folders, setFolders] = useState<FolderOut[]>([])
-  const [loading, setLoading] = useState(false)
+/**
+ * Mount-gate: sin target no monta nada, y el interior se remonta por `target.id`,
+ * así cada apertura arranca en la raíz sin efectos que reseteen el navegador.
+ */
+export default function MoveModal({ mode = 'move', target, onClose, onMoved }: MoveModalProps) {
+  if (!target) return null
+  return <MoveModalInner key={target.id} mode={mode} target={target} onClose={onClose} onMoved={onMoved} />
+}
+
+interface MoveModalInnerProps {
+  mode: 'move' | 'copy'
+  target: MoveTarget
+  onClose: () => void
+  onMoved: (target: MoveTarget, newFolderId: string | null) => void
+}
+
+function MoveModalInner({ mode, target, onClose, onMoved }: MoveModalInnerProps) {
+  const isCopy = mode === 'copy'
+  // Copiar arranca en la carpeta actual del elemento (destino natural); mover, en la raíz
+  const [browseFolderId, setBrowseFolderId] = useState<string | null>(isCopy ? target.currentFolderId : null)
+  // Resultado atado a la carpeta que se estaba navegando: `loading` se deriva de que la
+  // carpeta actual todavía no tenga resultado (sin setState síncrono en efectos).
+  const [result, setResult] = useState<{
+    key: string
+    folders: FolderOut[]
+    breadcrumb: BreadcrumbItem[]
+    failed: boolean
+  } | null>(null)
   const [moving, setMoving] = useState(false)
+  // Contador para reintentar tras un error de listado (entra en la clave de la petición)
+  const [retryTick, setRetryTick] = useState(0)
 
-  // Reiniciar el navegador de carpetas cada vez que se abre para un item nuevo
-  useEffect(() => {
-    if (target) {
-      setBrowseFolderId(null)
-      setBreadcrumb([])
-    }
-  }, [target])
-
-  const loadFolders = useCallback(async (folderId: string | null) => {
-    setLoading(true)
-    try {
-      const listing = await filesService.list({ folderId: folderId ?? undefined })
-      // No ofrecer como destino la propia carpeta que se está moviendo (no se
-      // puede mover una carpeta dentro de sí misma) -- el resto de ciclos
-      // (mover dentro de un descendiente) los valida el backend.
-      setFolders(listing.folders.filter((f) => f.id !== target?.id))
-      setBreadcrumb(listing.breadcrumb)
-    } catch (error: unknown) {
-      toast.error(extractErrorMessage(error, 'Error al listar carpetas'))
-    } finally {
-      setLoading(false)
-    }
-  }, [target])
+  const browseKey = `${browseFolderId ?? ''}|${retryTick}`
+  const loading = result?.key !== browseKey
+  const folders = result?.folders ?? []
+  const breadcrumb = result?.breadcrumb ?? []
+  // Solo hay error si el resultado guardado es el de la petición actual
+  const loadFailed = !loading && (result?.failed ?? false)
 
   useEffect(() => {
-    if (!target) return
-    loadFolders(browseFolderId)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [target, browseFolderId])
+    let cancelled = false
+    filesService
+      .list({ folderId: browseFolderId ?? undefined })
+      .then((listing) => {
+        if (cancelled) return
+        // No ofrecer como destino la propia carpeta que se está moviendo (no se
+        // puede mover una carpeta dentro de sí misma) -- el resto de ciclos
+        // (mover dentro de un descendiente) los valida el backend.
+        setResult({
+          key: browseKey,
+          folders: listing.folders.filter((f) => f.id !== target.id),
+          breadcrumb: listing.breadcrumb,
+          failed: false,
+        })
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return
+        toast.error(extractErrorMessage(error, 'Error al listar carpetas'))
+        // Nunca se conserva la lista del destino anterior bajo la clave nueva: se muestra el
+        // error (con reintento) y se bloquea confirmar hasta tener el listado real del destino.
+        setResult({ key: browseKey, folders: [], breadcrumb: [], failed: true })
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [target.id, browseFolderId, browseKey])
 
   const handleClose = () => {
     if (moving) return
@@ -65,25 +97,30 @@ export default function MoveModal({ target, onClose, onMoved }: MoveModalProps) 
   }
 
   const handleConfirm = async () => {
-    if (!target) return
-
-    if (browseFolderId === target.currentFolderId) {
+    if (!isCopy && browseFolderId === target.currentFolderId) {
       toast.error('El elemento ya está en esa carpeta')
       return
     }
 
     setMoving(true)
     try {
-      if (target.type === 'folder') {
+      if (isCopy) {
+        // Destino explícito y sin ambigüedad: id de carpeta o null (raíz)
+        if (target.type === 'folder') {
+          await foldersService.copy(target.id, browseFolderId)
+        } else {
+          await filesService.copy(target.id, browseFolderId)
+        }
+      } else if (target.type === 'folder') {
         await foldersService.move(target.id, browseFolderId)
       } else {
         await filesService.move(target.id, browseFolderId)
       }
-      toast.success('Elemento movido correctamente')
+      toast.success(isCopy ? 'Copia creada correctamente' : 'Elemento movido correctamente')
       onMoved(target, browseFolderId)
       onClose()
     } catch (error: unknown) {
-      toast.error(extractErrorMessage(error, 'Error al mover el elemento'))
+      toast.error(extractErrorMessage(error, isCopy ? 'Error al copiar el elemento' : 'Error al mover el elemento'))
     } finally {
       setMoving(false)
     }
@@ -91,9 +128,9 @@ export default function MoveModal({ target, onClose, onMoved }: MoveModalProps) 
 
   return (
     <Modal
-      isOpen={!!target}
+      isOpen
       onClose={handleClose}
-      title={target ? `Mover "${target.name}"` : 'Mover'}
+      title={`${isCopy ? 'Copiar' : 'Mover'} "${target.name}"`}
       size="md"
       footer={
         <div className="flex justify-end gap-2">
@@ -105,9 +142,10 @@ export default function MoveModal({ target, onClose, onMoved }: MoveModalProps) 
             leftIcon={<MoveRight className="size-4" />}
             onClick={handleConfirm}
             isLoading={moving}
-            loadingText="Moviendo..."
+            disabled={loadFailed}
+            loadingText={isCopy ? 'Copiando...' : 'Moviendo...'}
           >
-            Mover aquí
+            {isCopy ? 'Copiar aquí' : 'Mover aquí'}
           </Button>
         </div>
       }
@@ -147,6 +185,13 @@ export default function MoveModal({ target, onClose, onMoved }: MoveModalProps) 
             <div className="flex items-center justify-center py-8">
               <div className="size-6 border-2 border-brand-500 border-t-transparent rounded-full animate-spin" />
             </div>
+          ) : loadFailed ? (
+            <div className="flex flex-col items-center gap-2 py-8 text-center">
+              <p className="text-sm text-red-600 dark:text-red-500">No se pudo cargar esta carpeta.</p>
+              <Button variant="secondary" size="sm" onClick={() => setRetryTick((t) => t + 1)}>
+                Reintentar
+              </Button>
+            </div>
           ) : folders.length === 0 ? (
             <p className="py-8 text-center text-sm text-gray-500 dark:text-gray-400">
               No hay subcarpetas acá
@@ -172,7 +217,7 @@ export default function MoveModal({ target, onClose, onMoved }: MoveModalProps) 
         </div>
 
         <p className="text-xs text-gray-500 dark:text-gray-400">
-          Navegá con doble clic en una carpeta y confirmá con "Mover aquí" para elegirla como destino.
+          Navegá con doble clic en una carpeta y confirmá con "{isCopy ? 'Copiar aquí' : 'Mover aquí'}" para elegirla como destino.
         </p>
       </div>
     </Modal>

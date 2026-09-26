@@ -2,7 +2,7 @@
  * COMPONENTE - NOTIFICACIONES
  * Gestiona preferencias de notificaciones por email, sistema y resúmenes
  */
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { Bell, Mail, Monitor, CheckCircle2, Save, Loader2 } from 'lucide-react'
 import { toast } from '@/ui/toast/CustomToast'
 import { userPreferencesService } from '@/modules/configuration/services/user-preferences.service'
@@ -11,6 +11,25 @@ import { useAuth } from '@/modules/auth/hooks/useAuth'
 
 interface NotificacionesProps {
   onSave?: () => void
+}
+
+// Interruptor: definido a nivel de módulo (no dentro del render) para no remontarse en cada render
+function Toggle({ checked, onChange }: { checked: boolean; onChange: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onChange}
+      className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+        checked ? 'bg-brand-600' : 'bg-gray-300 dark:bg-gray-600'
+      }`}
+    >
+      <span
+        className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+          checked ? 'translate-x-6' : 'translate-x-1'
+        }`}
+      />
+    </button>
+  )
 }
 
 export default function NotificacionesComponent({ onSave }: NotificacionesProps) {
@@ -25,26 +44,35 @@ export default function NotificacionesComponent({ onSave }: NotificacionesProps)
   })
 
 
+  // Núcleo del fetch (sin setState síncrono; `loading` arranca en true)
+  const fetchPreferences = useCallback(
+    () =>
+      userPreferencesService
+        .getMyPreferences()
+        .then((data) => {
+          setPreferences(data as unknown as UserPreferences)
+          setFormData({
+            email_notifications: data.email_notifications,
+            system_notifications: data.system_notifications
+          })
+        })
+        .catch((error) => {
+          console.error('Error cargando preferencias:', error)
+          toast.error('Error al cargar preferencias de notificaciones')
+        })
+        .finally(() => setLoading(false)),
+    []
+  )
+
+  // Recarga explícita (tras guardar): vuelve a mostrar el spinner
   const loadPreferences = async () => {
-    try {
-      setLoading(true)
-      const data = await userPreferencesService.getMyPreferences()
-      setPreferences(data as unknown as UserPreferences)
-      setFormData({
-        email_notifications: data.email_notifications,
-        system_notifications: data.system_notifications
-      })
-    } catch (error) {
-      console.error('Error cargando preferencias:', error)
-      toast.error('Error al cargar preferencias de notificaciones')
-    } finally {
-      setLoading(false)
-    }
+    setLoading(true)
+    await fetchPreferences()
   }
 
   useEffect(() => {
-    loadPreferences()
-  }, [])
+    fetchPreferences()
+  }, [fetchPreferences])
 
   const handleToggle = (field: keyof UserPreferencesUpdate) => {
     setFormData(prev => ({ ...prev, [field]: !prev[field] }))
@@ -74,22 +102,6 @@ export default function NotificacionesComponent({ onSave }: NotificacionesProps)
       </div>
     )
   }
-
-  const Toggle = ({ checked, onChange }: { checked: boolean; onChange: () => void }) => (
-    <button
-      type="button"
-      onClick={onChange}
-      className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-        checked ? 'bg-brand-600' : 'bg-gray-300 dark:bg-gray-600'
-      }`}
-    >
-      <span
-        className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-          checked ? 'translate-x-6' : 'translate-x-1'
-        }`}
-      />
-    </button>
-  )
 
   return (
     <div className="space-y-6">

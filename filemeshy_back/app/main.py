@@ -4,6 +4,7 @@ from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Receive, Scope, Send
+from app.shared.utils.datetime_iso import to_utc_iso
 from app.core.config import settings
 from app.core.database import check_database_connection
 from app.audit.service import AuditMiddleware
@@ -15,6 +16,7 @@ from app.auth.service import get_current_active_user
 from app.users.models import User
 import os
 import logging
+from contextlib import asynccontextmanager
 
 # Configure logging
 logging.basicConfig(
@@ -127,6 +129,30 @@ class SecurityHeadersMiddleware:
         await self.app(scope, receive, send_wrapper)
 
 
+# ===== LIFESPAN (arranque y cierre) =====
+# Ronda 12: reemplaza los `@app.on_event("startup"/"shutdown")` (deprecados y
+# eliminados en Starlette 1.0). Cubierto por
+# tests/test_app_canaries.py::test_lifespan_runs_startup_and_shutdown_hooks.
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Arranque: verificar conexión a BD. El esquema lo aplica Alembic
+    (alembic upgrade head corre antes que este proceso, ver Dockerfile/docker-compose.yml).
+    Cierre: limpiar recursos."""
+    logger.info("[APP] Starting application...")
+
+    if check_database_connection(max_retries=5, retry_interval=2):
+        logger.info("[APP] Application ready to receive requests")
+    else:
+        logger.warning(
+            "[APP] Application started WITHOUT database connection.\n"
+            "   API requests will fail until database is available."
+        )
+
+    yield
+
+    logger.info("[APP] Shutting down application...")
+
+
 # ===== APP INSTANCE =====
 # En producción, deshabilitar documentación pública
 app = FastAPI(
@@ -136,7 +162,8 @@ app = FastAPI(
     docs_url="/docs" if settings.DEBUG else None,
     redoc_url="/redoc" if settings.DEBUG else None,
     openapi_url="/openapi.json" if settings.DEBUG else None,
-    redirect_slashes=False
+    redirect_slashes=False,
+    lifespan=lifespan,
 )
 
 # ===== TRAILING SLASH MIDDLEWARE =====
@@ -189,28 +216,6 @@ async def favicon():
     if os.path.exists(favicon_path):
         return FileResponse(favicon_path)
     return JSONResponse(status_code=404, content={"detail": "Favicon not found"})
-
-
-# ===== STARTUP AND SHUTDOWN EVENTS =====
-@app.on_event("startup")
-async def startup_event():
-    """Evento de inicio: Verificar conexión a BD. El esquema lo aplica Alembic
-    (alembic upgrade head corre antes que este proceso, ver Dockerfile/docker-compose.yml)."""
-    logger.info("[APP] Starting application...")
-
-    if check_database_connection(max_retries=5, retry_interval=2):
-        logger.info("[APP] Application ready to receive requests")
-    else:
-        logger.warning(
-            "[APP] Application started WITHOUT database connection.\n"
-            "   API requests will fail until database is available."
-        )
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Evento de cierre: Limpiar recursos."""
-    logger.info("[APP] Shutting down application...")
 
 
 # ===== ROUTES =====
@@ -402,7 +407,7 @@ async def health_check_detailed(
 
     return {
         "status": "healthy" if db_status == "connected" else "degraded",
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "timestamp": to_utc_iso(datetime.utcnow()),
         "database": {
             "status": db_status,
         },

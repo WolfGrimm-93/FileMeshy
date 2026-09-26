@@ -1,4 +1,4 @@
-import { forwardRef, type SelectHTMLAttributes } from 'react'
+import { forwardRef, useId, type SelectHTMLAttributes } from 'react'
 
 export interface SelectOption {
   value: string
@@ -30,7 +30,9 @@ export const Select = forwardRef<HTMLSelectElement, SelectProps>(
     },
     ref
   ) => {
-    const selectId = id || label?.toLowerCase().replace(/\s+/g, '-')
+    // useId: id único por instancia; derivarlo del label rompía htmlFor con etiquetas repetidas
+    const generatedId = useId()
+    const selectId = id || generatedId
 
     const baseSelectClasses =
       'px-3 py-2 rounded-lg border shadow-xs transition-colors duration-200 focus:outline-hidden focus:ring-2 focus:ring-offset-0 disabled:cursor-not-allowed disabled:opacity-50 text-sm bg-white dark:bg-gray-900 appearance-none bg-[url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns=\'http://www.w3.org/2000/svg\' fill=\'none\' viewBox=\'0 0 20 20\'%3E%3Cpath stroke=\'%236b7280\' stroke-linecap=\'round\' stroke-linejoin=\'round\' stroke-width=\'1.5\' d=\'m6 8 4 4 4-4\'/%3E%3C/svg%3E")] bg-position-[right_0.5rem_center] bg-size-[1.5em_1.5em] bg-no-repeat pr-10'

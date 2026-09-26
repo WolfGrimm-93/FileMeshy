@@ -6,6 +6,8 @@ interface StatItem {
   icon: ReactNode
   label: string
   value: string | number
+  /** Tooltip nativo opcional sobre el valor (ej. aclarar la unidad). */
+  title?: string
   variant?: StatVariant
   onClick?: () => void
 }
@@ -66,7 +68,7 @@ export function StatsGrid({ stats, className = '' }: StatsGridProps) {
               <p className={`text-xs ${variant === 'default' ? 'text-gray-500 dark:text-gray-500' : styles.iconText}`}>
                 {stat.label}
               </p>
-              <p className={`text-lg font-semibold ${styles.text}`}>
+              <p className={`text-lg font-semibold ${styles.text}`} title={stat.title}>
                 {stat.value}
               </p>
             </div>

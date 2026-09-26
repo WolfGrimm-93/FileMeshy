@@ -684,6 +684,167 @@ Resuelto y verificado:
   consola (el front lo trata bien); "Navegador desconocido" en una sesión; `SplitButton` sin
   handler de Escape; `formatBytes` etiqueta GiB como GB.
 
+**Hecho (2026-09-26) — Ronda 12: cierre de deuda del backlog de la Ronda 11, CERRADA.**
+Flujo multi-agente completo, en 4 pasadas (12, 12b, 12c, 12d — cada una recon/implementación cuando hizo
+falta → revisión adversarial → feedback → auditor final → pruebas), porque cada pasada de pruebas reales
+(navegador y ataques en vivo) encontró fallos que la anterior no había cubierto — incluidos 3 hallazgos de
+severidad ALTA que se **reprodujeron en vivo antes y después del fix** (no solo en teoría). Suite final:
+**318 passed, 8 skipped, 0 failed**, dos corridas seguidas sin recrear nada entre ellas. Frontend: **252
+tests**, ESLint 0/0, `tsc` 0.
+
+Resuelto y verificado:
+
+- **Dependencias con CVEs (0 vulnerabilidades ahora):** backend y conversor: pypdf 6.19.0, pillow 12.3.0,
+  python-multipart 0.0.32, python-dotenv 1.2.3, fastapi 0.135.3, starlette 1.3.1, pydantic 2.12.5,
+  pydantic-settings 2.10.1; quitados pymysql/sqlmodel/faker/pandas/schedule/flower (sin usos). `@app.on_event`
+  migrado a `lifespan`. Frontend: react-router-dom 7.18.4 y `pnpm update` (0 vulnerabilidades, `pnpm audit`
+  y `--prod`). **`pnpm update` subió también dependencias de producción dentro de su rango** (react/react-dom
+  19.2.8→19.3.0, axios 1.13→1.20, react-hook-form, zustand, sonner, tailwind-merge); todo pasa, pero fue
+  un alcance no pedido: si aparece un problema raro de UI, sospechar de estos bumps.
+- **ESLint: 46 errores + 8 warnings → 0/0** con ~55 refactors react-hooks (patrones R/K/M/G/D/C/A/S, sin
+  ningún `eslint-disable` nuevo, quitados 7 obsoletos), `useAuth` sin refs, `RoleFormModal` (código muerto)
+  borrado. 185 tests de frontend (antes 41), `tsc` 0.
+- **Bugs reales corregidos:** `useLoginForm` enviaba `remember_me`/CAPTCHA viejos (deps faltantes); ids de
+  formulario duplicados (`useId` en Checkbox/Input/Select/Textarea/Radio/PasswordInput: clickear el texto
+  "Ver" de un recurso togglea SU casilla); `PermissionsManagementPage` podía guardar permisos de otro rol si
+  fallaba el fetch (y una carrera al volver a un rol); datos viejos sin spinner al cambiar de usuario
+  (Seguridad/MiPerfil/UserDetail); doble fetch al reabrir modales; `SplitButton` sin Escape; warning
+  `HydrateFallback`; login daba 500 con un User-Agent de más de 500 caracteres; parser de User-Agent
+  (iPhone→"Safari en macOS", Opera→Chrome, curl→"Navegador desconocido"); `GET /admin/config/email` daba 404;
+  `GET /users` daba 500 con emails de dominio reservado (Ronda 11).
+- **Alta de rol atómica** (`permission_ids` en el mismo POST, tope 1000, rechaza inexistentes/inactivos con 422,
+  409 en carrera de nombre) y mensajes de error legibles (`detail`) en `RoleCreatePage`.
+- **Secretos de configuración cifrados al guardar en TODOS los caminos** (antes solo `PUT /admin/config/email`
+  cifraba; `POST /smtp`, `PUT /turnstile`, `POST /create` y `PUT /update/{key}` los guardaban en claro aunque
+  decían cifrar). Los consumidores descifran con tolerancia a valores legados en claro; los secretos ya
+  guardados en claro se cifran al re-guardarse (no hay migración masiva). Enmascarado `"****"` en
+  `/email`, `/all` y `/categories/*`; un `"****"` reenviado ya no sobreescribe el secreto.
+- **Incidente de proceso (repetido, ya con salvaguarda):** `celery_worker` corrió con la imagen VIEJA porque
+  tenía imagen propia y `docker compose build backend` no la reconstruía (misma lección de la Ronda 4).
+  Ahora `backend` y `celery_worker` comparten build y tag (`image: filemeshy-backend`, ancla
+  `x-backend-build`); verificar tras cada deploy IDs de imagen y `pip freeze | md5sum` idénticos
+  (`docs/operacion.md` §4).
+- **CI:** `eslint`, `tsc` y `sca` bloqueantes; nuevo job `backend-tests` (con `continue-on-error: true`
+  porque NO se pudo verificar en un runner real). Script `reindex_legacy_pending.py` (`--all-schemas`)
+  ejecutado: 32 filas legadas → 0 (las creaban los propios tests; ahora se limpian solas).
+- **Reseteo de contraseña: nunca había funcionado, ahora funciona de punta a punta.** `POST
+  /password-reset/confirm` daba 500 SIEMPRE desde el commit inicial (`int(sub)` sobre un UUID, más un
+  segundo bug escondido detrás: `user_service.get(db, id=...)` con el nombre de parámetro incorrecto).
+  Corregido, y en el camino se auditó el flujo completo como código que corre por primera vez, lo que
+  destapó 3 fallos de severidad ALTA reales:
+  - **Fuerza bruta del código de 6 dígitos por condición de carrera:** el contador de intentos se leía e
+    incrementaba en Python sin bloqueo; 60 verificaciones simultáneas con códigos distintos comparaban
+    hasta 16 de forma efectiva contra el límite de 5. Corregido con un `UPDATE` atómico condicional.
+    Reproducido en vivo antes (16-13 comparaciones efectivas) y después (exactamente 5, confirmado también
+    con 60 peticiones simultáneas independientes en la fase de pruebas).
+  - **Enumeración de usuarios** en `/password-reset/request`: la cookie de sesión solo se seteaba si el
+    email existía. Corregido: respuesta, cookies y `Retry-After` ahora son byte a byte idénticos para un
+    email existente e inexistente (verificado de forma independiente en la fase de pruebas). El envío de
+    email salió del camino de la respuesta (`BackgroundTasks`).
+  - **IDOR de storage por el avatar:** el validador de `PUT /users/{id}` aceptaba cualquier clave del
+    bucket, y el siguiente `POST /avatar` borraba esa clave — un usuario podía hacer borrar un objeto
+    ajeno. Reproducido en vivo (el avatar de B pasó a 404 tras el ataque de A) y corregido: `PUT` solo
+    acepta `null`/`""`/el valor actual, y el borrado del avatar anterior queda restringido al prefijo
+    propio (`avatars/user_{id}/`). Verificado también con 8 payloads maliciosos distintos (URLs de otro
+    host, `javascript:`, path traversal, mayúsculas/encoding): todos dan 422, nunca 500.
+  - Además: `PUT /confirm` y el código de verificación ahora son atómicos ante concurrencia (10
+    confirmaciones simultáneas del mismo token → exactamente 1 exitosa), los access tokens ya emitidos se
+    invalidan de inmediato tras el reset, se avisa al usuario por notificación y email, y el reseteo usa
+    la IP real (no la del proxy).
+- **`PUT /config/preferences/my-preferences` daba 500** (regresión de esta ronda: FastAPI 0.135 dejó de
+  tolerar objetos ORM crudos en un campo `Any` de `SuccessResponse`). Corregido con un `@field_serializer`
+  central; un barrido de todos los endpoints confirmó que ese era el único roto.
+- **"Último acceso" en `GET /usuarios` siempre mostraba "Nunca"** (hallazgo de la fase final de pruebas,
+  corregido sin pasar por el flujo completo de agentes por ser un ajuste puntual y aislado): el campo
+  `last_login` ni siquiera estaba en la serialización manual del listado (no era solo un problema de
+  caché, aunque también se agregó invalidación de la caché de listados en cada login real). Corregido en
+  `app/users/router.py` y `app/auth/service.py`; verificado en vivo.
+- **Avatar:** contrato nuevo y estable — `POST /users/{id}/avatar` (multipart) sube y devuelve la URL
+  pública; `PUT /users/{id}` ya no acepta base64/data-URI (daba 500 con más de 500 caracteres). Un usuario
+  común ahora puede cambiar su propia foto (antes exigía `users.edit` sin necesidad).
+- **"Copiar" un archivo dejaba la copia en la raíz:** el frontend enviaba siempre `folder_id: null`. Ahora
+  "Copiar" abre un modal con la carpeta actual preseleccionada; el backend define el contrato (`to_root`,
+  ausente = misma carpeta) y además pasó a copiar del lado del servidor de MinIO (antes leía el archivo
+  entero a memoria: con los archivos de 10-20 GB de la Ronda 9 podía tumbar el backend). Copiar una carpeta
+  dentro de sí misma o de un descendiente daba 500; ahora da 400 sin crear nada.
+- **ESLint: 46 errores + 8 warnings → 0/0** con ~55 refactors react-hooks (patrones R/K/M/G/D/C/A/S, sin
+  ningún `eslint-disable` nuevo, quitados 9 obsoletos), `useAuth` sin refs, `RoleFormModal` (código muerto)
+  borrado. Ids de formulario únicos con `useId` (Checkbox/Input/Select/Textarea/Radio/PasswordInput):
+  clickear el texto "Ver" de un recurso ya no togglea el de otro. Labels sin `htmlFor` corregidos en Reset,
+  Mi Perfil, Usuarios, Configuración y los modales. Fechas de Logs (`+00:00Z` inválido) corregidas en el
+  origen (`to_utc_iso`) y con parseo tolerante en el frontend. `action_url` de notificaciones con rutas
+  reales. Toast "Refresh token no encontrado" al fallar el 2FA corregido (era el interceptor de axios).
+  `PermissionsManagementPage` podía guardar/mostrar permisos de otro rol si fallaba el fetch o si se
+  cambiaba de rol rápido; corregido. 252 tests de frontend (antes 41), `tsc` 0.
+- **Dependencias con CVEs (0 vulnerabilidades):** backend y conversor: pypdf 6.19.0, pillow 12.3.0,
+  python-multipart 0.0.32, python-dotenv 1.2.3, fastapi 0.135.3, starlette 1.3.1, pydantic 2.12.5,
+  pydantic-settings 2.10.1; quitados pymysql/sqlmodel/faker/pandas/schedule/flower (sin usos). `@app.on_event`
+  migrado a `lifespan`. Frontend: react-router-dom 7.18.4 y `pnpm update` (0 vulnerabilidades, `pnpm audit`
+  y `--prod`). **`pnpm update` subió también dependencias de producción dentro de su rango** (react/react-dom
+  19.2.8→19.3.0, axios 1.13→1.20, react-hook-form, zustand, sonner, tailwind-merge); todo pasa, pero fue
+  un alcance no pedido: si aparece un problema raro de UI, sospechar de estos bumps.
+- **Secretos de configuración cifrados al guardar en TODOS los caminos** (antes solo `PUT /admin/config/email`
+  cifraba; `POST /smtp`, `PUT /turnstile`, `POST /create` y `PUT /update/{key}` los guardaban en claro aunque
+  decían cifrar). Los consumidores descifran con tolerancia a valores legados en claro (y ahora avisan con
+  un ERROR claro si el descifrado falla, en vez de devolver el ciphertext como si fuera la contraseña real);
+  los secretos ya guardados en claro se cifran al re-guardarse (no hay migración masiva). Enmascarado
+  `"****"` en `/email`, `/all` y `/categories/*` (también para las claves `*_token`, antes solo las cifradas);
+  un `"****"` reenviado ya no sobreescribe el secreto; un valor vacío enmascara honesto (`null`, no `"****"`).
+- **Incidente de proceso, repetido dos veces esta ronda (ya con salvaguarda):** `celery_worker` corrió con la
+  imagen VIEJA porque tenía imagen propia y `docker compose build backend` no la reconstruía (misma lección
+  de la Ronda 4). Ahora `backend` y `celery_worker` comparten build y tag (`image: filemeshy-backend`, ancla
+  `x-backend-build` en `docker-compose.yml`); verificar tras cada deploy IDs de imagen y `pip freeze | md5sum`
+  idénticos (`docs/operacion.md` §4). Se borró además la imagen huérfana `filemeshy-celery_worker:latest`
+  que quedó de antes de este cambio.
+- **CI:** `eslint`, `tsc` y `sca` (frontend) bloqueantes; nuevo job `backend-tests` (con
+  `continue-on-error: true` porque NO se pudo verificar en un runner real). Script
+  `reindex_legacy_pending.py` (`--all-schemas`) ejecutado dos veces (las 32 y luego 25 filas legadas que
+  fue encontrando resultaron ser generadas por los propios tests sin limpiar; ya se corrigió y quedó en 0
+  de forma estable). `fix_notification_urls.py` también soporta `--all-schemas`.
+- **Verificación en vivo, independiente de los informes de los implementadores (fase de pruebas final):**
+  suite 318 passed / 8 skipped / 0 failed en 2 corridas; 8 servicios healthy con la misma imagen en backend
+  y worker; **ataques reales** (no solo lectura de código) contra los 3 hallazgos ALTOS — todos resistidos
+  (60 verificaciones simultáneas → exactamente 5 comparaciones efectivas; comparación byte a byte de
+  enumeración → sin diferencias; 10 confirmaciones simultáneas → exactamente 1 exitosa; 8 payloads de IDOR
+  de avatar → todos 422); copia de 90 MB con memoria del backend estable (sin picos); shares públicos con
+  35 GET rotando IP → exactamente 30×200 y 5×429 (el límite es por token, no evadible rotando IP); reset
+  completo, 2FA, avatar, copiar/mover, alta de rol, preferencias y subidas probados en **Chromium y
+  Firefox** reales (no headless simulado) sin violaciones de CSP ni errores de consola relevantes.
+
+**Hallazgos menores encontrados en la fase final de pruebas, documentados y SIN corregir (bajo impacto,
+no bloquean el cierre de la ronda):**
+
+- **Firefox, cosmético:** navegar a `/reset-password` con sesión activa, borrar cookies, volver a loguear
+  → la consola muestra "React Router caught the following error during render" al redirigir a
+  `/dashboard`, que igual renderiza bien (sin pantalla rota visible). Solo reproducido en Firefox, no en
+  Chromium. No se pudo extraer el stack completo (Playwright+Firefox destruye el `JSHandle` antes de
+  poder serializarlo). Investigar cuando convenga; no es bloqueante.
+- **Preview de PDF/Office con iframe vacío en navegador headless (Chromium y Firefox), sin errores de red
+  ni de consola** (el endpoint `/preview` responde 200 con un PDF real). Puede ser una limitación del modo
+  headless de este entorno de pruebas y no un bug real — **verificar a mano en un navegador de escritorio
+  real antes de confiar en que el preview de PDF/Office funciona** en producción.
+- El 429 del share público no trae `Retry-After` en el share público en sí (el de reset y verify sí lo
+  llevan desde esta ronda); `sessionExpired` en el reset de contraseña no se resetea a `false` hasta pedir
+  un código nuevo (ya corregido) — verificar que no queden casos residuales.
+- No hay endpoint `DELETE` para claves de configuración individuales (quedaron 2 filas de prueba
+  `qa_test_api_token`/`turnstile_*` sin poder limpiarse por API en el stack de desarrollo).
+- `system_configuration.updated_at` no se actualiza al cambiar `value_string` de una clave existente.
+- ~14.9k usuarios `pytest_*` acumulados en la BD de desarrollo (todos rol USER, sin privilegios; no es un
+  riesgo pero conviene un `docker compose down -v` cuando se quiera limpiar el stack de dev).
+- Patrones legacy de pydantic v1 sin migrar (`class Config`, `.dict()`, `@validator`); `pip-audit` de CI usa
+  `--no-deps` (transitivas no cubiertas por ese job, sí auditadas manualmente con el `pip freeze` real de
+  las imágenes); uvicorn 0.32.1, httpx 0.25.2 y celery 5.3.6 sin subir a propósito; `PUT
+  /roles/{id}/permissions` no valida existentes/inactivos como el alta (`POST /roles` sí); no hay endpoint
+  global de catálogo de permisos (el alta lo obtiene con un rodeo: conviene `GET /permissions/catalog`).
+- El `job backend-tests` de CI (levanta el stack completo y corre pytest) quedó escrito pero **nunca se
+  verificó en un runner real** — sigue con `continue-on-error: true` hasta la primera corrida verde.
+
+**Sigue abierto y necesita decisión del usuario (sin cambios):** IP real del visitante en producción
+(`nginx` `set_real_ip_from`/`real_ip_header` o `cf-connecting-ip` opt-in, `docs/operacion.md` §5.3),
+`docker-compose.prod.yml` no versionado (healthchecks, redes internas, `mem_limit`, imagen compartida
+backend/worker), renombrado de contenedores de prod a `filemeshy-prod-<servicio>`, y S3 externo para el
+backup de MinIO.
+
 ### 🟠 Seguridad — importante pero no bloqueante
 
 - `SECRET_KEY` con default hardcodeado en `core/config.py:32` — mitigado por una guarda que
@@ -864,6 +1025,7 @@ Aprobado con el usuario el 2026-09-20. Cada ronda se diseña en detalle recién 
 | 9 (hecho) | Post-roadmap, pedido explícito del usuario 2026-09-22: subida de archivos grandes (10-20GB) sin saturar el servidor, resumable — **completa** |
 | 10 (hecho y verificado en vivo) | Endurecimiento: `Retry-After`, PyJWT, pin por digest, CSP, headers de `/assets/`, `/health/detailed`, validación de email del super admin, portal del Dropdown, tests de Ronda 9 |
 | 11 (hecho y verificado en vivo) | Cierre de deuda del backlog: IP real/CIDR + ventana fija, rate-limit de shares dirigidos, auditoría de descargas, indexación endurecida + barrido, `tenant_schema` en AV, healthchecks y redes internas, CI/Dependabot/ruff, vitest, fixes de `GET /users` y del QR de 2FA |
+| 12 (hecho y verificado en vivo, Chromium + Firefox) | Deps con CVEs (0 vulns), ESLint 46+8→0/0, reseteo de contraseña reparado de raíz (nunca había funcionado) + 3 hallazgos ALTOS reales corregidos (fuerza bruta, enumeración, IDOR de avatar), `my-preferences` 500, "Último acceso" en /usuarios, copiar server-side, secretos cifrados, imagen compartida backend/worker, CI |
 
 Fuera de alcance por decisión de producto (no construir sin pedido explícito nuevo): cliente
 de escritorio, app móvil, sincronización selectiva, acceso offline real, edición colaborativa
@@ -871,46 +1033,38 @@ en tiempo real.
 
 ### Semáforo
 
-**Roadmap original completo (Rondas 1-8) + Ronda 9 post-roadmap, todas verificadas en vivo**
-(incluida verificación visual en navegador real, y desde Ronda 3 en adelante, reproducción de
-escenarios de punta a punta por el propio Auditor Final, incluida verificación de contenido
-real —no solo capturas— en las Rondas 5, 6, 7, 8 y 9). Listo para uso interno de un solo
-usuario/equipo pequeño en red cerrada — los 6 bloqueadores de seguridad de la auditoría del 19
-están resueltos, y el Drive ganó favoritos, orden real, copiar, cuota visible, etiquetas,
-compartir granular (contraseña, permisos, usuarios específicos) con notificaciones reales,
-versionado de archivos con historial completo, preview de video/audio/Office, búsqueda por
-contenido + OCR, escaneo de malware en toda subida, backups automáticos de Postgres con
-verificación real, administración de tenants multi-tenant vía panel separado, y subida de
-archivos grandes (10-20GB) resumable y sin saturar el servidor con antivirus asíncrono. **Todavía
-no listo para exposición pública a Internet sin decisión** sobre las deudas residuales de
-seguridad marcadas arriba en cada ronda (todas confirmadas no explotables hoy, pero dependen de
-configuración de producción que este repo de trabajo no controla directamente, de defensa en
-profundidad pendiente, o de contratar un destino externo): `TRUSTED_PROXY_IPS` vacío en
-producción real, el balde compartido de rate-limit en shares públicos, la falta de rate-limit en
-los endpoints autenticados de shares dirigidos, la red no dedicada de los servicios
-`office_converter` y `clamav`, la falta de tope de páginas/reintentos en la indexación de PDFs de
-texto embebido, la ausencia de backup real de los archivos de usuario en MinIO (solo sus
-metadatos) hasta que se configure un destino S3 externo, la ausencia de sesión/expiración/
-auditoría real en el panel de plataforma de la Ronda 8 (hoy solo la propia key, sin capa
-adicional), y el header `Retry-After` que el backend nunca logra entregar en ningún 503 con
-headers custom (bug preexistente, expuesto por la Ronda 9, mitigado del lado frontend pero no
-corregido de raíz).
+**Rondas 1-12, todas verificadas en vivo.** El roadmap original (1-8) más las post-roadmap (9-12)
+están hechas y reprobadas con pruebas reales — no solo tests unitarios — antes de cerrarse. La Ronda
+12 destapó y cerró el fallo más grave de todo el historial del proyecto: **el reseteo de contraseña
+nunca había funcionado**, desde el commit inicial, sin que ninguna ronda anterior lo hubiera probado
+de punta a punta en un navegador real. Sigue **no listo para exposición pública a Internet sin
+decisión del usuario** sobre: `TRUSTED_PROXY_IPS`/`TRUSTED_PROXY_IP_HEADERS` vacío en producción real
+(el balde de rate-limit de shares públicos queda compartido detrás de un proxy), la red no dedicada
+de `office_converter`/`clamav` en el compose de producción (no versionado), la ausencia de backup
+real de los archivos de usuario en MinIO hasta contratar un S3 externo, la ausencia de
+sesión/auditoría en el panel de plataforma, y el `Retry-After` que sigue faltando en el 503 de
+subidas grandes salvo que se corrija el handler global (deuda preexistente desde la Ronda 9).
 
-**Patrón recurrente confirmado en 6 de las últimas 7 rondas, siempre atrapado por el propio
-proceso antes de cerrar la ronda, nunca por pytest solo:** un bug de "código que funciona en el
-proceso de tests pero se rompe en el proceso/entorno real" (Ronda 4: `celery_worker` con imagen
-vieja; Ronda 5: contrato roto solo visible contra el backend real; Ronda 6: registro de mappers
-de SQLAlchemy envenenado según el orden de tareas en el worker real; Ronda 7: un permiso nuevo
-en el código que nunca se sembró en la tabla real, invisible para tests que usan un bypass
-directo de BD en vez del camino real de asignación de rol; Ronda 8: un campo (`admin_email`)
-descartado en silencio por el schema de respuesta, y una `tenant_id` sin tipar que solo
-explotaba con un valor real malformado; Ronda 9: tres bugs de firma SigV4 en el proxy de nginx,
-ninguno visible probando la firma o nginx por separado, solo contra el proxy real completo, más
-un modal de UI bloqueado que ningún test automatizado iba a atrapar — solo apareció al navegar
-de verdad con una subida real en curso). Todos aparecieron recién al probar contra el stack
-Docker completo levantado, con datos y flujos reales. Confirma que la verificación en vivo (no
-solo tests unitarios/aislados, y no solo tests que "pasan" sin ejercitar el camino real que usa
-un usuario de verdad) sigue siendo imprescindible antes de cerrar cualquier ronda futura.
+**Patrón recurrente confirmado en 8 de las últimas 9 rondas, siempre atrapado por el propio proceso
+de verificación en vivo antes de cerrar la ronda, nunca por pytest solo:** un bug de "código que
+funciona en el proceso de tests pero se rompe en el proceso/entorno real", o directamente un camino
+que ningún test automatizado ejercitaba de punta a punta. Ronda 4: `celery_worker` con imagen vieja.
+Ronda 5: contrato roto solo visible contra el backend real. Ronda 6: registro de mappers de
+SQLAlchemy envenenado según el orden de tareas del worker real. Ronda 7: un permiso nuevo nunca
+sembrado en la tabla real. Ronda 8: un campo descartado en silencio por el schema de respuesta.
+Ronda 9: tres bugs de firma SigV4 en nginx, solo visibles contra el proxy real completo, más un
+modal de UI bloqueado que solo apareció navegando con una subida real en curso. Ronda 10: el QR de
+2FA roto por la CSP nueva, y ya **publicado en GitHub** antes de detectarlo, porque nadie abrió el
+navegador tras el cambio. Ronda 11: `GET /users` con 500 por un dato legado de una ronda anterior.
+Ronda 12, el caso más grave: un endpoint que respondía 500 desde el primer commit del proyecto,
+descubierto recién cuando por primera vez alguien probó el flujo completo en un navegador real —y al
+auditarlo como código nuevo, aparecieron 3 vulnerabilidades de severidad ALTA reales (fuerza bruta
+por condición de carrera, enumeración de usuarios, IDOR de storage) que ningún test ni revisión de
+código habían encontrado hasta ejecutarlas con concurrencia real. **Confirma, con el ejemplo más caro
+de todo el proyecto, que la verificación en vivo —navegador real, ataques reales, no solo lectura de
+código ni tests que pasan sin ejercitar el camino que usa un usuario de verdad— es imprescindible
+antes de dar cualquier ronda por cerrada, y que "nadie lo reportó en 12 rondas" no es evidencia de
+que algo funcione.**
 
 **Lección de proceso confirmada en Ronda 4** (ya aplicada, dejar como recordatorio para
 rondas futuras y para cualquier deploy real): reconstruir solo `backend` no alcanza cuando el

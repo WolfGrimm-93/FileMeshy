@@ -2,7 +2,7 @@
  * COMPONENTE - SEGURIDAD
  * Gestiona cambio de contraseña, 2FA y sesiones activas
  */
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useMemo } from 'react'
 import { Shield, Lock, Key, Eye, EyeOff, Laptop, Smartphone, Trash2, AlertTriangle, Loader2, CheckCircle2, Copy, XCircle, LogOut } from 'lucide-react'
 import { toast } from '@/ui/toast/CustomToast'
 import { authService } from '@/modules/auth/services/auth.service'
@@ -20,9 +20,68 @@ interface SeguridadProps {
 
 type TwoFAView = 'idle' | 'setup' | 'verify-enable' | 'show-backup' | 'verify-disable'
 
+/** Fortaleza de una contraseña según las políticas vigentes (función pura). */
+function calcPasswordStrength(password: string, policies: SecurityPolicies): { strength: number; message: string } {
+  if (!password) return { strength: 0, message: '' }
+
+  let strength = 0
+  const issues: string[] = []
+
+  // Longitud
+  if (password.length >= policies.min_password_length) {
+    strength += 20
+  } else {
+    issues.push(`Mínimo ${policies.min_password_length} caracteres`)
+  }
+
+  // Mayúsculas
+  if (policies.require_uppercase) {
+    if (/[A-Z]/.test(password)) {
+      strength += 20
+    } else {
+      issues.push('Una mayúscula')
+    }
+  }
+
+  // Números
+  if (policies.require_numbers) {
+    if (/\d/.test(password)) {
+      strength += 20
+    } else {
+      issues.push('Un número')
+    }
+  }
+
+  // Caracteres especiales
+  if (policies.require_special_chars) {
+    if (/[^A-Za-z0-9]/.test(password)) {
+      strength += 20
+    } else {
+      issues.push('Un carácter especial')
+    }
+  }
+
+  // Variedad
+  if (password.length >= 12) strength += 10
+  if (/[a-z]/.test(password) && /[A-Z]/.test(password)) strength += 10
+
+  let message = ''
+  if (issues.length > 0) {
+    message = `Falta: ${issues.join(', ')}`
+  } else if (strength >= 80) {
+    message = '✓ Contraseña fuerte'
+  } else if (strength >= 60) {
+    message = 'Contraseña aceptable'
+  }
+
+  return { strength, message }
+}
+
 export default function SeguridadComponent({ onSave }: SeguridadProps) {
   const { user: authUser } = useAuth()
-  const [loading, setLoading] = useState(true)
+  // `loading` se deriva: recarga explícita en curso, o aún no cargado para el usuario actual
+  const [reloading, setReloading] = useState(false)
+  const [loadedFor, setLoadedFor] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
   const [showNewPassword, setShowNewPassword] = useState(false)
   const [showConfirmPassword, setShowConfirmPassword] = useState(false)
@@ -59,28 +118,44 @@ export default function SeguridadComponent({ onSave }: SeguridadProps) {
     confirm_password: ''
   })
 
-  const [passwordStrength, setPasswordStrength] = useState({
-    strength: 0,
-    message: ''
-  })
+  // Fortaleza derivada (sin estado ni efecto)
+  const passwordStrength = useMemo(
+    () => calcPasswordStrength(passwordData.new_password, policies),
+    [passwordData.new_password, policies]
+  )
 
+  const userId = authUser?.id
+  const loading = reloading || !userId || loadedFor !== userId
+
+  // Núcleo del fetch (sin setState síncrono). `isStale` descarta respuestas de un usuario anterior
+  const fetchSecurityData = useCallback((isStale: () => boolean = () => false) => {
+    if (!userId) return Promise.resolve()
+    return Promise.allSettled([
+      authService.getSecurityPolicies(),
+      userService.getUserSessions(userId),
+      authService.get2FAStatus(),
+    ])
+      .then(([policiesData, sessionsData, status2fa]) => {
+        if (isStale()) return
+        if (policiesData.status === 'fulfilled') setPolicies(policiesData.value)
+        if (sessionsData.status === 'fulfilled') setSessions(sessionsData.value.items)
+        if (status2fa.status === 'fulfilled') setTwoFAStatus(status2fa.value)
+      })
+      .catch((error) => {
+        console.error('Error cargando datos de seguridad:', error)
+      })
+      .finally(() => {
+        if (isStale()) return
+        setLoadedFor(userId)
+        setReloading(false)
+      })
+  }, [userId])
+
+  // Recarga explícita (tras revocar sesiones): vuelve a mostrar el spinner
   const loadSecurityData = async () => {
-    if (!authUser) return
-    try {
-      setLoading(true)
-      const [policiesData, sessionsData, status2fa] = await Promise.allSettled([
-        authService.getSecurityPolicies(),
-        userService.getUserSessions(authUser.id),
-        authService.get2FAStatus(),
-      ])
-      if (policiesData.status === 'fulfilled') setPolicies(policiesData.value)
-      if (sessionsData.status === 'fulfilled') setSessions(sessionsData.value.items)
-      if (status2fa.status === 'fulfilled') setTwoFAStatus(status2fa.value)
-    } catch (error) {
-      console.error('Error cargando datos de seguridad:', error)
-    } finally {
-      setLoading(false)
-    }
+    if (!userId) return
+    setReloading(true)
+    await fetchSecurityData()
   }
 
   // --- Handlers 2FA ---
@@ -148,72 +223,13 @@ export default function SeguridadComponent({ onSave }: SeguridadProps) {
     toast.success('Códigos copiados al portapapeles')
   }, [backupCodes])
 
-  const checkPasswordStrength = (password: string) => {
-    if (!password) {
-      setPasswordStrength({ strength: 0, message: '' })
-      return
-    }
-
-    let strength = 0
-    const issues: string[] = []
-
-    // Longitud
-    if (password.length >= policies.min_password_length) {
-      strength += 20
-    } else {
-      issues.push(`Mínimo ${policies.min_password_length} caracteres`)
-    }
-
-    // Mayúsculas
-    if (policies.require_uppercase) {
-      if (/[A-Z]/.test(password)) {
-        strength += 20
-      } else {
-        issues.push('Una mayúscula')
-      }
-    }
-
-    // Números
-    if (policies.require_numbers) {
-      if (/\d/.test(password)) {
-        strength += 20
-      } else {
-        issues.push('Un número')
-      }
-    }
-
-    // Caracteres especiales
-    if (policies.require_special_chars) {
-      if (/[^A-Za-z0-9]/.test(password)) {
-        strength += 20
-      } else {
-        issues.push('Un carácter especial')
-      }
-    }
-
-    // Variedad
-    if (password.length >= 12) strength += 10
-    if (/[a-z]/.test(password) && /[A-Z]/.test(password)) strength += 10
-
-    let message = ''
-    if (issues.length > 0) {
-      message = `Falta: ${issues.join(', ')}`
-    } else if (strength >= 80) {
-      message = '✓ Contraseña fuerte'
-    } else if (strength >= 60) {
-      message = 'Contraseña aceptable'
-    }
-
-    setPasswordStrength({ strength, message })
-  }
-
   useEffect(() => {
-    loadSecurityData()
-  }, [])
-
-  useEffect(() => {
-    checkPasswordStrength(passwordData.new_password)
-  }, [passwordData.new_password, policies])
+    let cancelled = false
+    fetchSecurityData(() => cancelled)
+    return () => {
+      cancelled = true
+    }
+  }, [fetchSecurityData])
 
   const handlePasswordChange = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -501,12 +517,12 @@ export default function SeguridadComponent({ onSave }: SeguridadProps) {
         <form onSubmit={handlePasswordChange} className="space-y-4">
           {/* Contraseña Actual */}
           <div className="space-y-2">
-            <label className="block text-sm font-medium text-foreground/80">
+            <label className="block text-sm font-medium text-foreground/80" htmlFor="seg-pref-1">
               Contraseña Actual
             </label>
             <div className="relative">
               <Lock className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" size={18} />
-              <input
+              <input id="seg-pref-1"
                 type="password"
                 value={passwordData.current_password}
                 onChange={(e) => setPasswordData(prev => ({ ...prev, current_password: e.target.value }))}
@@ -520,12 +536,12 @@ export default function SeguridadComponent({ onSave }: SeguridadProps) {
 
           {/* Nueva Contraseña */}
           <div className="space-y-2">
-            <label className="block text-sm font-medium text-foreground/80">
+            <label className="block text-sm font-medium text-foreground/80" htmlFor="seg-pref-2">
               Nueva Contraseña
             </label>
             <div className="relative">
               <Lock className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" size={18} />
-              <input
+              <input id="seg-pref-2"
                 type={showNewPassword ? 'text' : 'password'}
                 value={passwordData.new_password}
                 onChange={(e) => setPasswordData(prev => ({ ...prev, new_password: e.target.value }))}
@@ -572,12 +588,12 @@ export default function SeguridadComponent({ onSave }: SeguridadProps) {
 
           {/* Confirmar Contraseña */}
           <div className="space-y-2">
-            <label className="block text-sm font-medium text-foreground/80">
+            <label className="block text-sm font-medium text-foreground/80" htmlFor="seg-pref-3">
               Confirmar Nueva Contraseña
             </label>
             <div className="relative">
               <Lock className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" size={18} />
-              <input
+              <input id="seg-pref-3"
                 type={showConfirmPassword ? 'text' : 'password'}
                 value={passwordData.confirm_password}
                 onChange={(e) => setPasswordData(prev => ({ ...prev, confirm_password: e.target.value }))}

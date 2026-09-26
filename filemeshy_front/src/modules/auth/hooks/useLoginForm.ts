@@ -331,7 +331,7 @@ export const useLoginForm = () => {
     } finally {
       setIsLoading(false)
     }
-  }, [formData, login, navigate, validateForm])
+  }, [formData, login, navigate, validateForm, rememberMe, turnstileToken, requiresTurnstile, turnstileConfig?.enabled])
 
   const handleTotpSubmit = useCallback(async (e: React.FormEvent) => {
     e.preventDefault()

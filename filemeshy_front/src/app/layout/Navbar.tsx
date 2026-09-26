@@ -27,6 +27,8 @@ export default function Navbar({
   const { user } = useAuth()
   const navigate = useNavigate()
   const [currentTime, setCurrentTime] = useState(new Date())
+  // URL de avatar que falló al cargar (404, CSP, otro origen): se muestra el icono en su lugar
+  const [failedAvatar, setFailedAvatar] = useState<string | null>(null)
   const [showNotifDropdown, setShowNotifDropdown] = useState(false)
   const [showSwitchUserModal, setShowSwitchUserModal] = useState(false)
   const notifDropdownRef = useRef<HTMLDivElement>(null)
@@ -84,10 +86,9 @@ export default function Navbar({
   // recalcula al abrir y en resize/scroll mientras está abierto, para que
   // siga la campana si la ventana cambia de tamaño.
   useLayoutEffect(() => {
-    if (!showNotifDropdown) {
-      setNotifPanelPos(null)
-      return
-    }
+    // El render ya está gateado por `showNotifDropdown && notifPanelPos`; al reabrir,
+    // este efecto recalcula la posición antes del pintado
+    if (!showNotifDropdown) return
     const updatePosition = () => {
       const rect = notifButtonRef.current?.getBoundingClientRect()
       if (!rect) return
@@ -150,7 +151,16 @@ export default function Navbar({
           {/* Usuario logueado */}
           {user && (
             <div className="flex items-center gap-2 px-3 py-1.5 bg-gray-50 dark:bg-gray-800/50 rounded-lg">
-              <User className="w-3.5 h-3.5 text-blue-500 dark:text-blue-400" />
+              {user.avatar && failedAvatar !== user.avatar ? (
+                <img
+                  src={user.avatar}
+                  alt=""
+                  onError={() => setFailedAvatar(user.avatar ?? null)}
+                  className="w-5 h-5 rounded-full object-cover"
+                />
+              ) : (
+                <User className="w-3.5 h-3.5 text-blue-500 dark:text-blue-400" />
+              )}
               <span className="text-gray-700 dark:text-gray-300 font-medium capitalize">
                 {user.first_name} {user.last_name}
               </span>

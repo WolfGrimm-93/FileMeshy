@@ -17,6 +17,13 @@ import { storageQuotaService, type StorageQuotaItem, type StorageCapacity } from
 import { EditQuotaModal } from '../components/EditQuotaModal'
 
 const PAGE_SIZE = 50
+const EMPTY_ITEMS: StorageQuotaItem[] = []
+
+// Tooltip de capacidad: el valor visible usa la convención base 1024 con etiqueta "GB"
+// (decisión de producto); el title aclara la unidad real (GiB) sin cambiar lo que se ve.
+function binaryTooltip(bytes: number): string {
+  return `${formatBytes(bytes).replace(/ ([KMGT])B$/, ' $1iB')} (base 1024)`
+}
 
 // Umbrales de color de la barra de consumo -- reusa los mismos tokens
 // semánticos (verde/amarillo/rojo) que ya usa Badge/StatsGrid en el resto
@@ -49,14 +56,26 @@ export default function StorageQuotasPage() {
   const { hasPermission } = useAuth()
   const canManage = hasPermission(Permission.MANAGE_STORAGE_QUOTAS)
 
-  const [items, setItems] = useState<StorageQuotaItem[]>([])
-  const [total, setTotal] = useState(0)
-  const [totalPages, setTotalPages] = useState(0)
+  // Resultado del último fetch, atado a la clave de la petición que lo produjo: `isLoading`
+  // se deriva de que la clave actual todavía no tenga resultado (sin setState síncrono en efectos).
+  const [result, setResult] = useState<{
+    key: string
+    items: StorageQuotaItem[]
+    total: number
+    totalPages: number
+  } | null>(null)
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(PAGE_SIZE)
+  // `searchInput` es lo que se ve en el campo (inmediato); `search` es el término ya aplicado (con debounce)
+  const [searchInput, setSearchInput] = useState('')
   const [search, setSearch] = useState('')
-  const [isLoading, setIsLoading] = useState(true)
-  const [isFirstLoad, setIsFirstLoad] = useState(true)
+  const requestKey = `${page}|${pageSize}|${search}`
+  const isLoading = result?.key !== requestKey
+  const isFirstLoad = result === null
+  // Mientras carga se conservan los datos previos (igual que antes)
+  const items = result?.items ?? EMPTY_ITEMS
+  const total = result?.total ?? 0
+  const totalPages = result?.totalPages ?? 0
 
   const [capacity, setCapacity] = useState<StorageCapacity | null>(null)
 
@@ -64,29 +83,37 @@ export default function StorageQuotasPage() {
 
   const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  const fetchQuotas = useCallback(async () => {
-    setIsLoading(true)
-    try {
-      const skip = (page - 1) * pageSize
-      const response = await storageQuotaService.getQuotas({
-        skip,
+  useEffect(() => {
+    let cancelled = false
+    storageQuotaService
+      .getQuotas({
+        skip: (page - 1) * pageSize,
         limit: pageSize,
         search: search || undefined,
       })
-      setItems(response.items)
-      setTotal(response.total)
-      setTotalPages(response.total_pages)
-    } catch {
-      toast.error('Error al cargar las cuotas de almacenamiento')
-    } finally {
-      setIsLoading(false)
-      setIsFirstLoad(false)
+      .then((response) => {
+        if (cancelled) return
+        setResult({
+          key: requestKey,
+          items: response.items,
+          total: response.total,
+          totalPages: response.total_pages,
+        })
+      })
+      .catch(() => {
+        if (cancelled) return
+        toast.error('Error al cargar las cuotas de almacenamiento')
+        setResult((prev) => ({
+          key: requestKey,
+          items: prev?.items ?? [],
+          total: prev?.total ?? 0,
+          totalPages: prev?.totalPages ?? 0,
+        }))
+      })
+    return () => {
+      cancelled = true
     }
-  }, [page, pageSize, search])
-
-  useEffect(() => {
-    fetchQuotas()
-  }, [fetchQuotas])
+  }, [requestKey, page, pageSize, search])
 
   useEffect(() => {
     storageQuotaService
@@ -95,16 +122,29 @@ export default function StorageQuotasPage() {
       .catch(() => setCapacity(null))
   }, [])
 
+  // Al desmontar se cancela el timer pendiente del debounce
+  useEffect(() => {
+    return () => {
+      if (searchTimerRef.current) clearTimeout(searchTimerRef.current)
+    }
+  }, [])
+
   const handleSearchChange = useCallback((value: string) => {
-    setSearch(value)
+    setSearchInput(value)
     if (searchTimerRef.current) clearTimeout(searchTimerRef.current)
-    searchTimerRef.current = setTimeout(() => setPage(1), 300)
+    // Debounce real (300 ms): recién ahí se aplica el término y se vuelve a la página 1
+    searchTimerRef.current = setTimeout(() => {
+      setSearch(value)
+      setPage(1)
+    }, 300)
   }, [])
 
   const handleSaveQuota = useCallback(async (userId: string, limitBytes: number | null) => {
     try {
       const updated = await storageQuotaService.updateQuota(userId, { limit_bytes: limitBytes })
-      setItems((prev) => prev.map((it) => (it.user_id === userId ? updated : it)))
+      setResult((prev) =>
+        prev ? { ...prev, items: prev.items.map((it) => (it.user_id === userId ? updated : it)) } : prev,
+      )
       toast.success('Cuota actualizada exitosamente')
     } catch {
       toast.error('Error al actualizar la cuota')
@@ -157,18 +197,21 @@ export default function StorageQuotasPage() {
       icon: <HardDrive className="w-5 h-5" />,
       label: 'Capacidad total',
       value: capacity?.total_bytes != null ? formatBytes(capacity.total_bytes) : 'No disponible',
+      title: capacity?.total_bytes != null ? binaryTooltip(capacity.total_bytes) : undefined,
       variant: 'default' as const,
     },
     {
       icon: <Database className="w-5 h-5" />,
       label: 'Usado',
       value: capacity?.used_bytes != null ? formatBytes(capacity.used_bytes) : 'No disponible',
+      title: capacity?.used_bytes != null ? binaryTooltip(capacity.used_bytes) : undefined,
       variant: 'warning' as const,
     },
     {
       icon: <PieChart className="w-5 h-5" />,
       label: 'Libre',
       value: capacity?.free_bytes != null ? formatBytes(capacity.free_bytes) : 'No disponible',
+      title: capacity?.free_bytes != null ? binaryTooltip(capacity.free_bytes) : undefined,
       variant: 'success' as const,
     },
   ]
@@ -187,7 +230,7 @@ export default function StorageQuotasPage() {
       <div className="space-y-4">
         <TableFilters
           enableSearch
-          searchValue={search}
+          searchValue={searchInput}
           onSearchChange={handleSearchChange}
           searchPlaceholder="Buscar por nombre o email..."
         />

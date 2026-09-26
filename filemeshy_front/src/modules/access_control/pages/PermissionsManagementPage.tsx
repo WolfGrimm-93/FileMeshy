@@ -9,7 +9,7 @@
  * Reusa RolePermissionsEditor (el checklist por recurso/acción ya existía,
  * conectado al lugar equivocado) en vez de construir un checklist nuevo.
  */
-import { useState, useEffect, useCallback, useMemo } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { ArrowLeft, ShieldCheck, Save, Loader2 } from 'lucide-react'
 import { toast } from 'sonner'
@@ -37,7 +37,13 @@ export default function PermissionsManagementPage() {
   const [catalog, setCatalog] = useState<PermissionCatalogItem[]>([])
   const [assignedDict, setAssignedDict] = useState<RolePermissions>({})
   const [isLoadingRoles, setIsLoadingRoles] = useState(true)
-  const [isLoadingPermissions, setIsLoadingPermissions] = useState(false)
+  // Rol cuyos permisos ya terminaron de cargarse (con éxito o error): `loading` se
+  // deriva de compararlo con el rol seleccionado, sin setState síncrono en el efecto
+  const [attempt, setAttempt] = useState(0)
+  const [loadState, setLoadState] = useState<{ roleId: string; ok: boolean } | null>(null)
+  const isLoadingPermissions = selectedRoleId !== null && loadState?.roleId !== selectedRoleId
+  // La carga del rol seleccionado falló: no se muestran permisos ajenos ni se permite guardar
+  const loadFailed = selectedRoleId !== null && loadState?.roleId === selectedRoleId && !loadState.ok
   const [isSaving, setIsSaving] = useState(false)
 
   useEffect(() => {
@@ -51,22 +57,31 @@ export default function PermissionsManagementPage() {
       .finally(() => setIsLoadingRoles(false))
   }, [])
 
-  const loadRolePermissions = useCallback(async (roleId: string) => {
-    setIsLoadingPermissions(true)
-    try {
-      const res = await permissionsAssignmentService.getForRole(roleId)
-      setCatalog(res.catalog)
-      setAssignedDict(idsToPermissionsDict(res.assigned_permission_ids, res.catalog))
-    } catch {
-      toast.error('No se pudieron cargar los permisos de este rol')
-    } finally {
-      setIsLoadingPermissions(false)
-    }
-  }, [])
-
   useEffect(() => {
-    if (selectedRoleId) loadRolePermissions(selectedRoleId)
-  }, [selectedRoleId, loadRolePermissions])
+    if (!selectedRoleId) return
+    let cancelled = false
+    permissionsAssignmentService
+      .getForRole(selectedRoleId)
+      .then((res) => {
+        if (cancelled) return
+        setCatalog(res.catalog)
+        setAssignedDict(idsToPermissionsDict(res.assigned_permission_ids, res.catalog))
+        setLoadState({ roleId: selectedRoleId, ok: true })
+      })
+      .catch(() => {
+        if (cancelled) return
+        // Limpiar lo del rol anterior para no mostrarlo ni guardarlo bajo este rol
+        setCatalog([])
+        setAssignedDict({})
+        setLoadState({ roleId: selectedRoleId, ok: false })
+        toast.error('No se pudieron cargar los permisos de este rol')
+      })
+    return () => {
+      cancelled = true
+      // Al cambiar de rol se invalida lo cargado: volver a un rol previo recarga con spinner
+      setLoadState(null)
+    }
+  }, [selectedRoleId, attempt])
 
   const selectedRole = useMemo(() => roles.find((r) => r.id === selectedRoleId), [roles, selectedRoleId])
 
@@ -146,6 +161,15 @@ export default function PermissionsManagementPage() {
           ) : isLoadingPermissions ? (
             <div className="p-8 flex justify-center">
               <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
+            </div>
+          ) : loadFailed ? (
+            <div className="p-4 rounded-lg border border-red-200 bg-red-50 dark:bg-red-900/20 text-sm text-red-700 dark:text-red-300">
+              No se pudieron cargar los permisos de este rol. Selecciona otro rol o vuelve a intentarlo.
+              <div className="mt-3">
+                <Button variant="secondary" size="sm" onClick={() => { setLoadState(null); setAttempt((n) => n + 1) }}>
+                  Reintentar
+                </Button>
+              </div>
             </div>
           ) : (
             <div className="space-y-4">

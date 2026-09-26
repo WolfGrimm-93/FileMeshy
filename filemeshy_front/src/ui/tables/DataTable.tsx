@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react'
-import { useCallback } from 'react'
+import { useCallback, useMemo } from 'react'
 import { Eye, Edit, Trash2, Printer, Download, CheckCircle, XCircle, ReceiptText } from 'lucide-react'
 
 // =============================================
@@ -119,7 +119,10 @@ export function DataTable<T extends object>({
   const showSelection = (!!onSelectionChangeProp || !!selectedRows) && enableSelection !== false
 
   // Compatibilidad: selectedRows (string[]) → selectedIds (Set)
-  const selectedIds = selectedIdsProp ?? (selectedRows ? new Set<string | number>(selectedRows) : undefined)
+  const selectedIds = useMemo(
+    () => selectedIdsProp ?? (selectedRows ? new Set<string | number>(selectedRows) : undefined),
+    [selectedIdsProp, selectedRows],
+  )
   const onSelectionChange = onSelectionChangeProp
 
   // ---- Selección ----

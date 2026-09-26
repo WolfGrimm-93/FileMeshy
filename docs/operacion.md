@@ -52,13 +52,21 @@ Si falla por red, revisar la ruta por defecto del contenedor (la trampa de los c
 
 ## 4. Orden de rebuild backend + celery_worker
 
-Ambos usan la misma imagen (`./filemeshy_back`). Secuencial, un comando docker a la vez:
+`backend` y `celery_worker` comparten build Y tag de imagen (`image: filemeshy-backend`, ancla `x-backend-build` en `docker-compose.yml`): reconstruir cualquiera de los dos actualiza la misma imagen, así el worker no puede quedar desfasado. (Incidente de la Ronda 12: cuando cada servicio tenía su propia imagen, `docker compose build backend` NO reconstruía la del worker, que estuvo corriendo con dependencias viejas mientras se creía lo contrario.) `office_converter` sigue teniendo imagen propia y se reconstruye aparte. Secuencial, un comando docker a la vez:
 
 ```
 docker compose build backend
-docker compose build celery_worker
-docker compose up -d backend celery_worker
+docker compose up -d --force-recreate backend celery_worker
 ```
+
+**Verificación obligatoria tras cada deploy** (los dos comandos deben dar IDs idénticos y el mismo md5):
+
+```
+docker inspect --format '{{.Name}} {{.Image}}' filemeshy-backend-1 filemeshy-celery_worker-1
+for s in backend celery_worker; do docker compose exec -T $s pip freeze | md5sum; done
+```
+
+En producción (`docker-compose.prod.yml`, no versionado) aplicar el mismo cambio a mano: ancla de build compartida y `image:` idéntico en ambos servicios, o repetir el chequeo de arriba en cada despliegue.
 
 El backend corre `alembic upgrade head` al arrancar: levantar backend primero y esperar a que esté `healthy` antes de dejar que el worker procese con un esquema viejo.
 
@@ -141,7 +149,7 @@ Sin límite hoy (OCR/indexación puede crecer). Punto de partida, NO medido: `me
 
 Los contenedores de prod se llaman `filemeshy-postgres`, `filemeshy-backend`, etc. La nomenclatura obligatoria es `filemeshy-prod-<servicio>` (p. ej. `filemeshy-prod-celery-worker`). Renombrar recrea los contenedores: queda PENDIENTE hasta que el usuario lo confirme. Ídem para dev (`docker-compose.yml` no fija `container_name`; el prefijo lo da el nombre del proyecto).
 
-## 6. Verificación pendiente en el primer arranque del compose nuevo
+## 6. Verificación del primer arranque del compose nuevo (HECHA en dev)
 
 Backend y celery_worker ahora dependen de que minio esté `healthy` vía `mc ready local`. Confirmar que la imagen pinneada trae `mc`:
 
@@ -149,20 +157,83 @@ Backend y celery_worker ahora dependen de que minio esté `healthy` vía `mc rea
 docker run --rm --entrypoint mc quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z --version
 ```
 
-Si no lo trae, minio quedará `unhealthy` y bloqueará backend y worker. (Se verifica en la fase de Build; no verificado al escribir esto.)
+Si no lo trae, minio quedará `unhealthy` y bloqueará backend y worker. **Verificado el 2026-09-25:** la imagen pinneada trae `mc` (`mc version RELEASE.2025-08-13T08-35-41Z`) y los 8 servicios llegan a `healthy` en el arranque en frío. Repetir el chequeo si se cambia el digest de MinIO.
 
 ## 7. Deuda de dependencias conocida
 
-Medido con pip-audit (backend con `--no-deps --disable-pip`, sin cubrir transitivas) y `pnpm audit --prod`. Revisar hasta que se actualicen:
+Medido con pip-audit (`--no-deps --disable-pip -r`, sobre los requirements y, desde la Ronda 12, también sobre el `pip freeze` real de las imágenes reconstruidas, que sí cubre transitivas) y `pnpm audit --prod`.
 
-| Paquete | Versión actual | Vulns | Fix |
+### Resuelto en la Ronda 12 (backend y office_converter)
+
+| Paquete | Antes | Ahora | Vulns antes |
 |---|---|---|---|
-| pypdf (backend) | 4.3.1 | 77 | 6.9.2 |
-| pillow (backend) | 11.0.0 | 33 | 12.3.0 |
-| python-multipart (backend y office_converter) | 0.0.18 | 12 c/u | 0.0.31 |
-| python-dotenv (backend) | 1.0.0 | 2 | 1.2.2 |
-| pymysql (backend) | 1.1.0 | 2 | 1.1.1 |
-| starlette (office_converter, transitiva) | 0.41.3 | varias | hasta 1.3.1 |
-| react-router (front, vía react-router-dom) | <7.18.2 | 5 (2 altas, 3 moderadas) | >=7.18.2 |
+| pypdf (backend) | 4.3.1 | 6.19.0 | 77 |
+| pillow (backend) | 11.0.0 | 12.3.0 | 33 |
+| python-multipart (backend y office_converter) | 0.0.18 | 0.0.32 | 12 c/u |
+| python-dotenv (backend) | 1.0.0 | 1.2.3 | 2 |
+| pymysql (backend) | 1.1.0 | eliminado (sin usos) | 2 |
+| starlette (backend y office_converter, antes transitiva) | 0.41.3 | 1.3.1 (pin explícito) | 14 |
+| fastapi | 0.115.6 | 0.135.3 | (arrastraba starlette<0.42) |
+| pydantic / pydantic-settings | 2.5.2 / 2.1.0 | 2.12.5 / 2.10.1 | (requisito de fastapi 0.135) |
 
-Total backend: 126 vulnerabilidades en 5 paquetes. El job `sca` de CI es `continue-on-error` por esto: quitarlo cuando se actualice.
+También se quitaron del requirements del backend paquetes sin ningún uso en `app/`, `tests/`, `scripts/`, migraciones ni compose: sqlmodel, faker, pandas, schedule, flower.
+
+Resultado: pip-audit sobre el `pip freeze` real de backend (76 paquetes) y de office_converter (20): 0 vulnerabilidades conocidas; la API JSON de PyPI (`vulnerabilities`) de cada versión instalada también da 0. Antes: 126 en los pines directos del backend + 14 de starlette transitivo (~140), y 12 + 14 en el conversor.
+
+Cambios de comportamiento a tener presentes:
+- python-multipart >= 0.0.30 ya no interpreta `filename*=UTF-8''...` (RFC 2231) en multipart/form-data: esa parte deja de tratarse como archivo (respuesta 4xx limpia). Los navegadores y httpx envían `filename="..."` en UTF-8 crudo, que sigue funcionando (test `test_multipart_unicode_avatar.py`).
+- `@app.on_event` se migró a `lifespan` (Starlette 1.0 lo elimina); canario en `tests/test_app_canaries.py`.
+- Las constantes `HTTP_413_REQUEST_ENTITY_TOO_LARGE` / `HTTP_422_UNPROCESSABLE_ENTITY` están deprecadas en Starlette 1.x (solo warning); migrar a `*_CONTENT_TOO_LARGE` / `*_UNPROCESSABLE_CONTENT` en una ronda futura.
+- Los ~29 patrones legacy de pydantic v1 (`class Config`, `.dict()`, `@validator`, `from_orm`) siguen funcionando en pydantic 2.12 y solo emiten deprecation warnings; migrarlos antes de pydantic 3.
+
+### Fase 4 de la Ronda 12 (correcciones tras la revisión adversarial)
+
+- **`celery_worker` y `backend` ahora comparten imagen** (ver §4). Antes cada servicio tenía la suya y el worker quedó con las dependencias viejas sin que nada lo avisara; se detectó con `pip freeze` de cada contenedor.
+- **Enmascarado de secretos de configuración**: `GET /admin/config/email`, `/admin/config/all` y `/admin/config/category/{c}` devuelven `"****"` para cualquier fila con `is_encrypted=true` O cuya `config_key` termine en `password`, `secret`, `secret_key`, `api_key`, `private_key` o `token` (sufijo, no subcadena: `password_min_length` es una política y se muestra). Valores `false`/`0` ya no se devuelven como `null`.
+- **Recorte de User-Agent/IP**: `sessions.user_agent` (500) y `sessions.ip_address` (45) se recortan al guardar (`Session.clip_user_agent` + validadores del modelo); el UA vacío se guarda como `unknown`. Antes, un UA de 600+ caracteres daba 500 en el login. El audit log recorta `action`(20), `table_name`(100), `record_id`(100), `ip_address`(45), `endpoint`(255) y `method`(10).
+- **`POST /roles`**: `permission_ids` admite como máximo 1000 ids (422 si excede); rechaza ids inexistentes o de permisos inactivos con 422 (el detalle lista como máximo 20 ids y "y N más"); una carrera por nombre duplicado responde 409 en vez de 500. `PUT /roles/{id}/permissions` no cambió (no valida existentes/activos de esta forma).
+- **`scripts/reindex_legacy_pending.py --all-schemas`** recorre todos los tenants activos (`iter_tenant_schemas()`; en modo local equivale al schema por defecto). Sin `--all-schemas` ni `--schema`, en modo cloud solo procesa `public`.
+- Los tests de pytest que promueven usuarios a ADMIN/SUPER_ADMIN los bajan a USER y los desactivan al terminar (fixture autouse `_demote_privileged_users` en `tests/conftest.py`).
+
+### Fase 5 de la Ronda 12 (cierre tras la auditoría final)
+
+- **Secretos de configuración cifrados al guardar** en TODOS los caminos (antes solo `PUT /admin/config/email` cifraba, y `POST /admin/config/smtp`, `PUT /admin/config/turnstile`, `POST /admin/config/create` y `PUT /admin/config/update/{key}` los dejaban en claro aunque decían cifrarlos). Se usa el mismo Fernet de `app/core/security.py` (`encrypt_secret_if_needed`, idempotente). Los consumidores (envío de email, Turnstile) descifran con `decrypt_secret_tolerant`, que acepta valores legados en claro: NADA se rompe en instalaciones existentes, y un secreto en claro se cifra la próxima vez que se guarde. No hay migración masiva: los secretos ya guardados en claro siguen así hasta re-guardarse.
+- El enmascarado devuelve `"****"` solo si el secreto tiene valor; si está vacío devuelve `null` (el estado mostrado es honesto). Un `"****"` reenviado por un cliente ya no sobreescribe el secreto guardado.
+- Los logs de auditoría de auth pasan el UA/IP/email por `sanitize_for_log` (caracteres de control fuera, truncado a 200).
+- Constantes deprecadas de Starlette migradas (`HTTP_413_CONTENT_TOO_LARGE`, `HTTP_422_UNPROCESSABLE_CONTENT`, y también 414/416).
+- Datos de prueba: las filas legadas de `file_content_index` en 'pending' sin `attempted_at` las creaban los tests de `test_reindex_legacy_pending.py` (no un camino real de código); ahora se limpian solas. `scripts/reindex_legacy_pending.py` se ejecutó una vez sobre el stack de desarrollo (32 filas → 0).
+- **CI:** `eslint`, `tsc` y `sca` ya son bloqueantes (0 errores, 0 warnings, 0 vulnerabilidades). Nuevo job `backend-tests`, con `continue-on-error: true` hasta la primera corrida verde en un runner real (no verificado).
+
+## 8. Cambios de contrato de la Ronda 12 (backend↔frontend)
+
+- **Fechas:** toda respuesta que use `SuccessResponse`/`to_utc_iso` devuelve ISO 8601 con sufijo `Z`
+  (antes algunos endpoints devolvían `+00:00Z`, inválido, y el frontend mostraba fechas vacías o
+  "Invalid Date"). El frontend además tolera ambos formatos (`shared/utils/dates.ts::parseDate`) por
+  si algún dato legado o de un consumidor externo llega distinto.
+- **Avatar:** el único camino para SUBIR un avatar es `POST /users/{id}/avatar` (multipart, campo
+  `file`, jpeg/png/webp/gif, máximo 5 MB, cualquier usuario sobre su propia foto o con
+  `users.edit`/`admin.manage` sobre otra). `PUT /users/{id}` con el campo `avatar` **solo** acepta
+  `null`, `""` o el valor actual ya guardado — cualquier otro valor (base64, data-URI, una clave de
+  storage ajena) da 422. Es un cambio de contrato: un cliente viejo que mandara el avatar por `PUT`
+  deja de funcionar a propósito (era la causa de un IDOR real, ver pendiente.md Ronda 12).
+- **Copiar:** `POST /files/{id}/copy` y `POST /folders/{id}/copy` — sin `folder_id` ni `to_root` en
+  el body (o body vacío) copia en la MISMA carpeta del original; `folder_id: "<uuid>"` copia ahí;
+  `to_root: true` (o, por compatibilidad, `folder_id: null` explícito) copia en la raíz. `to_root:
+  true` junto con un `folder_id` no nulo da 422. Copiar un archivo/carpeta desde/hacia un descendiente
+  de sí mismo da 400. La copia ahora es server-side en MinIO (antes leía el archivo completo a
+  memoria del backend).
+- **Riesgo de despliegue — CSP y avatar/preview en producción:** `filemeshy_front/nginx.conf` fija
+  `img-src`/`media-src`/`frame-src` a `'self' data: http://localhost:58102` (el puerto de MinIO en
+  dev). Si en producción `MINIO_PUBLIC_URL` NO queda en el mismo origen que el frontend, los avatares
+  y los previews de imagen/video/PDF quedarán bloqueados por la CSP sin ningún error de red visible
+  (solo la violación en la consola del navegador) — agregar el origen real de MinIO a esas
+  directivas al desplegar, o confirmar que `MINIO_PUBLIC_URL` es same-origin (ver Ronda 5 en
+  pendiente.md, ya documentado ahí para el caso general de previews).
+
+### Sigue pendiente
+
+- **Frontend:** `pnpm audit` y `pnpm audit --prod` dan 0 vulnerabilidades (react-router 7.18.4). Ya no hay deuda de dependencias conocida en el frontend.
+- **Backend:** el `pip-audit` de CI usa `--no-deps --disable-pip` (no cubre transitivas). Las transitivas sí se auditaron con el `pip freeze` real de las imágenes (0). Falta auditar con resolución completa en un runner con Python 3.11 (en el host con Python 3.14 falla al compilar `psycopg2-binary`).
+- Pines sin subir a propósito (sin CVEs reportados por PyPI/pip-audit): uvicorn 0.32.1, httpx 0.25.2 (el `TestClient` de Starlette 1.x pide httpx >= 0.27; los tests usan `httpx.Client` contra el servidor real, no `TestClient`) y celery 5.3.6.
+- Patrones legacy de pydantic v1 (`class Config`, `.dict()`, `@validator`, `from_orm`): solo dan deprecation warnings; migrarlos antes de pydantic 3.
+- `passlib 1.7.4` sin mantenimiento (compatibilidad con bcrypt fijada a propósito).

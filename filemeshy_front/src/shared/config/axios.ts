@@ -149,11 +149,24 @@ axiosInstance.interceptors.response.use(
       '/auth/password-reset/request',
       '/auth/password-reset/verify',
       '/auth/password-reset/confirm',
+      '/auth/2fa/verify-login', // un código 2FA incorrecto devuelve 401: no es un token vencido
       '/auth/logout',
       '/auth/refresh' // el propio refresh nunca debe reintentar refresh (recursión)
     ]
     const isPublicRoute = publicRoutes.some(route => originalRequest.url?.includes(route))
     
+    // Rutas autenticadas cuyo 401 puede ser de NEGOCIO (código 2FA incorrecto): no es un token
+    // vencido, así que no se refresca. Un 401 real (token) sigue el camino normal de refresh.
+    const businessCodeRoutes = ['/auth/2fa/enable', '/auth/2fa/disable']
+    const detail = (error.response?.data as { detail?: unknown } | undefined)?.detail
+    const isBusinessCode401 =
+      error.response?.status === 401 &&
+      businessCodeRoutes.some(route => originalRequest.url?.includes(route)) &&
+      typeof detail === 'string' && /c[óo]digo/i.test(detail)
+    if (isBusinessCode401) {
+      return Promise.reject(error)
+    }
+
     // ❌ En rutas públicas, NUNCA intentar refresh - rechazar error directamente
     if (isPublicRoute) {
       if (env.isDev) {

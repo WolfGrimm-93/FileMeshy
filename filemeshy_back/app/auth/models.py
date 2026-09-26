@@ -3,7 +3,7 @@ PasswordResetSession (sesión temporal opaca para reset de contraseña)."""
 
 from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Boolean, func
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, validates
 from datetime import datetime, timezone
 from app.core.database import Base
 from app.shared.utils.uuid7 import uuid7
@@ -28,6 +28,27 @@ class Session(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     last_activity = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
     expires_at = Column(DateTime(timezone=True), nullable=False)  # Cuando expira el refresh token
+
+    # Longitudes de las columnas: un UA/IP más largo (uvicorn acepta headers de
+    # hasta ~64KB, y el cliente lo controla) daba StringDataRightTruncation ->
+    # 500 en el login. Se recorta acá (backstop para cualquier INSERT) y
+    # `clip_user_agent` lo usa el servicio para que el filtro de "misma sesión
+    # del mismo dispositivo" compare contra el valor efectivamente guardado.
+    USER_AGENT_MAX_LENGTH = 500
+    IP_ADDRESS_MAX_LENGTH = 45
+
+    @staticmethod
+    def clip_user_agent(user_agent):
+        """Devuelve `(user_agent or "unknown")[:500]`."""
+        return (user_agent or "unknown")[:Session.USER_AGENT_MAX_LENGTH]
+
+    @validates("user_agent")
+    def _clip_user_agent_column(self, _key, value):
+        return None if value is None else value[: self.USER_AGENT_MAX_LENGTH]
+
+    @validates("ip_address")
+    def _clip_ip_address_column(self, _key, value):
+        return None if value is None else value[: self.IP_ADDRESS_MAX_LENGTH]
 
     # Estado
     is_active = Column(Boolean, default=True, nullable=False)

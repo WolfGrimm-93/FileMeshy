@@ -16,6 +16,7 @@ from app.users.repository import user as crud_user
 from app.users.service import user_service
 from app.access_control import service as access_control_service
 from app.auth.service import get_current_active_user, invalidate_session_active_cache
+from app.shared.utils.datetime_iso import to_utc_iso
 from app.access_control.service import has_permission
 from app.users.models import User
 from app.auth.models import Session as SessionModel
@@ -287,7 +288,15 @@ def list_users(
             "role_id": user.role_id,
             "is_active": user.is_active,
             "is_superuser": user.is_superuser,
-            "created_at": user.created_at.isoformat() if user.created_at else None,
+            "created_at": to_utc_iso(user.created_at),
+            # Faltaban en esta serialización manual (a diferencia del detalle,
+            # que sí los expone vía el schema Pydantic completo): el listado
+            # siempre mostraba "Último acceso: Nunca" sin importar si el
+            # usuario ya se había logueado (hallazgo de pruebas en navegador,
+            # Ronda 12) -- no era un problema de cache, el campo directamente
+            # nunca se calculaba acá.
+            "last_login": to_utc_iso(user.last_login) if user.last_login else None,
+            "updated_at": to_utc_iso(user.updated_at) if user.updated_at else None,
             "sesiones_activas": 0,
         }
 
@@ -441,6 +450,21 @@ def update_user(
     # permitiendo que cualquier usuario logueado se auto-asignara el rol SUPER_ADMIN
     # vía PUT /users/{su_propio_id}.
     incoming = user_in.model_dump(exclude_unset=True)
+
+    # Ronda 12c (ALTO-3): por PUT el avatar solo puede BORRARSE (null/"") o repetir el
+    # valor actual ya guardado. Cualquier otra referencia (clave/URL ajena, p. ej. el
+    # avatar de otro usuario o un objeto de `files/`) exponía objetos ajenos y, en el
+    # siguiente POST /avatar, permitía borrarlos. Subir foto: POST /users/{id}/avatar.
+    if incoming.get("avatar") not in (None, ""):
+        from app.files.service import get_public_url
+
+        current = user.avatar
+        allowed_values = {current, get_public_url(current)} if current else set()
+        if incoming["avatar"] not in allowed_values:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="El avatar no se puede fijar por PUT. Subí la imagen con POST /api/v1/users/{user_id}/avatar (multipart, campo 'file')."
+            )
     if "role_id" in incoming and not is_superuser:
         if "users.manage_roles" not in user_permissions and "admin.manage" not in user_permissions:
             raise HTTPException(
@@ -801,32 +825,72 @@ def revoke_all_user_sessions(
     )
 
 
+def _avatar_key_of(user) -> str | None:
+    """Clave de storage del avatar ACTUAL del usuario, o None si no es un objeto de SU
+    prefijo `avatars/user_<id>/` (Ronda 12c, ALTO-3: nunca se borra un objeto fuera de él)."""
+    from urllib.parse import urlparse
+
+    from app.core.config import settings
+
+    stored = user.avatar
+    if not stored:
+        return None
+    if stored.lower().startswith(("http://", "https://")):
+        marker = f"/{settings.MINIO_BUCKET}/"
+        path = urlparse(stored).path
+        if marker not in path:
+            return None
+        key = path.split(marker, 1)[1]
+    else:
+        key = stored.lstrip("/")
+    return key if key.startswith(f"avatars/user_{user.id}/") and ".." not in key else None
+
+
 @router.post("/{user_id}/avatar", response_model=UserSchema)
 async def upload_user_avatar(
     user_id: UUID,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
-    current_user: User = Depends(has_permission(["users.edit", "admin.manage"]))
+    current_user: User = Depends(get_current_active_user)
 ):
-    """Subir o reemplazar la foto de perfil de un usuario"""
+    """Subir o reemplazar la foto de perfil de un usuario.
+
+    Contrato (multipart/form-data): campo `file` (imagen jpeg/png/webp/gif, sin SVG,
+    máx. MAX_AVATAR_SIZE_BYTES). Responde 200 con el usuario completo; su campo
+    `avatar` es la URL pública ya lista para un <img src>.
+
+    Ronda 12b: cada usuario puede cambiar SU PROPIA foto (antes exigía users.edit /
+    admin.manage, así que un usuario normal no podía usar este endpoint y el
+    frontend terminaba mandando el avatar como base64 por PUT /users/{id}); para la
+    de otro usuario se sigue exigiendo users.edit / admin.manage / superusuario."""
     user = crud_user.get(db, id=user_id)
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Usuario no encontrado")
 
+    if user.id != current_user.id and not crud_user.is_superuser(current_user):
+        perms = current_user.permissions or []
+        if "users.edit" not in perms and "admin.manage" not in perms:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="No tienes permisos para cambiar la foto de este usuario"
+            )
+
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="El archivo debe ser una imagen")
 
-    from app.files.service import upload_file, delete_file, is_minio_url
+    from app.files.service import upload_file, delete_file
     from app.files.service import compress_image
     from app.files.service import validate_image_content
 
-    if user.avatar and is_minio_url(user.avatar):
-        try:
-            delete_file(user.avatar)
-        except Exception:
-            pass
-
-    contents = await file.read()
+    # Ronda 12c (MEDIO-6): lectura con TOPE (no todo el cuerpo a memoria), validar,
+    # subir, actualizar la BD y SOLO AL FINAL borrar el avatar anterior. Antes se borraba
+    # primero: un upload inválido dejaba al usuario con el avatar roto.
+    contents = await file.read(MAX_AVATAR_SIZE_BYTES + 1)
+    if len(contents) > MAX_AVATAR_SIZE_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail=f"El archivo supera el tamaño máximo permitido ({MAX_AVATAR_SIZE_BYTES // (1024 * 1024)} MB)"
+        )
     # Magic-bytes real (content_type del header es falsificable) + límite de
     # tamaño explícito + SVG excluido: un SVG puede llevar <script> embebido
     # -- stored XSS si termina servido desde un bucket público (avatar).
@@ -835,7 +899,10 @@ async def upload_user_avatar(
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     contents, ext = compress_image(contents, fmt)
-    content_type = "image/webp" if ext == ".webp" else (file.content_type or "image/jpeg")
+    # content_type derivado del formato VALIDADO, no del header del cliente.
+    content_type = "image/webp" if ext == ".webp" else f"image/{'jpeg' if fmt == 'jpg' else fmt}"
+
+    old_key = _avatar_key_of(user)
     url = upload_file(
         path=f"avatars/user_{user_id}",
         content=contents,
@@ -844,6 +911,13 @@ async def upload_user_avatar(
     )
 
     updated = user_service.update(db, db_obj=user, obj_in=UserUpdate(avatar=url))
+
+    # Borrado del avatar anterior: best-effort y SOLO dentro del prefijo propio del usuario.
+    if old_key and old_key != url.lstrip("/"):
+        try:
+            delete_file(old_key)
+        except Exception:
+            pass
 
     from app.core.cache import invalidate_users_cache
     invalidate_users_cache()

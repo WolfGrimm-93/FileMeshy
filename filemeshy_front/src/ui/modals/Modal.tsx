@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useEffect, useId } from 'react'
 import { createPortal } from 'react-dom'
 import { X } from 'lucide-react'
 
@@ -24,6 +24,14 @@ const sizeClasses = {
   '4xl': 'max-w-4xl',
 }
 
+// Pila de modales abiertos a nivel de módulo (en orden de apertura). Sirve para:
+//  - scroll del body: con modales anidados (ej. TagsModal -> confirmación de borrado), cerrar el
+//    interno no libera el scroll mientras el externo sigue abierto; se bloquea al pasar de 0 a 1
+//    y se restaura el valor ORIGINAL de `overflow` solo al volver a 0.
+//  - Escape: solo cierra el modal más alto (el último abierto), no todos los anidados.
+const openModalStack: string[] = []
+let originalBodyOverflow = ''
+
 export function Modal({
   isOpen,
   onClose,
@@ -35,30 +43,36 @@ export function Modal({
   footer,
   className = '',
 }: ModalProps) {
-  // Cerrar con tecla Escape
+  const instanceId = useId()
+  // id único por instancia: con modales anidados un id fijo quedaría duplicado
+  const titleId = `${instanceId}-title`
+
+  // Cerrar con tecla Escape: solo el modal más alto de la pila
   useEffect(() => {
     const handleEscape = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && isOpen) {
+      if (e.key === 'Escape' && isOpen && openModalStack[openModalStack.length - 1] === instanceId) {
         onClose()
       }
     }
 
     document.addEventListener('keydown', handleEscape)
     return () => document.removeEventListener('keydown', handleEscape)
-  }, [isOpen, onClose])
+  }, [isOpen, onClose, instanceId])
 
-  // Prevenir scroll del body cuando el modal está abierto
+  // Prevenir scroll del body mientras haya al menos un modal abierto
   useEffect(() => {
-    if (isOpen) {
+    if (!isOpen) return
+    if (openModalStack.length === 0) {
+      originalBodyOverflow = document.body.style.overflow
       document.body.style.overflow = 'hidden'
-    } else {
-      document.body.style.overflow = 'unset'
     }
-
+    openModalStack.push(instanceId)
     return () => {
-      document.body.style.overflow = 'unset'
+      const index = openModalStack.indexOf(instanceId)
+      if (index !== -1) openModalStack.splice(index, 1)
+      if (openModalStack.length === 0) document.body.style.overflow = originalBodyOverflow
     }
-  }, [isOpen])
+  }, [isOpen, instanceId])
 
   if (!isOpen) return null
 
@@ -75,7 +89,7 @@ export function Modal({
         className="fixed inset-0 z-50 flex items-center justify-center p-4"
         role="dialog"
         aria-modal="true"
-        aria-labelledby="modalTitle"
+        aria-labelledby={titleId}
         onClick={closeOnOverlayClick ? onClose : undefined}
       >
         <div
@@ -85,7 +99,7 @@ export function Modal({
           {/* Header fijo */}
           <div className="flex items-start justify-between p-6 pb-0 shrink-0">
             <h2
-              id="modalTitle"
+              id={titleId}
               className="text-xl font-bold text-gray-900 dark:text-white sm:text-2xl"
             >
               {title}

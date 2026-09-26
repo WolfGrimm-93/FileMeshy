@@ -1,7 +1,7 @@
 /**
  * Editor de permisos granulares para roles
  */
-import { useState, useEffect } from 'react'
+import { useState } from 'react'
 import { Checkbox } from '@/ui/inputs/Checkbox'
 import { Badge } from '@/ui/badges/Badge'
 import { ChevronDown, ChevronRight } from 'lucide-react'
@@ -22,9 +22,12 @@ export default function RolePermissionsEditor({
     new Set(Object.keys(available))
   )
 
-  useEffect(() => {
+  // Ajuste de estado durante el render: al llegar un `available` nuevo se re-expanden todos
+  const [prevAvailable, setPrevAvailable] = useState(available)
+  if (available !== prevAvailable) {
+    setPrevAvailable(available)
     setExpandedResources(new Set(Object.keys(available)))
-  }, [available])
+  }
 
   const toggleResource = (resource: string) => {
     const newExpanded = new Set(expandedResources)
@@ -97,6 +100,7 @@ export default function RolePermissionsEditor({
 
                 <div className="flex items-center gap-2 flex-1">
                   <Checkbox
+                    id={`perm-${resource}`}
                     checked={isFullySelected}
                     onChange={(e) => toggleAllActionsForResource(resource, e.target.checked)}
                     label={resource_labels[resource] || resource}
@@ -116,6 +120,7 @@ export default function RolePermissionsEditor({
                 {actions.map((action) => (
                   <Checkbox
                     key={action}
+                    id={`${resource}-${action}`}
                     checked={(permissions[resource] || []).includes(action)}
                     onChange={(e) => toggleAction(resource, action, e.target.checked)}
                     label={action_labels[action] || action}

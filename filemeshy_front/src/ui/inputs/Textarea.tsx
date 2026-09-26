@@ -1,4 +1,4 @@
-import { forwardRef, type TextareaHTMLAttributes } from 'react'
+import { forwardRef, useId, type TextareaHTMLAttributes } from 'react'
 
 export interface TextareaProps extends TextareaHTMLAttributes<HTMLTextAreaElement> {
   label?: string
@@ -26,7 +26,9 @@ export const Textarea = forwardRef<HTMLTextAreaElement, TextareaProps>(
     },
     ref
   ) => {
-    const textareaId = id || label?.toLowerCase().replace(/\s+/g, '-')
+    // useId: id único por instancia; derivarlo del label rompía htmlFor con etiquetas repetidas
+    const generatedId = useId()
+    const textareaId = id || generatedId
     const currentLength = String(value).length
 
     const baseTextareaClasses =

@@ -104,9 +104,10 @@ class FilesService {
   }
 
   async copy(fileId: string, folderId?: string | null): Promise<FileOut> {
-    const response = await axiosInstance.post<FileOut>(`${this.basePath}/${fileId}/copy`, {
-      folder_id: folderId ?? null,
-    })
+    // Contrato del backend: campo AUSENTE = misma carpeta del original; `null` explícito = raíz;
+    // un id = esa carpeta. Por eso `undefined` NO se colapsa a null (copiaba siempre a la raíz).
+    const body = folderId === undefined ? {} : { folder_id: folderId }
+    const response = await axiosInstance.post<FileOut>(`${this.basePath}/${fileId}/copy`, body)
     return response.data
   }
 
