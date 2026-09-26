@@ -76,7 +76,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # La versión de pnpm sale de "packageManager" en package.json.
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           package_json_file: filemeshy_front/package.json
       - uses: actions/setup-node@v4
@@ -122,7 +122,7 @@ jobs:
         run: pip-audit --no-deps --disable-pip -r filemeshy_back/requirements.txt
       - name: pip-audit office_converter
         run: pip-audit -r filemeshy_office_converter/requirements.txt
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           package_json_file: filemeshy_front/package.json
       - name: pnpm audit (prod)
