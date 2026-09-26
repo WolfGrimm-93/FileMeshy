@@ -9,7 +9,7 @@ email-validator==2.1.0
 PyJWT==2.14.0  # Ronda 10: reemplaza python-jose (sin mantenimiento activo, CVE-2024-33663/33664) -- solo HS256 simetrico, no necesita el extra [crypto]
 cryptography==50.0.1  # Ronda 10: antes llegaba transitivamente via python-jose[cryptography] -- ahora explicita porque app/core/security.py la usa directo (Fernet + PBKDF2HMAC para cifrar SMTP password/API keys/TOTP secret), sin relacion con JWT
 passlib==1.7.4
-bcrypt==4.0.1
+bcrypt==5.0.0
 python-multipart==0.0.32
 python-dotenv==1.2.3
 psycopg2-binary==2.9.9
