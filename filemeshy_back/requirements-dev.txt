@@ -2,4 +2,4 @@
 # (ver Dockerfile, que solo copia requirements.txt). Instalar dentro del
 # contenedor backend ya corriendo con:
 #   docker compose exec backend pip install -r requirements-dev.txt
-pytest==7.4.4
+pytest==9.1.1
