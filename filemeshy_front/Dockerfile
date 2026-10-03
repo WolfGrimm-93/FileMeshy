@@ -35,7 +35,7 @@ RUN pnpm build:prod
 # Pin por DIGEST (Ronda 10) -- mismo criterio que la etapa de build:
 # "alpine" es flotante. nginx/1.31.6 confirmado en vivo con `nginx -v`
 # corriendo la imagen real, digest vigente al 2026-09-22.
-FROM nginx:alpine@sha256:62ff2089abf5a9ed33bd232895bef5e22f7bb4b200675cec49a5ebc48e3d4ac8
+FROM nginx:alpine@sha256:df221db836e1754089190208cee7eeda94f233197056426eda74a43ab1abeac2
 
 # Copiar config de nginx
 COPY nginx.conf /etc/nginx/conf.d/default.conf
