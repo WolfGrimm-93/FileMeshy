@@ -321,7 +321,7 @@ services:
     # (en vez de una tag numerada) porque el propósito de "stable" sigue
     # siendo válido como documentación de intención, el digest es lo que
     # realmente ancla la reproducibilidad.
-    image: clamav/clamav:stable@sha256:0e31ce089574268aefa0b543767d66b70240ab51ed49eec53e07f18d5629d817
+    image: clamav/clamav:stable@sha256:ebec5bc138401b36ae987caa1a3fa3c3b2a21ed3d51f0bfa5852825e663e67b0
     volumes:
       - clamav_data:/var/lib/clamav
     # Ronda 9: escaneo asíncrono de archivos grandes -- por defecto la imagen
