@@ -63,7 +63,7 @@ services:
     # 15.19-alpine es la build vigente al 2026-09-22 (confirmado con
     # `postgres --version` corriendo la imagen real); el digest fija ESE
     # binario exacto para siempre, sin depender de que la tag no se re-apunte.
-    image: postgres:15.19-alpine@sha256:f7d23353e1b15400d22ebe31189f4d314b87a4c129cc400c8c2d8d4ca127bf81
+    image: postgres:18.4-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
     environment:
       POSTGRES_USER: filemeshy
       POSTGRES_PASSWORD: filemeshy_dev_only
