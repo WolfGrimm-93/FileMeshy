@@ -2,7 +2,7 @@
 # Python 3.11.x + base Debian que se actualizan sin aviso en cualquier
 # rebuild). Python 3.11.16 confirmado en vivo con `python3 --version`
 # corriendo la imagen real, digest vigente al 2026-09-22.
-FROM python:3.11-slim@sha256:da047cb8f9d1d98e5c070f5300ba9f7274e33b8fc0e5be5ed88740aed1b95ba9
+FROM python:3.15-slim@sha256:94d3426f1def7db4a106a232ac121bfd975393e5dfd40a619b955fae45fe7913
 
 WORKDIR /app
 
